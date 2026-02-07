@@ -21,7 +21,7 @@
  * Analysis API endpoint
  * POST request with { url, text } body
  */
-const ANALYZE_API_URL = 'http://localhost:8000/analyze';
+const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 
 /** Request timeout in milliseconds */
 const REQUEST_TIMEOUT = 5000;
@@ -30,7 +30,7 @@ const REQUEST_TIMEOUT = 5000;
 const MAX_SEARCH_QUERY_WORDS = 12;
 
 // ============================================================================
-// EXTENSION ICON CLICK → Tell content script to grab context
+// EXTENSION ICON CLICK → Toggle extension on/off
 // ============================================================================
 
 chrome.action.onClicked.addListener((tab) => {
@@ -39,18 +39,45 @@ chrome.action.onClicked.addListener((tab) => {
     return;
   }
 
+  // Send toggle message to content script
   chrome.tabs.sendMessage(tab.id, { type: 'GRAB_CONTEXT' }, (response) => {
     if (chrome.runtime.lastError) {
       console.error('[ContextGrabber] Could not reach content script:', chrome.runtime.lastError.message);
+      return;
+    }
+    // Update badge based on new state
+    if (response && response.enabled !== undefined) {
+      updateBadgeForTab(tab.id, response.enabled);
     }
   });
 });
+
+/**
+ * Updates the extension badge to show enabled/disabled state
+ */
+function updateBadgeForTab(tabId, enabled) {
+  if (enabled) {
+    chrome.action.setBadgeText({ text: '', tabId });
+    chrome.action.setBadgeBackgroundColor({ color: '#4CAF50', tabId });
+  } else {
+    chrome.action.setBadgeText({ text: 'OFF', tabId });
+    chrome.action.setBadgeBackgroundColor({ color: '#FF9800', tabId });
+  }
+}
 
 // ============================================================================
 // MESSAGE HANDLER: Receive content from content script
 // ============================================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Handle extension state changes from content script
+  if (message.type === 'EXTENSION_STATE_CHANGED') {
+    if (sender.tab && sender.tab.id) {
+      updateBadgeForTab(sender.tab.id, message.enabled);
+    }
+    sendResponse({ received: true });
+  }
+
   if (message.type === 'ANALYZE_CONTENT') {
     analyzeContent(message.data, sender.tab.id);
     sendResponse({ received: true });

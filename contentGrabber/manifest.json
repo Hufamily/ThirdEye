@@ -11,12 +11,11 @@
   ],
   
   "host_permissions": [
-    "http://localhost:8000/*",
     "<all_urls>"
   ],
   
   "action": {
-    "default_title": "Grab Context & Search"
+    "default_title": "Toggle Context Grabber (Ctrl+Shift+G)"
   },
 
   "background": {

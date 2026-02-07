@@ -13,15 +13,17 @@
  * 4. Adjust DWELL_TIME_MS to change how long the user must hover
  */
 
+console.log('[ContextGrabber] Script starting to load...');
+
 // ============================================================================
 // CONFIGURATION - MODIFY THESE FOR YOUR SETUP
 // ============================================================================
 
 /** Gaze tracking API endpoint (GET request) */
-const GAZE_API_URL = 'http://localhost:8000/gaze';
+const GAZE_API_URL = 'http://127.0.0.1:8000/gaze';
 
 /** Analysis API endpoint (POST request) */
-const ANALYZE_API_URL = 'http://localhost:8000/analyze';
+const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 
 /** Enable/disable gaze tracking (set to false to use cursor-only mode) */
 const ENABLE_GAZE_MODE = false;
@@ -53,10 +55,23 @@ const DWELL_CHECK_INTERVAL = 200;
 /** Snapshot capture region size in pixels (width & height around the point) */
 const SNAPSHOT_SIZE = 400;
 
+/** 
+ * Screenshot API priority mode:
+ * - 'api-only': Only use screenshot + backend API, never fall back to Google
+ * - 'api-first': Try API first, fall back to Google if API fails/returns nothing
+ * - 'google-only': Skip API entirely, only use Google search
+ */
+const SCREENSHOT_PRIORITY = 'api-first';
+
+/** Number of text lines to capture before and after the target point (centered window) */
+const CONTEXT_LINES_BEFORE = 10;
+const CONTEXT_LINES_AFTER = 10;
+
 // ============================================================================
 // STATE
 // ============================================================================
 
+let extensionEnabled = true;          // Toggle extension on/off without reload
 let gazeAvailable = ENABLE_GAZE_MODE; // Tracks if gaze API is working
 let currentOverlay = null;            // Reference to persistent overlay element
 let isTyping = false;                 // Tracks if user is typing
@@ -74,6 +89,7 @@ let dwellAnchor = null;               // {x, y, time} — where dwell started
 let lastScrapedElement = null;        // Avoid re-scraping same element
 let lastScrapeTime = 0;               // Timestamp of last scrape
 let overlayVisible = false;           // Whether overlay is currently shown
+let overlayDocked = false;            // Whether overlay is in docked (compact icon) mode
 let lastSnapshotDataUrl = null;       // Last captured snapshot
 let activeTab = 'web';                // 'web' or 'images' — which tab is shown
 let isHoveringOverlay = false;        // Tracks if cursor is inside the overlay
@@ -1055,6 +1071,118 @@ function extractVisibleText(element) {
   return cleaned.substring(0, MAX_TEXT_LENGTH);
 }
 
+/**
+ * Extracts text from the page centered around a given point (x, y).
+ * Collects visible text lines, finds the closest to the cursor, and returns
+ * a window of CONTEXT_LINES_BEFORE + 1 + CONTEXT_LINES_AFTER lines.
+ * 
+ * @param {number} x - Client X coordinate
+ * @param {number} y - Client Y coordinate
+ * @returns {string} Centered context text
+ */
+function extractCenteredTextFromPoint(x, y) {
+  // Gather all visible text "lines" with their bounding positions
+  const textLines = [];
+  
+  // Walk visible block-level elements that contain text
+  const blockSelectors = 'p, h1, h2, h3, h4, h5, h6, li, td, th, dd, dt, blockquote, figcaption, div, span, label';
+  const elements = document.querySelectorAll(blockSelectors);
+  
+  for (const el of elements) {
+    // Skip invisible elements
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+      continue;
+    }
+    
+    // Skip elements that are just containers (have child block elements with text)
+    // Only process elements with direct text content
+    let hasDirectText = false;
+    for (const child of el.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE && child.textContent.trim().length > 0) {
+        hasDirectText = true;
+        break;
+      }
+    }
+    
+    // For spans and labels, check if parent is already processed block
+    const isInlineInBlock = (el.tagName === 'SPAN' || el.tagName === 'LABEL') && 
+      el.parentElement && ['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'DIV'].includes(el.parentElement.tagName);
+    
+    if (!hasDirectText && !isInlineInBlock) {
+      // Check if it's a leaf element with text content
+      if (el.children.length > 0) continue;
+    }
+    
+    const text = (el.innerText || el.textContent || '').trim();
+    if (text.length === 0) continue;
+    
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) continue;
+    if (rect.bottom < 0 || rect.top > window.innerHeight) continue; // Not in viewport
+    
+    // Split by newlines if the element contains multiple lines
+    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    if (lines.length === 0) continue;
+    
+    // Approximate line positions within the element
+    const lineHeight = rect.height / Math.max(lines.length, 1);
+    for (let i = 0; i < lines.length; i++) {
+      const lineTop = rect.top + i * lineHeight;
+      const lineMid = lineTop + lineHeight / 2;
+      textLines.push({
+        text: lines[i],
+        top: lineTop,
+        mid: lineMid,
+        left: rect.left,
+        right: rect.right
+      });
+    }
+  }
+  
+  if (textLines.length === 0) {
+    return '';
+  }
+  
+  // Sort lines by their vertical position
+  textLines.sort((a, b) => a.mid - b.mid);
+  
+  // De-duplicate lines (same text at similar vertical positions)
+  const uniqueLines = [];
+  let lastText = '';
+  let lastMid = -Infinity;
+  for (const line of textLines) {
+    if (line.text === lastText && Math.abs(line.mid - lastMid) < 10) {
+      continue;
+    }
+    uniqueLines.push(line);
+    lastText = line.text;
+    lastMid = line.mid;
+  }
+  
+  // Find the line closest to the cursor's Y position
+  let closestIdx = 0;
+  let closestDist = Infinity;
+  for (let i = 0; i < uniqueLines.length; i++) {
+    const dist = Math.abs(uniqueLines[i].mid - y);
+    if (dist < closestDist) {
+      closestDist = dist;
+      closestIdx = i;
+    }
+  }
+  
+  // Extract a centered window: CONTEXT_LINES_BEFORE before, target, CONTEXT_LINES_AFTER after
+  const startIdx = Math.max(0, closestIdx - CONTEXT_LINES_BEFORE);
+  const endIdx = Math.min(uniqueLines.length, closestIdx + CONTEXT_LINES_AFTER + 1);
+  
+  const contextLines = [];
+  for (let i = startIdx; i < endIdx; i++) {
+    contextLines.push(uniqueLines[i].text);
+  }
+  
+  return contextLines.join('\n').substring(0, MAX_TEXT_LENGTH);
+}
+
 // ============================================================================
 // RICH CONTEXT EXTRACTION: Multi-strategy text/metadata gathering
 // ============================================================================
@@ -1352,8 +1480,16 @@ function resolveTargetFromPoint(x, y) {
   // --- Normal web page ----------------------------------------------------
   else {
     container = findSemanticContainer(x, y);
-    if (container) {
+    
+    // Use centered text extraction around the cursor point
+    const centeredText = extractCenteredTextFromPoint(x, y);
+    if (centeredText && centeredText.length > 20) {
+      text = centeredText;
+      console.log('[ContextGrabber] Using centered context extraction');
+    } else if (container) {
+      // Fallback to container-based extraction if centered didn't yield enough
       text = extractRichContext(container);
+      console.log('[ContextGrabber] Fallback to container extraction');
     }
   }
 
@@ -1391,6 +1527,7 @@ function resolveTargetFromPoint(x, y) {
  * The overlay stays open and its content is updated in-place.
  */
 function createPersistentOverlay() {
+  console.log('[ContextGrabber] createPersistentOverlay called, currentOverlay:', !!currentOverlay);
   if (currentOverlay) return;
 
   // Inject styles
@@ -1399,6 +1536,7 @@ function createPersistentOverlay() {
     style.id = 'context-grabber-styles';
     style.textContent = getOverlayStyles();
     document.head.appendChild(style);
+    console.log('[ContextGrabber] Styles injected');
   }
 
   const overlay = document.createElement('div');
@@ -1409,17 +1547,31 @@ function createPersistentOverlay() {
       <div class="cg-overlay-header">
         <span class="cg-title">Context Grabber</span>
         <span class="cg-status" id="cg-status">Watching...</span>
+        <button class="cg-toggle-btn" id="cg-toggle-btn" aria-label="Toggle extension" title="Toggle on/off (Ctrl+Shift+G)">&#9654;</button>
         <button class="cg-minimize-btn" aria-label="Minimize">&#8212;</button>
+        <button class="cg-dock-btn" id="cg-dock-btn" aria-label="Dock to corner" title="Dock to corner">&#8690;</button>
       </div>
       <div class="cg-body" id="cg-body">
-        <div class="cg-section"><p class="cg-hint">Hover over content for ${DWELL_TIME_MS / 1000}s to search.</p></div>
+        <div class="cg-section"><p class="cg-hint">Hover over content for ${DWELL_TIME_MS / 1000}s to search.<br><em>Ctrl+Shift+G to toggle, or click &#9654;</em></p></div>
       </div>
+    </div>
+    <div class="cg-docked-icon" id="cg-docked-icon" style="display:none" title="Expand Context Grabber">
+      <span class="cg-docked-eye">👁</span>
     </div>
   `;
 
   document.body.appendChild(overlay);
   currentOverlay = overlay;
   overlayVisible = true;
+  console.log('[ContextGrabber] Overlay appended to body, visible:', overlayVisible);
+
+  // Toggle button: enable/disable extension
+  const toggleBtn = overlay.querySelector('#cg-toggle-btn');
+  toggleBtn.addEventListener('click', () => {
+    toggleExtension();
+    updateToggleButton();
+  });
+  updateToggleButton(); // Set initial state
 
   // Minimize/restore toggle
   const minimizeBtn = overlay.querySelector('.cg-minimize-btn');
@@ -1429,6 +1581,25 @@ function createPersistentOverlay() {
     body.style.display = isMinimized ? 'block' : 'none';
     minimizeBtn.innerHTML = isMinimized ? '&#8212;' : '&#9744;';
     overlayVisible = isMinimized;
+  });
+
+  // Dock/undock toggle
+  const dockBtn = overlay.querySelector('#cg-dock-btn');
+  const dockedIcon = overlay.querySelector('#cg-docked-icon');
+  const overlayContent = overlay.querySelector('.cg-overlay-content');
+  
+  dockBtn.addEventListener('click', () => {
+    overlayDocked = true;
+    overlay.classList.add('cg-docked');
+    overlayContent.style.display = 'none';
+    dockedIcon.style.display = 'flex';
+  });
+  
+  dockedIcon.addEventListener('click', () => {
+    overlayDocked = false;
+    overlay.classList.remove('cg-docked');
+    overlayContent.style.display = 'block';
+    dockedIcon.style.display = 'none';
   });
 
   // Don't trigger dwell when hovering the overlay itself
@@ -1457,6 +1628,7 @@ function updateOverlayContent(html) {
  * @param {string} text - Status text
  */
 function setOverlayStatus(text) {
+  if (!currentOverlay) createPersistentOverlay();
   if (!currentOverlay) return;
   const status = currentOverlay.querySelector('#cg-status');
   if (status) status.textContent = text;
@@ -1651,6 +1823,90 @@ function getOverlayStyles() {
       color: #333;
     }
 
+    .cg-toggle-btn {
+      background: #4CAF50;
+      border: none;
+      font-size: 12px;
+      cursor: pointer;
+      color: white;
+      padding: 0;
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      transition: all 0.2s;
+      margin-right: 4px;
+    }
+
+    .cg-toggle-btn:hover {
+      background: #388E3C;
+    }
+
+    .cg-toggle-btn.cg-toggle-paused {
+      background: #FF9800;
+    }
+
+    .cg-toggle-btn.cg-toggle-paused:hover {
+      background: #F57C00;
+    }
+
+    .cg-dock-btn {
+      background: none;
+      border: none;
+      font-size: 14px;
+      cursor: pointer;
+      color: #999;
+      padding: 0;
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      transition: all 0.2s;
+    }
+
+    .cg-dock-btn:hover {
+      background: #f0f0f0;
+      color: #333;
+    }
+
+    /* Docked (compact) mode - small floating icon */
+    .cg-docked-icon {
+      width: 40px;
+      height: 40px;
+      background: linear-gradient(135deg, #4CAF50, #2E7D32);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+      transition: all 0.2s;
+    }
+
+    .cg-docked-icon:hover {
+      transform: scale(1.1);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+
+    .cg-docked-eye {
+      font-size: 20px;
+      line-height: 1;
+    }
+
+    /* When docked, shrink the overlay container */
+    #context-grabber-overlay.cg-docked {
+      width: auto;
+      max-height: none;
+      background: transparent;
+      border: none;
+      box-shadow: none;
+      overflow: visible;
+    }
+
     .cg-hint {
       color: #999;
       font-style: italic;
@@ -1799,6 +2055,89 @@ function escapeHtml(text) {
 }
 
 // ============================================================================
+// EXTENSION TOGGLE: Enable/disable without page reload
+// ============================================================================
+
+/**
+ * Toggles the extension on or off.
+ * Updates the overlay status and resets dwell state.
+ */
+function toggleExtension() {
+  extensionEnabled = !extensionEnabled;
+  dwellAnchor = null; // Reset dwell state
+  
+  // Ensure overlay exists
+  if (!currentOverlay) {
+    createPersistentOverlay();
+  }
+  
+  if (extensionEnabled) {
+    console.log('[ContextGrabber] Extension ENABLED');
+    setOverlayStatus('Watching...');
+    showOverlayIfHidden();
+  } else {
+    console.log('[ContextGrabber] Extension DISABLED');
+    setOverlayStatus('Paused (click ▶ to resume)');
+  }
+  
+  // Update the toggle button appearance
+  updateToggleButton();
+  
+  // Notify background about state change for badge update
+  chrome.runtime.sendMessage({ 
+    type: 'EXTENSION_STATE_CHANGED', 
+    enabled: extensionEnabled 
+  }).catch(() => {}); // Ignore if background not ready
+}
+
+/**
+ * Shows the overlay if it was minimized.
+ * Creates the overlay if it doesn't exist.
+ */
+function showOverlayIfHidden() {
+  if (!currentOverlay) {
+    createPersistentOverlay();
+  }
+  if (!currentOverlay) return; // Still failed to create
+  
+  const body = currentOverlay.querySelector('#cg-body');
+  const minimizeBtn = currentOverlay.querySelector('.cg-minimize-btn');
+  if (body && body.style.display === 'none') {
+    body.style.display = 'block';
+    if (minimizeBtn) minimizeBtn.innerHTML = '&#8212;';
+    overlayVisible = true;
+  }
+}
+
+/**
+ * Updates the toggle button appearance based on extension state.
+ */
+function updateToggleButton() {
+  if (!currentOverlay) createPersistentOverlay();
+  if (!currentOverlay) return;
+  const toggleBtn = currentOverlay.querySelector('#cg-toggle-btn');
+  if (toggleBtn) {
+    if (extensionEnabled) {
+      toggleBtn.innerHTML = '&#9724;'; // Pause/stop symbol
+      toggleBtn.title = 'Pause extension (Ctrl+Shift+G)';
+      toggleBtn.classList.remove('cg-toggle-paused');
+    } else {
+      toggleBtn.innerHTML = '&#9654;'; // Play symbol
+      toggleBtn.title = 'Resume extension (Ctrl+Shift+G)';
+      toggleBtn.classList.add('cg-toggle-paused');
+    }
+  }
+}
+
+// Keyboard shortcut to toggle extension: Ctrl+Shift+G (or Cmd+Shift+G on Mac)
+document.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'g') {
+    event.preventDefault();
+    toggleExtension();
+  }
+}, true);
+
+// ============================================================================
 // MESSAGE HANDLER: Receive analysis results from background worker
 // ============================================================================
 
@@ -1808,10 +2147,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
   }
 
-  // Extension icon was clicked → grab context and search Google
+  // Toggle extension on/off
+  if (message.type === 'TOGGLE_EXTENSION') {
+    toggleExtension();
+    sendResponse({ enabled: extensionEnabled });
+  }
+
+  // Get current extension state
+  if (message.type === 'GET_EXTENSION_STATE') {
+    sendResponse({ enabled: extensionEnabled });
+  }
+
+  // Extension icon was clicked → toggle if already running, or grab context
   if (message.type === 'GRAB_CONTEXT') {
-    handleGrabContext();
-    sendResponse({ received: true });
+    // If user clicks icon, toggle the extension instead of grabbing context
+    toggleExtension();
+    sendResponse({ received: true, enabled: extensionEnabled });
   }
 
   // Receive Google search results from background
@@ -2064,6 +2415,7 @@ async function sendImageToBackend(imageDataUrl) {
 /**
  * Sends extracted text to background for Google search + image search.
  * Also captures a snapshot of the area around the dwell point.
+ * Respects SCREENSHOT_PRIORITY setting.
  */
 async function triggerSearchFromPoint(x, y) {
   // Try to extract text — dispatches to PDF / Google Docs / normal extractors
@@ -2102,78 +2454,112 @@ async function triggerSearchFromPoint(x, y) {
   setOverlayStatus('Capturing...');
   updateOverlayContent('<p class="cg-loading">Capturing area and searching...</p>');
 
-  // 1) Capture a snapshot of the area around the dwell point
-  try {
-    const snapshot = await captureAreaSnapshot(x, y);
-    lastSnapshotDataUrl = snapshot;
-  } catch (err) {
-    console.warn('[ContextGrabber] Snapshot capture failed:', err);
-    lastSnapshotDataUrl = null;
+  // --- SCREENSHOT API PRIORITY MODE ---
+  if (SCREENSHOT_PRIORITY === 'api-only' || SCREENSHOT_PRIORITY === 'api-first') {
+    // 1) Capture a snapshot of the area around the dwell point
+    try {
+      const snapshot = await captureAreaSnapshot(x, y);
+      lastSnapshotDataUrl = snapshot;
+    } catch (err) {
+      console.warn('[ContextGrabber] Snapshot capture failed:', err);
+      lastSnapshotDataUrl = null;
+    }
+
+    // 2) Send to backend image analysis API
+    let backendResults = null;
+    if (lastSnapshotDataUrl && ANALYZE_API_URL) {
+      console.log('[ContextGrabber] Sending snapshot to backend analysis...');
+      setOverlayStatus('Analyzing screenshot...');
+      backendResults = await sendImageToBackend(lastSnapshotDataUrl);
+    }
+
+    // 3) If backend returned results, display them
+    if (backendResults && backendResults.length > 0) {
+      console.log('[ContextGrabber] Backend provided', backendResults.length, 'results');
+      showSearchResultsOverlay({
+        query: text.substring(0, 60) + '...',
+        results: backendResults
+      });
+      return;
+    }
+
+    // 4) If api-only mode and no results, show message and stop
+    if (SCREENSHOT_PRIORITY === 'api-only') {
+      if (!lastSnapshotDataUrl) {
+        updateOverlayContent('<p class="cg-hint">Screenshot capture failed.</p>');
+      } else {
+        updateOverlayContent('<p class="cg-hint">No results from API. Screenshot sent.</p>');
+      }
+      setOverlayStatus('API complete');
+      // Still show the snapshot if captured
+      if (lastSnapshotDataUrl) {
+        showSearchResultsOverlay({
+          query: text.substring(0, 60) + '...',
+          results: []
+        });
+      }
+      return;
+    }
+    // Otherwise fall through to Google search (api-first mode)
   }
 
-  // 2) Try backend image analysis first (if configured)
-  let backendResults = null;
-  if (lastSnapshotDataUrl && ANALYZE_API_URL) {
-    console.log('[ContextGrabber] Sending snapshot to backend analysis...');
-    setOverlayStatus('Backend analysis...');
-    backendResults = await sendImageToBackend(lastSnapshotDataUrl);
-  }
+  // --- GOOGLE SEARCH FALLBACK ---
+  if (SCREENSHOT_PRIORITY !== 'api-only') {
+    console.log('[ContextGrabber] Using Google text search');
+    setOverlayStatus('Searching Google...');
 
-  // 3) If backend returned results, display them and skip Google search
-  if (backendResults && backendResults.length > 0) {
-    console.log('[ContextGrabber] Backend provided', backendResults.length, 'results');
-    // Display backend results using existing overlay function
-    showSearchResultsOverlay({
-      query: text.substring(0, 60) + '...',
-      results: backendResults
-    });
-    return;
-  }
-
-  // 4) Fall back to Google text search
-  console.log('[ContextGrabber] Falling back to Google text search');
-  setOverlayStatus('Searching Google...');
-
-  // Request web search results
-  chrome.runtime.sendMessage(
-    { type: 'SEARCH_GOOGLE', data: { url, text } },
-    response => {
-      if (chrome.runtime.lastError) {
-        console.error('[ContextGrabber] Message error:', chrome.runtime.lastError);
+    // Capture snapshot if not already done
+    if (!lastSnapshotDataUrl && SCREENSHOT_PRIORITY !== 'google-only') {
+      try {
+        const snapshot = await captureAreaSnapshot(x, y);
+        lastSnapshotDataUrl = snapshot;
+      } catch (err) {
+        console.warn('[ContextGrabber] Snapshot capture failed:', err);
+        lastSnapshotDataUrl = null;
       }
     }
-  );
 
-  // Request image search results in parallel
-  chrome.runtime.sendMessage(
-    { type: 'SEARCH_GOOGLE_IMAGES', data: { url, text } },
-    response => {
-      if (chrome.runtime.lastError) {
-        console.error('[ContextGrabber] Image search message error:', chrome.runtime.lastError);
+    // Request web search results
+    chrome.runtime.sendMessage(
+      { type: 'SEARCH_GOOGLE', data: { url, text } },
+      response => {
+        if (chrome.runtime.lastError) {
+          console.error('[ContextGrabber] Message error:', chrome.runtime.lastError);
+        }
       }
-    }
-  );
+    );
 
-  // If text extraction was thin, try OCR on the snapshot
-  if (lastSnapshotDataUrl && text.replace(/\[.*?\]/g, '').trim().length < 60) {
-    console.log('[ContextGrabber] Text is thin, attempting OCR on snapshot...');
-    setOverlayStatus('Running OCR...');
-    performClientOCR(lastSnapshotDataUrl).then(ocrText => {
-      if (ocrText && ocrText.trim().length > 10) {
-        console.log('[ContextGrabber] OCR extracted:', ocrText.substring(0, 80));
-        // Re-search with better text from OCR
-        chrome.runtime.sendMessage(
-          { type: 'SEARCH_GOOGLE', data: { url, text: ocrText.trim() } },
-          () => {
-            if (chrome.runtime.lastError) {
-              console.error('[ContextGrabber] OCR re-search error:', chrome.runtime.lastError);
+    // Request image search results in parallel
+    chrome.runtime.sendMessage(
+      { type: 'SEARCH_GOOGLE_IMAGES', data: { url, text } },
+      response => {
+        if (chrome.runtime.lastError) {
+          console.error('[ContextGrabber] Image search message error:', chrome.runtime.lastError);
+        }
+      }
+    );
+
+    // If text extraction was thin, try OCR on the snapshot
+    if (lastSnapshotDataUrl && text.replace(/\[.*?\]/g, '').trim().length < 60) {
+      console.log('[ContextGrabber] Text is thin, attempting OCR on snapshot...');
+      setOverlayStatus('Running OCR...');
+      performClientOCR(lastSnapshotDataUrl).then(ocrText => {
+        if (ocrText && ocrText.trim().length > 10) {
+          console.log('[ContextGrabber] OCR extracted:', ocrText.substring(0, 80));
+          // Re-search with better text from OCR
+          chrome.runtime.sendMessage(
+            { type: 'SEARCH_GOOGLE', data: { url, text: ocrText.trim() } },
+            () => {
+              if (chrome.runtime.lastError) {
+                console.error('[ContextGrabber] OCR re-search error:', chrome.runtime.lastError);
+              }
             }
-          }
-        );
-      }
-    }).catch(err => {
-      console.warn('[ContextGrabber] OCR failed:', err);
-    });
+          );
+        }
+      }).catch(err => {
+        console.warn('[ContextGrabber] OCR failed:', err);
+      });
+    }
   }
 }
 
@@ -2330,6 +2716,12 @@ async function dwellDetectionLoop() {
   while (true) {
     try {
       await new Promise(resolve => setTimeout(resolve, DWELL_CHECK_INTERVAL));
+
+      // Skip if extension is disabled
+      if (!extensionEnabled) {
+        dwellAnchor = null;
+        continue;
+      }
 
       // Skip while typing or cursor is inside the overlay
       if (isTyping || isHoveringOverlay) {
