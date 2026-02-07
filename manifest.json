@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Gaze Context Grabber",
+  "version": "1.0.0",
+  "description": "Chrome extension that uses gaze tracking to extract and analyze page context with click fallback",
+  
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs"
+  ],
+  
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "<all_urls>"
+  ],
+  
+  "action": {
+    "default_title": "Grab Context & Search"
+  },
+
+  "background": {
+    "service_worker": "background.js"
+  },
+  
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

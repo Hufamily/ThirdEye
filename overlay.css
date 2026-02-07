@@ -1,0 +1,119 @@
+/**
+ * OVERLAY STYLES - Reference for the floating context grabber overlay
+ * 
+ * Note: These styles are currently injected dynamically via getOverlayStyles()
+ * in content.js to ensure they're loaded regardless of page CSS loading timing.
+ * 
+ * If you want to use this as a separate stylesheet:
+ * 1. Add to manifest.json content_scripts: "css": ["overlay.css"]
+ * 2. Remove the getOverlayStyles() function from content.js
+ * 3. Remove the style injection code in showOverlay()
+ */
+
+#context-grabber-overlay {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  width: 380px;
+  max-height: 80vh;
+  background: white;
+  border: 2px solid #4CAF50;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 2147483647;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  overflow-y: auto;
+  pointer-events: auto;
+}
+
+.cg-overlay-content {
+  padding: 16px;
+  color: #333;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.cg-close-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  color: #999;
+  padding: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.cg-close-btn:hover {
+  background: #f0f0f0;
+  color: #333;
+}
+
+.cg-section {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #eee;
+}
+
+.cg-section:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+
+.cg-section strong {
+  display: block;
+  margin-bottom: 8px;
+  color: #4CAF50;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.cg-section p {
+  margin: 0;
+  padding: 0;
+}
+
+.cg-section ul {
+  margin: 0;
+  padding-left: 20px;
+  list-style: disc;
+}
+
+.cg-section li {
+  margin: 4px 0;
+  padding: 0;
+}
+
+/* Prevent text selection while maintaining readability */
+#context-grabber-overlay {
+  user-select: text;
+}
+
+/* Scrollbar styling */
+#context-grabber-overlay::-webkit-scrollbar {
+  width: 6px;
+}
+
+#context-grabber-overlay::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 3px;
+}
+
+#context-grabber-overlay::-webkit-scrollbar-thumb {
+  background: #ccc;
+  border-radius: 3px;
+}
+
+#context-grabber-overlay::-webkit-scrollbar-thumb:hover {
+  background: #999;
+}
