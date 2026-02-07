@@ -1,0 +1,838 @@
+/**
+ * BACKGROUND SERVICE WORKER
+ * 
+ * Handles:
+ * - Extension icon click → triggers context grab
+ * - Google search scraping from extracted context
+ * - Calling the analysis API
+ * - Sending results back to content script for display
+ * 
+ * TO INTEGRATE YOUR OWN ANALYSIS BACKEND:
+ * 1. Change ANALYZE_API_URL below
+ * 2. Modify the request format if your API expects different input
+ * 3. Modify the response handling to match your API output
+ */
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+/**
+ * Analysis API endpoint
+ * POST request with { url, text } body
+ */
+const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
+
+/** Request timeout in milliseconds */
+const REQUEST_TIMEOUT = 5000;
+
+/** Max words to use from extracted text as a Google search query */
+const MAX_SEARCH_QUERY_WORDS = 12;
+
+// ============================================================================
+// EXTENSION ICON CLICK → Toggle extension on/off
+// ============================================================================
+
+chrome.action.onClicked.addListener((tab) => {
+  if (!tab.id || tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
+    console.warn('[ContextGrabber] Cannot run on this page:', tab.url);
+    return;
+  }
+
+  // Send toggle message to content script
+  chrome.tabs.sendMessage(tab.id, { type: 'GRAB_CONTEXT' }, (response) => {
+    if (chrome.runtime.lastError) {
+      console.error('[ContextGrabber] Could not reach content script:', chrome.runtime.lastError.message);
+      return;
+    }
+    // Update badge based on new state
+    if (response && response.enabled !== undefined) {
+      updateBadgeForTab(tab.id, response.enabled);
+    }
+  });
+});
+
+/**
+ * Updates the extension badge to show enabled/disabled state
+ */
+function updateBadgeForTab(tabId, enabled) {
+  if (enabled) {
+    chrome.action.setBadgeText({ text: '', tabId });
+    chrome.action.setBadgeBackgroundColor({ color: '#4CAF50', tabId });
+  } else {
+    chrome.action.setBadgeText({ text: 'OFF', tabId });
+    chrome.action.setBadgeBackgroundColor({ color: '#FF9800', tabId });
+  }
+}
+
+// ============================================================================
+// MESSAGE HANDLER: Receive content from content script
+// ============================================================================
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Handle extension state changes from content script
+  if (message.type === 'EXTENSION_STATE_CHANGED') {
+    if (sender.tab && sender.tab.id) {
+      updateBadgeForTab(sender.tab.id, message.enabled);
+    }
+    sendResponse({ received: true });
+  }
+
+  if (message.type === 'ANALYZE_CONTENT') {
+    analyzeContent(message.data, sender.tab.id);
+    sendResponse({ received: true });
+  }
+
+  if (message.type === 'SEARCH_GOOGLE') {
+    searchGoogleAndRespond(message.data, sender.tab.id);
+    sendResponse({ received: true });
+  }
+
+  // Capture visible tab screenshot and return it
+  if (message.type === 'CAPTURE_AREA') {
+    captureVisibleTab(sender.tab.id, message.data)
+      .then(dataUrl => sendResponse({ dataUrl }))
+      .catch(err => {
+        console.error('[ContextGrabber] Capture error:', err);
+        sendResponse({ dataUrl: null });
+      });
+    return true; // Keep sendResponse channel open for async
+  }
+
+  // Search Google Images
+  if (message.type === 'SEARCH_GOOGLE_IMAGES') {
+    searchGoogleImagesAndRespond(message.data, sender.tab.id);
+    sendResponse({ received: true });
+  }
+});
+
+// ============================================================================
+// GOOGLE SEARCH: Scrape results for context
+// ============================================================================
+
+/** Time-decay LRU cache for recent search results (avoids redundant requests) */
+const searchCache = new Map();
+const SEARCH_CACHE_MAX = 30;
+const SEARCH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Gets cached search results if available and not expired.
+ * Increments access count and updates last-access time for LRU scoring.
+ */
+function getCachedResults(query) {
+  const entry = searchCache.get(query);
+  if (!entry) return null;
+
+  // Check TTL
+  if (Date.now() - entry.createdAt > SEARCH_CACHE_TTL) {
+    searchCache.delete(query);
+    return null;
+  }
+
+  // Update access tracking for LRU
+  entry.accessCount++;
+  entry.lastAccessTime = Date.now();
+  return entry.results;
+}
+
+/**
+ * Sets cache entry with time-decay LRU metadata.
+ * On eviction, prioritizes frequently accessed AND recently accessed queries.
+ */
+function setCachedResults(query, results) {
+  if (searchCache.size >= SEARCH_CACHE_MAX) {
+    // Evict entry with lowest LRU score
+    let lowestScore = Infinity;
+    let lowestKey = null;
+
+    const now = Date.now();
+    for (const [key, entry] of searchCache.entries()) {
+      // Score = accessCount * 10 + (recency: ms since last access, scaled to 1-10 range)
+      const msSinceLastAccess = now - entry.lastAccessTime;
+      const recencyScore = Math.max(1, 10 - (msSinceLastAccess / SEARCH_CACHE_TTL) * 10);
+      const score = (entry.accessCount * 20) + recencyScore;
+
+      if (score < lowestScore) {
+        lowestScore = score;
+        lowestKey = key;
+      }
+    }
+
+    if (lowestKey) searchCache.delete(lowestKey);
+  }
+
+  searchCache.set(query, {
+    results,
+    createdAt: Date.now(),
+    lastAccessTime: Date.now(),
+    accessCount: 1
+  });
+}
+
+/** Common English stop words to strip from search queries */
+const STOP_WORDS = new Set([
+  'the','a','an','and','or','but','in','on','at','to','for','of','with',
+  'by','from','is','it','as','be','was','are','been','has','have','had',
+  'that','this','these','those','which','what','who','whom','where','when',
+  'how','not','no','do','does','did','will','would','can','could','shall',
+  'should','may','might','its','than','then','so','if','just','also','very',
+  'into','about','up','out','all','some','any','each','every','such','here',
+  'there','other','more','much','own'
+]);
+
+/**
+ * Builds an effective search query from extracted page text.
+ *
+ * Improvements over the naive "first sentence" approach:
+ * 1. Strips rich-extraction metadata tags like [Image: ...], [Table: ...]
+ * 2. Removes common stop words to keep only keywords
+ * 3. Scores candidate phrases by keyword density
+ * 4. Avoids URLs and very short fragments
+ */
+function buildSearchQuery(text) {
+  // 1) Strip metadata bracket tags from rich extraction
+  let cleaned = text.replace(/\[[^\]]{0,80}\]/g, ' ');
+
+  // 2) Remove URLs
+  cleaned = cleaned.replace(/https?:\/\/\S+/g, ' ');
+
+  // 3) Collapse whitespace and split into sentences/lines
+  cleaned = cleaned.replace(/\s+/g, ' ').trim();
+  const sentences = cleaned.split(/[.!?\n]+/).map(s => s.trim()).filter(s => s.length > 5);
+
+  if (sentences.length === 0) {
+    // Fallback: just take the first N words of whatever we have
+    return cleaned.split(/\s+/).slice(0, MAX_SEARCH_QUERY_WORDS).join(' ');
+  }
+
+  // 4) Score each sentence by keyword density (non-stop-word ratio)
+  let bestSentence = sentences[0];
+  let bestScore = -1;
+
+  for (const sentence of sentences.slice(0, 10)) { // check first 10 sentences
+    const words = sentence.split(/\s+/).filter(w => w.length > 1);
+    if (words.length < 2) continue;
+    const keywords = words.filter(w => !STOP_WORDS.has(w.toLowerCase()));
+    const score = keywords.length / words.length; // keyword density 0-1
+    if (score > bestScore) {
+      bestScore = score;
+      bestSentence = sentence;
+    }
+  }
+
+  // 5) Take up to MAX_SEARCH_QUERY_WORDS, preferring keywords
+  const words = bestSentence.split(/\s+/);
+  const keywordsFirst = words.filter(w => !STOP_WORDS.has(w.toLowerCase()));
+  const query = keywordsFirst.slice(0, MAX_SEARCH_QUERY_WORDS).join(' ');
+
+  return query || words.slice(0, MAX_SEARCH_QUERY_WORDS).join(' ');
+}
+
+/**
+ * Fetches Google search results page and parses out result entries
+ * 
+ * @param {string} query - Search query string
+ * @returns {Promise<Array<{title: string, url: string, snippet: string}>>}
+ */
+async function scrapeGoogleResults(query) {
+  try {
+    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=5`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+    const response = await fetch(searchUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      console.warn('[ContextGrabber] Google returned status:', response.status);
+      // If Google blocks us (429 / 503), fall back to DuckDuckGo
+      if (response.status === 429 || response.status === 503) {
+        console.log('[ContextGrabber] Google rate-limited, trying DuckDuckGo...');
+        return await scrapeDuckDuckGoResults(query);
+      }
+      return [];
+    }
+
+    const html = await response.text();
+    const results = parseGoogleHTML(html);
+
+    // If Google returned an empty set (CAPTCHA page, etc.), try DDG
+    if (results.length === 0) {
+      console.log('[ContextGrabber] Google returned 0 results, trying DuckDuckGo...');
+      return await scrapeDuckDuckGoResults(query);
+    }
+
+    return results;
+  } catch (error) {
+    console.error('[ContextGrabber] Google search error:', error.message);
+    // Network error / timeout — try DuckDuckGo as fallback
+    try {
+      return await scrapeDuckDuckGoResults(query);
+    } catch (ddgError) {
+      console.error('[ContextGrabber] DuckDuckGo fallback also failed:', ddgError.message);
+      return [];
+    }
+  }
+}
+
+/**
+ * Parses Google search results from raw HTML using regex only.
+ * Service workers (MV3) don't support DOMParser, so we use pattern matching.
+ * Extracts titles, URLs, and snippets from result blocks.
+ */
+function parseGoogleHTML(html) {
+  const results = [];
+
+  // Pattern 1: Match <a> followed by <h3> structure (modern Google results)
+  // Google structure: <a href="URL">...<h3>TITLE</h3>...</a>
+  const resultPattern = /<a[^>]+href="(https?:\/\/(?!www\.google\.)[^"]+)"[^>]*>(?:(?!<\/a>).)*?<h3[^>]*>(.*?)<\/h3>/gis;
+  let match;
+
+  while ((match = resultPattern.exec(html)) !== null && results.length < 5) {
+    const url = match[1];
+    const title = match[2].replace(/<[^>]+>/g, '').trim();
+
+    if (!title || !url) continue;
+    if (url.includes('google.com/search') || url.includes('accounts.google') || url.includes('gstatic.com')) continue;
+
+    // Extract snippet: look for text after the title block
+    const afterMatch = html.substring(match.index + match[0].length, match.index + match[0].length + 500);
+    const snippetMatch = afterMatch.match(/<span[^>]*>([^<]{40,200})<\/span>/i);
+    const snippet = snippetMatch ? snippetMatch[1].replace(/<[^>]+>/g, '').trim() : '';
+
+    results.push({ title, url, snippet });
+  }
+
+  // Pattern 2: Alternative structure - separate h3 and link patterns
+  if (results.length === 0) {
+    const titleRegex = /<h3[^>]*>(.*?)<\/h3>/gi;
+    const linkRegex = /<a[^>]+href="(https?:\/\/(?!www\.google\.com)[^"]+)"[^>]*>/gi;
+
+    const titles = [];
+    while ((match = titleRegex.exec(html)) !== null && titles.length < 8) {
+      const clean = match[1].replace(/<[^>]+>/g, '').trim();
+      if (clean.length > 5) titles.push(clean);
+    }
+
+    const urls = [];
+    const seenUrls = new Set();
+    while ((match = linkRegex.exec(html)) !== null && urls.length < 15) {
+      const u = match[1];
+      if (seenUrls.has(u)) continue;
+      seenUrls.add(u);
+      if (!u.includes('google.com') && !u.includes('gstatic.com') && !u.includes('accounts.google')) {
+        urls.push(u);
+      }
+    }
+
+    for (let i = 0; i < Math.min(titles.length, urls.length, 5); i++) {
+      results.push({ title: titles[i], url: urls[i], snippet: '' });
+    }
+  }
+
+  // Pattern 3: Featured snippets and knowledge panels
+  if (results.length === 0) {
+    const featuredPattern = /data-(?:title|text)="([^"]{10,100})"/gi;
+    while ((match = featuredPattern.exec(html)) !== null && results.length < 3) {
+      const text = match[1].trim();
+      if (text && !text.includes('Google')) {
+        results.push({ title: text, url: '', snippet: 'Featured result' });
+      }
+    }
+  }
+
+  console.log('[ContextGrabber] Parsed', results.length, 'results from Google HTML');
+  return results;
+}
+
+// ============================================================================
+// DUCKDUCKGO FALLBACK: Used when Google blocks or returns empty
+// ============================================================================
+
+/**
+ * Scrapes DuckDuckGo HTML search results as a fallback.
+ * DDG's HTML version is more tolerant of automated requests.
+ *
+ * @param {string} query
+ * @returns {Promise<Array<{title: string, url: string, snippet: string}>>}
+ */
+async function scrapeDuckDuckGoResults(query) {
+  try {
+    const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+    const response = await fetch(searchUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      console.warn('[ContextGrabber] DuckDuckGo returned status:', response.status);
+      return [];
+    }
+
+    const html = await response.text();
+    return parseDuckDuckGoHTML(html);
+  } catch (error) {
+    console.error('[ContextGrabber] DuckDuckGo search error:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Parses DuckDuckGo HTML lite results page using regex only.
+ * Service workers (MV3) don't support DOMParser.
+ * Results are in <div class="result"> blocks.
+ */
+function parseDuckDuckGoHTML(html) {
+  const results = [];
+
+  // Pattern 1: DDG HTML lite result links with class="result__a"
+  const resultPattern = /class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi;
+  let match;
+
+  while ((match = resultPattern.exec(html)) !== null && results.length < 5) {
+    let url = match[1];
+    const title = match[2].replace(/<[^>]+>/g, '').trim();
+
+    // DDG redirects through uddg= param; extract actual URL
+    const uddgMatch = url.match(/[?&]uddg=([^&]+)/);
+    if (uddgMatch) {
+      url = decodeURIComponent(uddgMatch[1]);
+    }
+
+    if (!title || !url || url.includes('duckduckgo.com')) continue;
+
+    // Try to find snippet in nearby result__snippet class
+    const snippetPattern = new RegExp(`${escapeRegex(title)}[\\s\\S]{0,500}class="result__snippet"[^>]*>([^<]{10,200})`, 'i');
+    const snippetMatch = html.match(snippetPattern);
+    const snippet = snippetMatch ? snippetMatch[1].trim() : '';
+
+    results.push({ title, url, snippet });
+  }
+
+  // Pattern 2: Alternative - look for links with href containing uddg
+  if (results.length === 0) {
+    const altPattern = /<a[^>]+href="[^"]*uddg=([^"&]+)[^"]*"[^>]*>([^<]+)<\/a>/gi;
+    while ((match = altPattern.exec(html)) !== null && results.length < 5) {
+      const url = decodeURIComponent(match[1]);
+      const title = match[2].trim();
+      if (title.length > 5 && url && !url.includes('duckduckgo.com')) {
+        results.push({ title, url, snippet: '' });
+      }
+    }
+  }
+
+  console.log('[ContextGrabber] Parsed', results.length, 'results from DuckDuckGo HTML');
+  return results;
+}
+
+/**
+ * Escapes special regex characters in a string.
+ */
+function escapeRegex(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Handles the full flow: receive context → search Google → send results to overlay
+ */
+async function searchGoogleAndRespond(data, tabId) {
+  try {
+    const query = buildSearchQuery(data.text);
+    console.log('[ContextGrabber] Searching for:', query);
+
+    if (!query || query.trim().length < 3) {
+      console.warn('[ContextGrabber] Query too short, skipping search');
+      chrome.tabs.sendMessage(tabId, {
+        type: 'SHOW_SEARCH_RESULTS',
+        data: {
+          query: query || '(empty)',
+          results: [{ title: 'Query too short', url: '', snippet: 'Please select more text for better search results.' }],
+          sourceUrl: data.url
+        }
+      });
+      return;
+    }
+
+    // Check cache first
+    let results = getCachedResults(query);
+    if (results) {
+      console.log('[ContextGrabber] Cache hit for:', query);
+    } else {
+      results = await scrapeGoogleResults(query);
+      if (results.length > 0) setCachedResults(query, results);
+    }
+
+    // If no results from any source, provide a helpful fallback
+    if (!results || results.length === 0) {
+      console.warn('[ContextGrabber] No search results found for:', query);
+      results = [{
+        title: 'No results found',
+        url: `https://www.google.com/search?q=${encodeURIComponent(query)}`,
+        snippet: 'Click to search manually on Google. Try selecting different text for better results.'
+      }];
+    }
+
+    chrome.tabs.sendMessage(tabId, {
+      type: 'SHOW_SEARCH_RESULTS',
+      data: {
+        query: query,
+        results: results,
+        sourceUrl: data.url
+      }
+    }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.error('[ContextGrabber] Failed to send search results:', chrome.runtime.lastError.message);
+      }
+    });
+  } catch (error) {
+    console.error('[ContextGrabber] Search flow error:', error);
+    // Send error state to content script so user sees something
+    try {
+      chrome.tabs.sendMessage(tabId, {
+        type: 'SHOW_SEARCH_RESULTS',
+        data: {
+          query: data.text ? data.text.substring(0, 50) : 'unknown',
+          results: [{
+            title: 'Search failed',
+            url: '',
+            snippet: `Error: ${error.message}. Try again or select different text.`
+          }],
+          sourceUrl: data.url
+        }
+      });
+    } catch { /* ignore send errors */ }
+  }
+}
+
+// ============================================================================
+// SCREENSHOT CAPTURE: Capture visible tab and return it
+// ============================================================================
+
+/**
+ * Captures a screenshot of the currently visible tab.
+ * Returns the full-page screenshot as a data URL.
+ * The content script will crop it to the area of interest.
+ *
+ * @param {number} tabId - Tab to capture
+ * @param {Object} area  - { x, y, width, height, devicePixelRatio }
+ * @returns {Promise<string>} data URL of the screenshot
+ */
+async function captureVisibleTab(tabId, area) {
+  // Get the window ID for this tab
+  const tab = await chrome.tabs.get(tabId);
+
+  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+    format: 'png'
+  });
+
+  return dataUrl;
+}
+
+// ============================================================================
+// GOOGLE IMAGES SEARCH: Scrape image results for context
+// ============================================================================
+
+/**
+ * Fetches Google Images results and parses thumbnails/titles
+ *
+ * @param {string} query - Search query
+ * @returns {Promise<Array<{title: string, thumbnailUrl: string, sourceUrl: string}>>}
+ */
+async function scrapeGoogleImageResults(query) {
+  try {
+    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&tbm=isch&num=6`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+    const response = await fetch(searchUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      console.warn('[ContextGrabber] Google Images returned status:', response.status);
+      return [];
+    }
+
+    const html = await response.text();
+    return parseGoogleImagesHTML(html);
+  } catch (error) {
+    console.error('[ContextGrabber] Google Images search error:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Parses Google Images search page HTML to extract image thumbnails.
+ * Google Images embeds base64 thumbnail data and metadata in script tags.
+ */
+function parseGoogleImagesHTML(html) {
+  const results = [];
+
+  // Strategy 1: Extract image data from the "AF_initDataCallback" script blocks
+  // Google embeds image URLs in JSON-like structures within script tags
+  const imgRegex = /\["(https?:\/\/[^"]+\.(?:jpg|jpeg|png|gif|webp|svg)[^"]*)",\s*(\d+),\s*(\d+)\]/gi;
+  const seen = new Set();
+  let match;
+
+  while ((match = imgRegex.exec(html)) !== null && results.length < 8) {
+    const url = match[1];
+    const width = parseInt(match[2]);
+    const height = parseInt(match[3]);
+
+    // Skip tiny images (icons, tracking pixels) and Google's own assets
+    if (width < 50 || height < 50) continue;
+    if (url.includes('gstatic.com') || url.includes('google.com')) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+
+    results.push({
+      thumbnailUrl: url,
+      width: width,
+      height: height,
+      sourceUrl: '',
+      title: ''
+    });
+  }
+
+  // Strategy 2: Fallback — look for <img> tags with data-src or src attributes
+  if (results.length === 0) {
+    const imgTagRegex = /<img[^>]+(?:data-src|src)="(https?:\/\/[^"]+)"[^>]*>/gi;
+    while ((match = imgTagRegex.exec(html)) !== null && results.length < 8) {
+      const url = match[1];
+      if (url.includes('gstatic.com') || url.includes('google.com/images')) continue;
+      if (seen.has(url)) continue;
+      seen.add(url);
+
+      results.push({
+        thumbnailUrl: url,
+        width: 0,
+        height: 0,
+        sourceUrl: '',
+        title: ''
+      });
+    }
+  }
+
+  // Try to extract titles from nearby text
+  const titleRegex = /"([^"]{10,80})"\s*,\s*"(https?:\/\/[^"]+)"/g;
+  while ((match = titleRegex.exec(html)) !== null) {
+    // Try to match titles to existing results by proximity in HTML
+    for (const r of results) {
+      if (!r.title && !r.sourceUrl) {
+        r.title = match[1];
+        r.sourceUrl = match[2];
+        break;
+      }
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Full flow: receive context → search Google Images → send results to content script
+ */
+async function searchGoogleImagesAndRespond(data, tabId) {
+  try {
+    const query = buildSearchQuery(data.text);
+    console.log('[ContextGrabber] Searching Google Images for:', query);
+
+    if (!query || query.trim().length < 3) {
+      console.warn('[ContextGrabber] Query too short for image search');
+      chrome.tabs.sendMessage(tabId, {
+        type: 'SHOW_IMAGE_RESULTS',
+        data: { query: query || '(empty)', images: [] }
+      });
+      return;
+    }
+
+    const images = await scrapeGoogleImageResults(query);
+    console.log('[ContextGrabber] Found', images.length, 'images');
+
+    chrome.tabs.sendMessage(tabId, {
+      type: 'SHOW_IMAGE_RESULTS',
+      data: {
+        query: query,
+        images: images
+      }
+    }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.error('[ContextGrabber] Failed to send image results:', chrome.runtime.lastError.message);
+      }
+    });
+  } catch (error) {
+    console.error('[ContextGrabber] Image search flow error:', error);
+    // Send empty results so UI doesn't hang
+    try {
+      chrome.tabs.sendMessage(tabId, {
+        type: 'SHOW_IMAGE_RESULTS',
+        data: { query: '', images: [] }
+      });
+    } catch { /* ignore */ }
+  }
+}
+
+// ============================================================================
+// MAIN: Call analysis API and send results to content script
+// ============================================================================
+
+/**
+ * Sends content to analysis backend and returns results to content script
+ * 
+ * @param {Object} data - Content to analyze
+ * @param {string} data.url - Page URL
+ * @param {string} data.text - Extracted text content
+ * @param {number} tabId - Chrome tab ID for sending response
+ */
+async function analyzeContent(data, tabId) {
+  try {
+    console.log('[ContextGrabber] Analyzing content for tab', tabId);
+
+    // Call analysis API
+    const result = await callAnalysisAPI(data);
+
+    if (!result) {
+      console.warn('[ContextGrabber] Analysis API returned no result');
+      return;
+    }
+
+    console.log('[ContextGrabber] Analysis complete, sending to content script');
+
+    // Send result back to content script for display
+    chrome.tabs.sendMessage(
+      tabId,
+      {
+        type: 'SHOW_ANALYSIS',
+        data: result
+      },
+      response => {
+        if (chrome.runtime.lastError) {
+          console.error('[ContextGrabber] Failed to send analysis to content script:', 
+            chrome.runtime.lastError.message);
+        }
+      }
+    );
+  } catch (error) {
+    console.error('[ContextGrabber] Analysis error:', error);
+  }
+}
+
+/**
+ * Makes the actual API call to the analysis backend
+ * 
+ * CUSTOMIZE THIS FUNCTION for your backend:
+ * - Change request format (headers, body structure)
+ * - Transform response to match expected output
+ * - Add authentication if needed
+ * 
+ * @param {Object} data - { url, text }
+ * @returns {Promise<Object>} Analysis result
+ */
+async function callAnalysisAPI(data) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+    const response = await fetch(ANALYZE_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        url: data.url,
+        text: data.text
+      }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      console.error('[ContextGrabber] Analysis API returned status:', response.status);
+      return getPlaceholderResponse(data);
+    }
+
+    const result = await response.json();
+
+    // Validate response format
+    if (!result.summary || !Array.isArray(result.confusion_points) || 
+        !Array.isArray(result.image_queries)) {
+      console.warn('[ContextGrabber] Invalid analysis response format:', result);
+      return getPlaceholderResponse(data);
+    }
+
+    return result;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.warn('[ContextGrabber] Analysis API timeout');
+    } else {
+      console.warn('[ContextGrabber] Analysis API error:', error.message);
+    }
+
+    // Return placeholder response when API is unavailable
+    return getPlaceholderResponse(data);
+  }
+}
+
+/**
+ * Returns a placeholder response when the analysis backend is unavailable
+ * Helps with testing the UI when your real backend isn't ready
+ * 
+ * REMOVE THIS when your real API is ready
+ * 
+ * @param {Object} data - The content that would have been analyzed
+ * @returns {Object} Placeholder analysis result
+ */
+function getPlaceholderResponse(data) {
+  const textPreview = data.text.substring(0, 100).trim();
+  
+  return {
+    summary: `Content from ${data.url}: "${textPreview}..."`,
+    confusion_points: [
+      'Analysis API is not available. Is your backend running on ' + ANALYZE_API_URL + '?',
+      'Check console for detailed error messages',
+      'Until backend is ready, this is a placeholder response'
+    ],
+    image_queries: [
+      'Set up your analysis backend',
+      'Configure ANALYZE_API_URL in background.js'
+    ]
+  };
+}
+
+// ============================================================================
+// SERVICE WORKER LIFECYCLE
+// ============================================================================
+
+// Log when service worker starts
+console.log('[ContextGrabber] Background service worker initialized');
