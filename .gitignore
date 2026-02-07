@@ -1,0 +1,8 @@
+# Sensitive/local config
+agent_action.py
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.pyc
