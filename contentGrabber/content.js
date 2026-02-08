@@ -19,8 +19,8 @@ console.log('[ContextGrabber] Script starting to load...');
 // CONFIGURATION - MODIFY THESE FOR YOUR SETUP
 // ============================================================================
 
-/** Gaze tracking API endpoint (GET request) */
-const GAZE_API_URL = 'http://127.0.0.1:8000/gaze';
+/** Gaze tracking API endpoint (GET request) - fallback when WebSocket not connected. gaze2 runs on 5000. */
+const GAZE_API_URL = 'http://127.0.0.1:5000/gaze';
 
 /** Analysis API endpoint (POST request) */
 const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
@@ -54,6 +54,12 @@ const DWELL_CHECK_INTERVAL = 200;
 
 /** Snapshot capture region size in pixels (width & height around the point) */
 const SNAPSHOT_SIZE = 400;
+
+/** Gaze-centered screenshot size (smaller region for real-time gaze capture) */
+const GAZE_SNAPSHOT_SIZE = 200;
+
+/** Red gaze overlay diameter in pixels */
+const GAZE_OVERLAY_DIAMETER = 20;
 
 /** 
  * Screenshot API priority mode:
@@ -96,6 +102,8 @@ let isHoveringOverlay = false;        // Tracks if cursor is inside the overlay
 let lastExtractedRegionKey = '';      // De-dup key for special page extractions
 let pdfTrackingOverlay = null;        // Transparent overlay for PDF mouse tracking
 let lastScrollTime = 0;               // Timestamp of last scroll event
+let lastGazePoint = null;             // Latest gaze from WebSocket {x, y, screenWidth, screenHeight}
+let gazeOverlayEl = null;             // Red circle DOM element for gaze cursor
 
 // Chatbot panel state
 let chatbotExpanded = false;          // Whether chatbot panel is expanded
@@ -246,6 +254,75 @@ async function getGazePoint() {
     gazeAvailable = false;
     return null;
   }
+}
+
+// ============================================================================
+// GAZE OVERLAY: Red circle at gaze position (real-time from WebSocket)
+// ============================================================================
+
+/**
+ * Converts screen coordinates to viewport coordinates.
+ * Gaze model outputs screen pixels; we need viewport-relative for overlay.
+ * Uses window.screenX/Y and chrome height to map screen -> viewport.
+ */
+function screenToViewport(screenX, screenY) {
+  const topOffset = typeof window.outerHeight !== 'undefined'
+    ? Math.max(0, window.outerHeight - window.innerHeight)
+    : 0;
+  const viewportLeft = window.screenX || 0;
+  const viewportTop = (window.screenY || 0) + topOffset;
+  const x = screenX - viewportLeft;
+  const y = screenY - viewportTop;
+  return {
+    x: Math.max(0, Math.min(window.innerWidth, x)),
+    y: Math.max(0, Math.min(window.innerHeight, y))
+  };
+}
+
+/**
+ * Creates the red gaze overlay element (fixed, pointer-events: none, high z-index).
+ * Created once and reused; position updated in real time.
+ */
+function createGazeOverlay() {
+  if (gazeOverlayEl) return gazeOverlayEl;
+  const el = document.createElement('div');
+  el.id = 'cg-gaze-overlay';
+  el.style.cssText = `
+    position: fixed;
+    width: ${GAZE_OVERLAY_DIAMETER}px;
+    height: ${GAZE_OVERLAY_DIAMETER}px;
+    border-radius: 50%;
+    background: rgba(255, 0, 0, 0.8);
+    pointer-events: none;
+    z-index: 2147483647;
+    left: -100px;
+    top: -100px;
+    transform: translate(-50%, -50%);
+    box-shadow: 0 0 4px rgba(0,0,0,0.3);
+  `;
+  document.body.appendChild(el);
+  gazeOverlayEl = el;
+  return el;
+}
+
+/**
+ * Updates the gaze overlay position. Call when GAZE_UPDATE arrives.
+ * Hides overlay when extension disabled or no gaze.
+ */
+function updateGazeOverlay(data) {
+  if (!extensionEnabled) {
+    if (gazeOverlayEl) gazeOverlayEl.style.display = 'none';
+    return;
+  }
+  if (!data || data.available === false) {
+    if (gazeOverlayEl) gazeOverlayEl.style.display = 'none';
+    return;
+  }
+  const vp = screenToViewport(data.x, data.y);
+  createGazeOverlay();
+  gazeOverlayEl.style.display = 'block';
+  gazeOverlayEl.style.left = vp.x + 'px';
+  gazeOverlayEl.style.top = vp.y + 'px';
 }
 
 // ============================================================================
@@ -4035,6 +4112,10 @@ function toggleExtension() {
     if (currentOverlay) {
       currentOverlay.style.display = 'none';
     }
+    // Hide gaze cursor overlay
+    if (gazeOverlayEl) {
+      gazeOverlayEl.style.display = 'none';
+    }
   }
   
   // Update the toggle button appearance
@@ -4127,6 +4208,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'SHOW_IMAGE_RESULTS') {
     showImageResultsInOverlay(message.data);
     sendResponse({ success: true });
+  }
+
+  // Real-time gaze updates from WebSocket or HTTP poll (gaze2 stream)
+  if (message.type === 'GAZE_UPDATE') {
+    lastGazePoint = message.data;
+    gazeAvailable = true;
+    updateGazeOverlay(message.data);
+    if (!window.__cgGazeReceived) {
+      window.__cgGazeReceived = true;
+      console.log('[ContextGrabber] Gaze tracking active — red dot following your eyes');
+    }
+    sendResponse({ received: true });
   }
 });
 
@@ -4371,7 +4464,7 @@ async function sendImageToBackend(imageDataUrl) {
  * Also captures a snapshot of the area around the dwell point.
  * Respects SCREENSHOT_PRIORITY setting.
  */
-async function triggerSearchFromPoint(x, y) {
+async function triggerSearchFromPoint(x, y, snapshotSize = SNAPSHOT_SIZE) {
   // Try to extract text — dispatches to PDF / Google Docs / normal extractors
   const target = resolveTargetFromPoint(x, y);
   let text = target ? target.text.trim() : '';
@@ -4427,7 +4520,7 @@ async function triggerSearchFromPoint(x, y) {
   if (SCREENSHOT_PRIORITY === 'api-only' || SCREENSHOT_PRIORITY === 'api-first') {
     // 1) Capture a snapshot of the area around the dwell point
     try {
-      const snapshot = await captureAreaSnapshot(x, y);
+      const snapshot = await captureAreaSnapshot(x, y, snapshotSize);
       lastSnapshotDataUrl = snapshot;
     } catch (err) {
       console.warn('[ContextGrabber] Snapshot capture failed:', err);
@@ -4510,7 +4603,7 @@ async function triggerSearchFromPoint(x, y) {
     // Capture snapshot if not already done
     if (!lastSnapshotDataUrl && SCREENSHOT_PRIORITY !== 'google-only') {
       try {
-        const snapshot = await captureAreaSnapshot(x, y);
+        const snapshot = await captureAreaSnapshot(x, y, snapshotSize);
         lastSnapshotDataUrl = snapshot;
       } catch (err) {
         console.warn('[ContextGrabber] Snapshot capture failed:', err);
@@ -4641,18 +4734,19 @@ async function performClientOCR(imageDataUrl) {
  *
  * @param {number} x - Client X coordinate (CSS pixels)
  * @param {number} y - Client Y coordinate (CSS pixels)
+ * @param {number} size - Square region size (default SNAPSHOT_SIZE, use GAZE_SNAPSHOT_SIZE for gaze-centered)
  * @returns {Promise<string|null>} Cropped snapshot as a data URL, or null
  */
-async function captureAreaSnapshot(x, y) {
+async function captureAreaSnapshot(x, y, size = SNAPSHOT_SIZE) {
   return new Promise((resolve, reject) => {
     const dpr = window.devicePixelRatio || 1;
-    const halfSize = SNAPSHOT_SIZE / 2;
+    const halfSize = size / 2;
 
     // Region in CSS pixels, clamped to viewport
     const cropX = Math.max(0, x - halfSize);
     const cropY = Math.max(0, y - halfSize);
-    const cropW = Math.min(SNAPSHOT_SIZE, window.innerWidth - cropX);
-    const cropH = Math.min(SNAPSHOT_SIZE, window.innerHeight - cropY);
+    const cropW = Math.min(size, window.innerWidth - cropX);
+    const cropH = Math.min(size, window.innerHeight - cropY);
 
     chrome.runtime.sendMessage(
       {
@@ -4738,9 +4832,13 @@ async function dwellDetectionLoop() {
         continue;
       }
 
-      // Get current point: gaze API first, then smoothed mouse fallback
+      // Get current point: WebSocket gaze first, then HTTP gaze API, then mouse fallback
       let point = null;
-      if (gazeAvailable) {
+      if (lastGazePoint && lastGazePoint.available !== false) {
+        const vp = screenToViewport(lastGazePoint.x, lastGazePoint.y);
+        point = { x: Math.round(vp.x), y: Math.round(vp.y) };
+      }
+      if (!point && gazeAvailable) {
         point = await getGazePoint();
       }
       if (!point) {
@@ -4766,14 +4864,14 @@ async function dwellDetectionLoop() {
 
       if (!dwellAnchor) {
         // Start a dwell anchor (velocity gate removed — decay handles it now)
-        dwellAnchor = { x: point.x, y: point.y, time: now };
+        dwellAnchor = { x: point.x, y: point.y, time: now, fromGaze: !!lastGazePoint };
         continue;
       }
 
       // Check if position moved outside the dwell radius
       if (distance(point, dwellAnchor) > DWELL_RADIUS) {
         // Moved away — reset anchor
-        dwellAnchor = { x: point.x, y: point.y, time: now };
+        dwellAnchor = { x: point.x, y: point.y, time: now, fromGaze: !!lastGazePoint };
         continue;
       }
 
@@ -4782,7 +4880,8 @@ async function dwellDetectionLoop() {
 
       if (dwellDuration >= DWELL_TIME_MS && mouseVelocity < VELOCITY_REST_THRESHOLD) {
         // Dwell threshold reached AND cursor is at rest — trigger scrape
-        triggerSearchFromPoint(dwellAnchor.x, dwellAnchor.y);
+        const snapshotSize = dwellAnchor.fromGaze ? GAZE_SNAPSHOT_SIZE : SNAPSHOT_SIZE;
+        triggerSearchFromPoint(dwellAnchor.x, dwellAnchor.y, snapshotSize);
         // Reset anchor so we don't re-trigger immediately
         dwellAnchor = null;
       }

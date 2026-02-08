@@ -42,15 +42,21 @@ parser.add_argument("--api", action="store_true", help="Start Flask API in backg
 parser.add_argument("--api-port", type=int, default=5000, help="Port for API (default: 5000)")
 args = parser.parse_args()
 
-# Start API in background thread if requested
+# Start API and WebSocket server in background threads if requested
 if args.api:
     import threading
     from api import app
+    from gaze_websocket_server import start_websocket_thread
+
     def run_api():
         app.run(host="0.0.0.0", port=args.api_port, debug=False, use_reloader=False)
     api_thread = threading.Thread(target=run_api, daemon=True)
     api_thread.start()
     print(f"API running at http://127.0.0.1:{args.api_port}/gaze")
+
+    # WebSocket server for real-time gaze streaming (Chrome extension)
+    start_websocket_thread(port=8765, screen_width=screen_width, screen_height=screen_height)
+    print("WebSocket gaze stream at ws://127.0.0.1:8765")
 
 # Initialize GazeFollower
 print("Initializing GazeFollower...")
@@ -107,7 +113,8 @@ while running:
         # Push to API for /gaze endpoint (if api module is used)
         try:
             from api.app import set_gaze
-            set_gaze(float(gaze_x), float(gaze_y), confidence=1.0)
+            set_gaze(float(gaze_x), float(gaze_y), confidence=1.0,
+                     screen_width=screen_width, screen_height=screen_height)
         except ImportError:
             pass
     

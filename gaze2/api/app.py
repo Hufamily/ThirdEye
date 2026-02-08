@@ -16,13 +16,20 @@ _gaze_data = {
     "y": 0.0,
     "confidence": 0.0,
     "available": False,
+    "screenWidth": 1920,
+    "screenHeight": 1080,
 }
 
 
-def set_gaze(x: float, y: float, confidence: float = 1.0) -> None:
+def set_gaze(x: float, y: float, confidence: float = 1.0,
+             screen_width: int = None, screen_height: int = None) -> None:
     """Update the shared gaze state. Call from gaze_cursor or other tracking code."""
     global _gaze_data
     _gaze_data = {"x": x, "y": y, "confidence": confidence, "available": True}
+    if screen_width is not None:
+        _gaze_data["screenWidth"] = screen_width
+    if screen_height is not None:
+        _gaze_data["screenHeight"] = screen_height
 
 
 def get_gaze():
@@ -38,12 +45,17 @@ def gaze():
             "x": data["x"],
             "y": data["y"],
             "confidence": data["confidence"],
+            "screenWidth": data.get("screenWidth", 1920),
+            "screenHeight": data.get("screenHeight", 1080),
         })
     # Fallback to mock data when no live gaze source (e.g. for development)
     return jsonify({
         "x": random.uniform(0, 1920),
         "y": random.uniform(0, 1080),
         "confidence": random.uniform(0.85, 1.0),
+        "screenWidth": 1920,
+        "screenHeight": 1080,
+        "available": False,
     })
 
 
