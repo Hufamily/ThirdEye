@@ -6,6 +6,7 @@ Determines operational mode based on page context
 from typing import Dict, Any, Optional
 from enum import Enum
 from .base_agent import BaseAgent
+from services.whitelist_service import WhitelistService
 
 
 class Mode(str, Enum):
@@ -40,7 +41,9 @@ class TrafficController(BaseAgent):
                     "content_type": "string" (optional)
                 },
                 "user_permissions": List[str] (optional),
-                "whitelisted_folders": List[str] (optional)
+                "org_id": str (optional) - Organization ID for whitelist check,
+                "google_access_token": str (optional) - For folder path lookup,
+                "whitelisted_folders": List[str] (optional) - Deprecated, will be fetched from DB
             }
         
         Returns:
@@ -66,10 +69,13 @@ class TrafficController(BaseAgent):
             url = input_data["url"]
             page_content = input_data.get("page_content", {})
             user_permissions = input_data.get("user_permissions", [])
-            whitelisted_folders = input_data.get("whitelisted_folders", [])
+            org_id = input_data.get("org_id")
+            google_access_token = input_data.get("google_access_token")
             
             # Detect mode
-            mode_result = self._detect_mode(url, page_content, user_permissions, whitelisted_folders)
+            mode_result = await self._detect_mode(
+                url, page_content, user_permissions, org_id, google_access_token
+            )
             
             return self.create_response(success=True, data=mode_result)
             
@@ -78,12 +84,13 @@ class TrafficController(BaseAgent):
         except Exception as e:
             return self.create_response(success=False, error=f"Mode detection failed: {str(e)}")
     
-    def _detect_mode(
+    async def _detect_mode(
         self,
         url: str,
         page_content: Dict[str, Any],
         user_permissions: list,
-        whitelisted_folders: list
+        org_id: Optional[str],
+        google_access_token: Optional[str]
     ) -> Dict[str, Any]:
         """Detect operational mode from URL and page content"""
         from datetime import datetime
@@ -121,10 +128,14 @@ class TrafficController(BaseAgent):
         
         # Check if document is whitelisted (for enterprise)
         is_whitelisted = False
-        if doc_id and whitelisted_folders:
-            # In a real implementation, check if doc is in whitelisted folder
-            # For now, assume all enterprise docs are whitelisted if user has enterprise access
-            is_whitelisted = len(whitelisted_folders) > 0
+        if doc_id and org_id:
+            # Use WhitelistService to check if document is whitelisted
+            whitelist_service = WhitelistService()
+            is_whitelisted = await whitelist_service.is_document_whitelisted(
+                doc_id=doc_id,
+                org_id=org_id,
+                access_token=google_access_token
+            )
         
         # Determine routing
         agent_6_0_active = mode == Mode.EDITABLE and is_whitelisted
@@ -176,7 +187,8 @@ class TrafficController(BaseAgent):
             "url": context.get("url", ""),
             "page_content": context.get("page_content", {}),
             "user_permissions": context.get("user_permissions", []),
-            "whitelisted_folders": context.get("whitelisted_folders", [])
+            "org_id": context.get("org_id"),
+            "google_access_token": context.get("google_access_token")
         })
         
         if not mode_result.get("success"):

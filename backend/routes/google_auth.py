@@ -6,7 +6,7 @@ Handles access tokens for Google Drive, Gmail, Chat APIs
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
-from utils.auth import get_current_user
+from routes.auth import get_current_user
 from models.user import User
 from utils.database import get_db, ensure_warehouse_resumed
 from sqlalchemy.orm import Session
@@ -36,7 +36,7 @@ async def store_access_token(
     
     Called after user grants additional permissions (Drive, Gmail, etc.)
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     try:
         # Store access token in user's metadata or separate table

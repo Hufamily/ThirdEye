@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Building2 } from 'lucide-react'
 import { TimeReclaimed, TopDocuments } from '../../components/enterprise/DiagnosticKPIs'
@@ -8,13 +8,21 @@ import { DocumentHeatmapView } from '../../components/enterprise/DocumentHeatmap
 import { AISuggestionsQueue } from '../../components/enterprise/AISuggestionsQueue'
 import { BatchExportFooter } from '../../components/enterprise/BatchExportFooter'
 import { Navigation } from '../../components/ui/Navigation'
-import type {
-  DocumentContent,
-  AISuggestion,
-  DocumentWithGoogleDoc,
-  ApplyEditRequest,
-  ApplyEditResponse,
-} from '../../types/enterprise'
+import { LoadingSpinner } from '../../components/ui/LoadingSpinner'
+import {
+  getGoogleDocsDocuments,
+  getSuggestions,
+  getDocumentContent,
+  applyEditToGoogleDoc,
+  acceptSuggestion,
+  rejectSuggestion,
+  getKPIs,
+  type DocumentWithGoogleDoc,
+  type DocumentContent,
+  type AISuggestion,
+  type ApplyEditRequest,
+  type ApplyEditResponse,
+} from '../../utils/api'
 
 export default function EnterpriseOverview() {
   const navigate = useNavigate()
@@ -23,10 +31,60 @@ export default function EnterpriseOverview() {
   const [selectedSuggestionIds, setSelectedSuggestionIds] = useState<Set<string>>(new Set())
   const [isGeneratingReport, setIsGeneratingReport] = useState(false)
   const [sendingToGoogleDocs, setSendingToGoogleDocs] = useState<Set<string>>(new Set())
+  const [documents, setDocuments] = useState<DocumentWithGoogleDoc[]>([])
+  const [documentContents, setDocumentContents] = useState<Record<string, DocumentContent>>({})
+  const [aiSuggestions, setAiSuggestions] = useState<AISuggestion[]>([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [kpis, setKpis] = useState<any>(null)
 
-  // Mock data with Google Doc file information
-  // In production, this would come from: GET /api/google-docs/documents
-  const documents: DocumentWithGoogleDoc[] = [
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        setIsLoading(true)
+        // Fetch documents
+        const docsResponse = await getGoogleDocsDocuments()
+        setDocuments(docsResponse.documents)
+
+        // Fetch KPIs
+        const kpisData = await getKPIs()
+        setKpis(kpisData)
+      } catch (err) {
+        console.error('Failed to fetch data:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load data')
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    fetchData()
+  }, [])
+
+  useEffect(() => {
+    const fetchDocumentData = async () => {
+      if (!selectedDocumentId) return
+
+      try {
+        // Fetch document content and suggestions
+        const [contentResponse, suggestionsResponse] = await Promise.all([
+          getDocumentContent(selectedDocumentId),
+          getSuggestions(selectedDocumentId)
+        ])
+
+        setDocumentContents({
+          [selectedDocumentId]: contentResponse
+        })
+        setAiSuggestions(suggestionsResponse.suggestions)
+      } catch (err) {
+        console.error('Failed to fetch document data:', err)
+      }
+    }
+
+    fetchDocumentData()
+  }, [selectedDocumentId])
+
+  // Mock data fallback (for development/testing)
+  const mockDocuments: DocumentWithGoogleDoc[] = [
     {
       id: '1',
       title: 'React Best Practices Guide',
@@ -71,9 +129,8 @@ export default function EnterpriseOverview() {
     },
   ]
 
-  // Document contents with Google Doc references
-  // In production, this would come from: GET /api/suggestions?documentId=xxx
-  const documentContents: Record<string, DocumentContent> = {
+  // Mock document contents fallback
+  const mockDocumentContents: Record<string, DocumentContent> = {
     '1': {
       id: '1',
       title: 'React Best Practices Guide',
@@ -126,9 +183,8 @@ export default function EnterpriseOverview() {
     },
   }
 
-  // AI Suggestions with Google Doc file references
-  // In production, this would come from: GET /api/suggestions?documentId=xxx
-  const aiSuggestions: AISuggestion[] = [
+  // Mock AI suggestions fallback
+  const mockAiSuggestions: AISuggestion[] = [
     {
       id: 's1',
       documentId: '1',
@@ -186,7 +242,7 @@ export default function EnterpriseOverview() {
   ]
 
   const selectedDocument = selectedDocumentId
-    ? documentContents[selectedDocumentId] || null
+    ? (documentContents[selectedDocumentId] || null)
     : null
 
   // Filter suggestions based on selected document
@@ -258,14 +314,32 @@ export default function EnterpriseOverview() {
     })
   }
 
-  const handleAccept = (suggestionId: string) => {
-    console.log('Accepting suggestion:', suggestionId)
-    // API call would go here
+  const handleAccept = async (suggestionId: string) => {
+    try {
+      await acceptSuggestion(suggestionId)
+      // Refresh suggestions
+      if (selectedDocumentId) {
+        const suggestionsResponse = await getSuggestions(selectedDocumentId)
+        setAiSuggestions(suggestionsResponse.suggestions)
+      }
+    } catch (err) {
+      console.error('Failed to accept suggestion:', err)
+      alert('Failed to accept suggestion. Please try again.')
+    }
   }
 
-  const handleReject = (suggestionId: string) => {
-    console.log('Rejecting suggestion:', suggestionId)
-    // API call would go here
+  const handleReject = async (suggestionId: string) => {
+    try {
+      await rejectSuggestion(suggestionId)
+      // Refresh suggestions
+      if (selectedDocumentId) {
+        const suggestionsResponse = await getSuggestions(selectedDocumentId)
+        setAiSuggestions(suggestionsResponse.suggestions)
+      }
+    } catch (err) {
+      console.error('Failed to reject suggestion:', err)
+      alert('Failed to reject suggestion. Please try again.')
+    }
   }
 
   /**
@@ -299,30 +373,8 @@ export default function EnterpriseOverview() {
         range: suggestion.googleDocRange,
       }
 
-      // Backend API call - Replace this with your actual endpoint
-      // const response = await fetch('/api/google-docs/apply-edit', {
-      //   method: 'POST',
-      //   headers: {
-      //     'Content-Type': 'application/json',
-      //     'Authorization': `Bearer ${authToken}`,
-      //   },
-      //   body: JSON.stringify(requestPayload),
-      // })
-      // 
-      // if (!response.ok) {
-      //   throw new Error(`API error: ${response.statusText}`)
-      // }
-      // 
-      // const result: ApplyEditResponse = await response.json()
-
-      // Simulate API call for now
-      await new Promise((resolve) => setTimeout(resolve, 2000))
-      const result: ApplyEditResponse = {
-        success: true,
-        message: 'Edit applied successfully',
-        googleDocUrl: suggestion.googleDoc.url,
-        appliedAt: new Date().toISOString(),
-      }
+      // Call backend API
+      const result = await applyEditToGoogleDoc(requestPayload)
 
       if (result.success) {
         console.log('✅ Successfully sent to Google Docs:', {
@@ -367,6 +419,27 @@ export default function EnterpriseOverview() {
     }
   }
 
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <LoadingSpinner />
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-background">
+        <Navigation />
+        <div className="max-w-[1920px] mx-auto px-4 pt-[123px]">
+          <div className="text-center text-red-500">
+            {error}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="min-h-screen bg-background">
       <Navigation />
@@ -401,7 +474,10 @@ export default function EnterpriseOverview() {
         {/* Top-Level: Efficiency & Unmet Need KPIs */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
           {/* Time Reclaimed */}
-          <TimeReclaimed timeReclaimed={245.8} totalTriggers={310} />
+          <TimeReclaimed 
+            timeReclaimed={kpis?.timeReclaimed || 0} 
+            totalTriggers={kpis?.totalTriggers || 0} 
+          />
 
           {/* Top Documents by Friction */}
           <TopDocuments
@@ -415,19 +491,10 @@ export default function EnterpriseOverview() {
 
           {/* Efficiency Prediction Chart */}
           <EfficiencyPredictionChart
-            data={[
-              { date: 'Week 1', actual: 62.5 },
-              { date: 'Week 2', actual: 64.2 },
-              { date: 'Week 3', actual: 65.8 },
-              { date: 'Week 4', actual: 67.1 },
-              { date: 'Week 5', actual: 68.3, predicted: 68.3 },
-              { date: 'Week 6', actual: 0, predicted: 70.1 },
-              { date: 'Week 7', actual: 0, predicted: 71.8 },
-              { date: 'Week 8', actual: 0, predicted: 73.5 },
-            ]}
-            currentEfficiency={68.3}
-            predictedEfficiency={73.5}
-            timeframe="8 weeks"
+            data={kpis?.efficiencyData || []}
+            currentEfficiency={kpis?.currentEfficiency || 0}
+            predictedEfficiency={kpis?.predictedEfficiency || 0}
+            timeframe={kpis?.timeframe || "7 days"}
           />
         </div>
 

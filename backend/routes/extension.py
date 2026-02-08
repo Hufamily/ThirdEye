@@ -56,7 +56,7 @@ async def start_session(
     POST /api/extension/session/start
     Start a new learning session
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     session_id = str(uuid.uuid4())
     started_at = datetime.now()
@@ -93,7 +93,7 @@ async def stop_session(
     POST /api/extension/session/{session_id}/stop
     Stop current session
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # Get session
     result = db.execute(text("""
@@ -166,7 +166,7 @@ async def get_status(
     this endpoint should only return status fields (isGazeTracking, hasWebcamAccess)
     without backend integration. Gaze tracking is handled by the separate gaze2 service.
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # Get current active session
     result = db.execute(text("""
@@ -217,7 +217,7 @@ async def track_history(
     POST /api/extension/history/track
     Track browser history visit for learning context analysis
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     try:
         # Store history visit (could create BROWSER_HISTORY table or store in SESSIONS metadata)
@@ -288,7 +288,7 @@ async def analyze_history(
     GET /api/extension/history/analyze?days_back=7
     Analyze user's browsing patterns for learning context
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     try:
         # Get sessions with history data

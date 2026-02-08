@@ -5,6 +5,7 @@ import { GoogleLogin } from '@react-oauth/google'
 import { X, User, Building2 } from 'lucide-react'
 import { useAuthStore } from '../../store/useAuthStore'
 import { useNavigate } from 'react-router-dom'
+import { login as apiLogin } from '../../utils/api'
 
 interface LoginModalProps {
   isOpen: boolean
@@ -17,51 +18,92 @@ export function LoginModal({ isOpen, onClose, initialAccountType }: LoginModalPr
     initialAccountType || null
   )
   const [showAccountSelection, setShowAccountSelection] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const { login, setAccountType } = useAuthStore()
   const navigate = useNavigate()
 
-  const handleGoogleSuccess = (credentialResponse: any) => {
+  const handleGoogleSuccess = async (credentialResponse: any) => {
     if (!credentialResponse.credential) {
       console.error('No credential received')
+      setError('No credential received from Google')
       return
     }
 
-    // Decode the JWT token to get user info
-    try {
-      const base64Url = credentialResponse.credential.split('.')[1]
-      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/')
-      const jsonPayload = decodeURIComponent(
-        atob(base64)
-          .split('')
-          .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
-          .join('')
-      )
-      const userData = JSON.parse(jsonPayload)
+    setIsLoading(true)
+    setError(null)
 
-      const user = {
-        name: userData.name || '',
-        email: userData.email || '',
-        picture: userData.picture || '',
-        sub: userData.sub || '',
+    try {
+      // If account type was pre-selected, use it; otherwise show selection first
+      if (!selectedAccountType) {
+        setShowAccountSelection(true)
+        setIsLoading(false)
+        return
       }
 
-      // Store the token and user info
-      login(user, credentialResponse.credential)
+      // Call backend API to authenticate
+      const response = await apiLogin(credentialResponse.credential, selectedAccountType)
 
-      // If account type was pre-selected, use it; otherwise show selection
-      if (selectedAccountType) {
-        setAccountType(selectedAccountType)
-        handleComplete(selectedAccountType)
+      // Store the token and user info from backend response
+      const user = {
+        id: response.user.id || response.user.sub || '',
+        name: response.user.name || '',
+        email: response.user.email || '',
+        picture: response.user.picture || '',
+        sub: response.user.sub || response.user.id || '',
+      }
+
+      login(user, response.token, response.accountType, response.hasEnterpriseAccess)
+
+      // Navigate to the selected account type
+      handleComplete(response.accountType)
+    } catch (error) {
+      console.error('Error during login:', error)
+      setError(error instanceof Error ? error.message : 'Failed to authenticate. Please try again.')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleAccountTypeSelect = async (accountType: 'personal' | 'enterprise') => {
+    setSelectedAccountType(accountType)
+    setIsLoading(true)
+    setError(null)
+
+    try {
+      // Get the credential from storage (we need to store it temporarily)
+      // For now, we'll need to trigger login again with the selected account type
+      // This is a limitation - we'd need to store the credential temporarily
+      // For a better UX, we could show account selection BEFORE Google login
+      // But for now, let's handle it this way:
+      const storedCredential = sessionStorage.getItem('pending_google_credential')
+      if (storedCredential) {
+        const response = await apiLogin(storedCredential, accountType)
+        const user = {
+          id: response.user.id || response.user.sub || '',
+          name: response.user.name || '',
+          email: response.user.email || '',
+          picture: response.user.picture || '',
+          sub: response.user.sub || response.user.id || '',
+        }
+        login(user, response.token, response.accountType, response.hasEnterpriseAccess)
+        sessionStorage.removeItem('pending_google_credential')
+        handleComplete(response.accountType)
       } else {
-        setShowAccountSelection(true)
+        setError('Please sign in with Google again')
+        setShowAccountSelection(false)
       }
     } catch (error) {
-      console.error('Error decoding token:', error)
+      console.error('Error during login:', error)
+      setError(error instanceof Error ? error.message : 'Failed to authenticate. Please try again.')
+    } finally {
+      setIsLoading(false)
     }
   }
 
   const handleGoogleError = () => {
     console.error('Google login failed')
+    setError('Google authentication failed. Please try again.')
   }
 
   const handleComplete = (accountType: 'personal' | 'enterprise') => {
@@ -113,18 +155,33 @@ export function LoginModal({ isOpen, onClose, initialAccountType }: LoginModalPr
                 </p>
               </div>
 
-              <div className="flex justify-center">
-                <GoogleLogin
-                  onSuccess={handleGoogleSuccess}
-                  onError={handleGoogleError}
-                  useOneTap={false}
-                  theme="filled_black"
-                  size="large"
-                  text="signin_with"
-                  shape="rectangular"
-                  // Note: Scopes are configured in Google Cloud Console OAuth consent screen
-                  // The component will request whatever scopes are configured there
-                />
+              <div className="flex flex-col items-center gap-4">
+                {error && (
+                  <div className="text-sm text-red-500 bg-red-500/10 px-4 py-2 rounded-lg">
+                    {error}
+                  </div>
+                )}
+                {isLoading ? (
+                  <div className="text-sm text-muted-foreground">Authenticating...</div>
+                ) : (
+                  <GoogleLogin
+                    onSuccess={(response) => {
+                      // Store credential temporarily if account type not selected
+                      if (!selectedAccountType) {
+                        sessionStorage.setItem('pending_google_credential', response.credential)
+                        setShowAccountSelection(true)
+                      } else {
+                        handleGoogleSuccess(response)
+                      }
+                    }}
+                    onError={handleGoogleError}
+                    useOneTap={false}
+                    theme="filled_black"
+                    size="large"
+                    text="signin_with"
+                    shape="rectangular"
+                  />
+                )}
               </div>
             </div>
           ) : (
@@ -136,13 +193,22 @@ export function LoginModal({ isOpen, onClose, initialAccountType }: LoginModalPr
                   Select how you'd like to use Third Eye
                 </p>
               </div>
+              {error && (
+                <div className="text-sm text-red-500 bg-red-500/10 px-4 py-2 rounded-lg">
+                  {error}
+                </div>
+              )}
+              {isLoading && (
+                <div className="text-sm text-muted-foreground text-center">Setting up your account...</div>
+              )}
 
               <div className="grid grid-cols-1 gap-4">
                 <motion.button
                   whileHover={{ scale: 1.02 }}
                   whileTap={{ scale: 0.98 }}
-                  onClick={() => handleComplete('personal')}
-                  className="p-6 border-2 border-border rounded-xl hover:border-primary transition-colors text-left group"
+                  onClick={() => handleAccountTypeSelect('personal')}
+                  disabled={isLoading}
+                  className="p-6 border-2 border-border rounded-xl hover:border-primary transition-colors text-left group disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <div className="flex items-start gap-4">
                     <div className="p-3 bg-primary/10 rounded-lg group-hover:bg-primary/20 transition-colors">
@@ -160,8 +226,9 @@ export function LoginModal({ isOpen, onClose, initialAccountType }: LoginModalPr
                 <motion.button
                   whileHover={{ scale: 1.02 }}
                   whileTap={{ scale: 0.98 }}
-                  onClick={() => handleComplete('enterprise')}
-                  className="p-6 border-2 border-border rounded-xl hover:border-primary transition-colors text-left group"
+                  onClick={() => handleAccountTypeSelect('enterprise')}
+                  disabled={isLoading}
+                  className="p-6 border-2 border-border rounded-xl hover:border-primary transition-colors text-left group disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <div className="flex items-start gap-4">
                     <div className="p-3 bg-primary/10 rounded-lg group-hover:bg-primary/20 transition-colors">

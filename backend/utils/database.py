@@ -65,7 +65,7 @@ def get_db():
         db.close()
 
 
-def ensure_warehouse_resumed():
+async def ensure_warehouse_resumed():
     """
     Ensure Snowflake warehouse is resumed before queries
     Snowflake warehouses auto-suspend, so we need to resume them

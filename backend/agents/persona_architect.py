@@ -10,6 +10,7 @@ from services.google_drive_client import GoogleDriveClient
 from utils.database import engine, ensure_warehouse_resumed
 from sqlalchemy import text
 import json
+import uuid
 
 
 class PersonaArchitect(BaseAgent):
@@ -98,6 +99,9 @@ class PersonaArchitect(BaseAgent):
                 browser_history
             )
             
+            # Store persona card in database
+            await self._save_persona_card(user_id, persona_card)
+            
             return self.create_response(success=True, data={"personaCard": persona_card})
             
         except ValueError as e:
@@ -107,7 +111,7 @@ class PersonaArchitect(BaseAgent):
     
     async def _fetch_google_docs_metadata(self, user_id: str) -> List[Dict[str, Any]]:
         """Fetch Google Docs metadata for user"""
-        ensure_warehouse_resumed()
+        await ensure_warehouse_resumed()
         
         try:
             with engine.connect() as conn:
@@ -146,7 +150,7 @@ class PersonaArchitect(BaseAgent):
     
     async def _get_user_google_token(self, user_id: str) -> Optional[str]:
         """Try to get user's Google access token from database"""
-        ensure_warehouse_resumed()
+        await ensure_warehouse_resumed()
         
         try:
             # TODO: When TOKENS table is created, query it here
@@ -223,7 +227,7 @@ class PersonaArchitect(BaseAgent):
     
     async def _analyze_search_history(self, user_id: str) -> List[Dict[str, Any]]:
         """Analyze search history from sessions"""
-        ensure_warehouse_resumed()
+        await ensure_warehouse_resumed()
         
         try:
             with engine.connect() as conn:
@@ -259,7 +263,7 @@ class PersonaArchitect(BaseAgent):
     
     async def _fetch_session_history(self, user_id: str) -> List[Dict[str, Any]]:
         """Fetch session history with confusion patterns"""
-        ensure_warehouse_resumed()
+        await ensure_warehouse_resumed()
         
         try:
             with engine.connect() as conn:
@@ -295,7 +299,7 @@ class PersonaArchitect(BaseAgent):
     
     async def _fetch_browser_history(self, user_id: str, days_back: int = 7) -> Dict[str, Any]:
         """Fetch browser history analysis for user"""
-        ensure_warehouse_resumed()
+        await ensure_warehouse_resumed()
         
         try:
             with engine.connect() as conn:
@@ -591,3 +595,39 @@ Return a JSON object with this structure:
                 "topDomains": [d["domain"] for d in browser_history.get("topDomains", [])[:5]]
             } if browser_history.get("totalVisits", 0) > 0 else None
         }
+    
+    async def _save_persona_card(self, user_id: str, persona_card: Dict[str, Any]):
+        """Save persona card to database"""
+        try:
+            await ensure_warehouse_resumed()
+            persona_id = str(uuid.uuid4())
+            
+            with engine.connect() as conn:
+                # Mark previous persona cards as not current
+                update_old = text("""
+                    UPDATE THIRDEYE_DEV.PUBLIC.PERSONA_CARDS
+                    SET IS_CURRENT = FALSE
+                    WHERE USER_ID = :user_id
+                """)
+                conn.execute(update_old, {"user_id": user_id})
+                
+                # Insert new persona card
+                insert_query = text("""
+                    INSERT INTO THIRDEYE_DEV.PUBLIC.PERSONA_CARDS (
+                        PERSONA_ID, USER_ID, PERSONA_CARD, CREATED_AT, UPDATED_AT, IS_CURRENT
+                    ) VALUES (
+                        :persona_id, :user_id, PARSE_JSON(:persona_card_json), 
+                        CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), TRUE
+                    )
+                """)
+                
+                conn.execute(insert_query, {
+                    "persona_id": persona_id,
+                    "user_id": user_id,
+                    "persona_card_json": json.dumps(persona_card)
+                })
+                conn.commit()
+                
+        except Exception as e:
+            print(f"Error saving persona card: {e}")
+            # Don't fail the request if storage fails

@@ -77,6 +77,35 @@ class GoogleDriveClient:
             print(f"Error listing files: {e}")
             return []
     
+    def get_file_metadata(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get file metadata from Google Drive
+        
+        Args:
+            file_id: Google Drive file/folder ID
+            
+        Returns:
+            File metadata dictionary or None if error
+        """
+        try:
+            file = self.service.files().get(
+                fileId=file_id,
+                fields="id, name, mimeType, parents, modifiedTime, createdTime, webViewLink"
+            ).execute()
+            
+            return {
+                "id": file.get('id'),
+                "name": file.get('name'),
+                "mimeType": file.get('mimeType'),
+                "parents": file.get('parents', []),
+                "modifiedTime": file.get('modifiedTime'),
+                "createdTime": file.get('createdTime'),
+                "url": file.get('webViewLink')
+            }
+        except HttpError as e:
+            print(f"Error getting file metadata: {e}")
+            return None
+    
     def get_file_content(self, file_id: str) -> Optional[str]:
         """
         Get content of a Google Doc

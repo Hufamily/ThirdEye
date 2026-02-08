@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 
 interface GoogleUser {
+  id: string
   name: string
   email: string
   picture: string
@@ -13,13 +14,12 @@ interface AuthState {
   isAuthenticated: boolean
   accountType: 'personal' | 'enterprise' | null
   token: string | null
-  // TODO: Backend - Add hasEnterpriseAccess flag
-  // This should be fetched from backend API after login to check if a personal account
-  // has enterprise access. If not, enterprise section should show "NA"
-  // Example: hasEnterpriseAccess: boolean
-  login: (user: GoogleUser, token: string) => void
+  hasEnterpriseAccess: boolean
+  login: (user: GoogleUser, token: string, accountType: 'personal' | 'enterprise', hasEnterpriseAccess: boolean) => void
   logout: () => void
   setAccountType: (type: 'personal' | 'enterprise') => void
+  setUser: (user: GoogleUser) => void
+  setHasEnterpriseAccess: (hasAccess: boolean) => void
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -29,15 +29,18 @@ export const useAuthStore = create<AuthState>()(
       isAuthenticated: false,
       accountType: null,
       token: null,
-      login: (user, token) => {
+      hasEnterpriseAccess: false,
+      login: (user, token, accountType, hasEnterpriseAccess) => {
         localStorage.setItem('auth_token', token)
-        set({ user, token, isAuthenticated: true })
+        set({ user, token, isAuthenticated: true, accountType, hasEnterpriseAccess })
       },
       logout: () => {
         localStorage.removeItem('auth_token')
-        set({ user: null, token: null, isAuthenticated: false, accountType: null })
+        set({ user: null, token: null, isAuthenticated: false, accountType: null, hasEnterpriseAccess: false })
       },
       setAccountType: (type) => set({ accountType: type }),
+      setUser: (user) => set({ user }),
+      setHasEnterpriseAccess: (hasAccess) => set({ hasEnterpriseAccess: hasAccess }),
     }),
     {
       name: 'auth-storage',
@@ -47,6 +50,7 @@ export const useAuthStore = create<AuthState>()(
         isAuthenticated: state.isAuthenticated,
         accountType: state.accountType,
         token: state.token,
+        hasEnterpriseAccess: state.hasEnterpriseAccess,
       }),
     }
   )

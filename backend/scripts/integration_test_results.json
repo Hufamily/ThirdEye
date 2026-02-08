@@ -1,0 +1,50 @@
+{
+  "database": {
+    "connection": true,
+    "tables": {
+      "existing": [
+        "USERS",
+        "SESSIONS",
+        "DOCUMENTS",
+        "INTERACTIONS",
+        "TRACKED_ASSETS",
+        "ORG_MEMBERSHIPS",
+        "ORGANIZATIONS",
+        "WHITELISTED_FOLDERS",
+        "PERSONA_CARDS",
+        "GAP_HYPOTHESES",
+        "EXPLANATIONS",
+        "DOCUMENT_SUGGESTIONS",
+        "AGENT_EXECUTIONS"
+      ],
+      "missing": []
+    }
+  },
+  "services": {
+    "WhitelistService": true,
+    "AgentOrchestrator": true,
+    "DedalusClient": true,
+    "GeminiClient": true,
+    "K2ThinkClient": true,
+    "VisionClient": true,
+    "WhitelistService_functionality": true,
+    "AgentOrchestrator_functionality": true
+  },
+  "agents": {
+    "PersonaArchitect": true,
+    "TrafficController": true,
+    "CaptureScrape": true,
+    "TargetInterpreter": true,
+    "GapHypothesis": true,
+    "ExplanationComposer": true,
+    "MemoryVault": true,
+    "DocumentSurgeon": true,
+    "storage_methods": true
+  },
+  "routes": {},
+  "overall": {
+    "passed": 0,
+    "failed": 0,
+    "errors": []
+  }
+}

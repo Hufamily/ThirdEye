@@ -35,7 +35,7 @@ class AuthResponse(BaseModel):
     hasEnterpriseAccess: bool
 
 
-def get_current_user(
+async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
@@ -71,7 +71,7 @@ def get_current_user(
             }
         )
     
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # Use raw SQL with fully qualified table name for reliability
     from sqlalchemy import text
@@ -151,7 +151,7 @@ async def google_login(
                 }
             )
         
-        ensure_warehouse_resumed()
+        await ensure_warehouse_resumed()
         
         # Find or create user using raw SQL with fully qualified table name
         from sqlalchemy import text

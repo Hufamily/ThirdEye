@@ -1,23 +1,45 @@
+import { useState, useEffect } from 'react'
 import { BookOpen, ChevronRight } from 'lucide-react'
 import { motion } from 'framer-motion'
 import { useUIStore, usePersonalPageStore } from '../../store/useStore'
 import { NotebookEntryDetail } from './NotebookEntryDetail'
-
-interface NotebookEntry {
-  id: string
-  sessionId: string
-  title: string
-  date: string
-  snippet: string
-  preview: string
-}
+import { getNotebookEntries, NotebookEntry } from '../../utils/api'
+import { LoadingSpinner } from '../ui/LoadingSpinner'
 
 export function NotebookEntries() {
   const { sidebarOpen, setSidebarOpen } = useUIStore()
   const { selectedSessionId, selectedNotebookEntryId, setSelectedNotebookEntryId } = usePersonalPageStore()
+  const [allEntries, setAllEntries] = useState<NotebookEntry[]>([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
-  // Mock entries - in real app, these would be filtered by selectedSessionId
-  const allEntries: NotebookEntry[] = [
+  useEffect(() => {
+    const fetchEntries = async () => {
+      try {
+        setIsLoading(true)
+        const entries = await getNotebookEntries(50, 0, selectedSessionId || undefined)
+        setAllEntries(entries)
+        setError(null)
+      } catch (err) {
+        console.error('Failed to fetch notebook entries:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load entries')
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    fetchEntries()
+    
+    // Poll for new entries every 5 seconds
+    const interval = setInterval(() => {
+      fetchEntries()
+    }, 5000)
+    
+    return () => clearInterval(interval)
+  }, [selectedSessionId])
+
+  // Mock entries fallback
+  const mockEntries: NotebookEntry[] = [
     {
       id: '1',
       sessionId: '1',
@@ -52,12 +74,37 @@ export function NotebookEntries() {
     },
   ]
 
+  // Use API data if available, otherwise fallback to mock
+  const entriesToUse = allEntries.length > 0 ? allEntries : mockEntries
+
   // Filter entries by selected session, or show all if none selected
   const filteredEntries = selectedSessionId
-    ? allEntries.filter((entry) => entry.sessionId === selectedSessionId)
-    : allEntries
+    ? entriesToUse.filter((entry) => entry.sessionId === selectedSessionId)
+    : entriesToUse
 
   const displayedEntries = filteredEntries.slice(0, 5)
+
+  if (isLoading && allEntries.length === 0) {
+    return (
+      <div className="space-y-4 h-full flex flex-col w-full max-w-full">
+        <h2 className="text-lg font-semibold truncate">Notebook Entries</h2>
+        <div className="flex-1 flex items-center justify-center">
+          <LoadingSpinner />
+        </div>
+      </div>
+    )
+  }
+
+  if (error && allEntries.length === 0) {
+    return (
+      <div className="space-y-4 h-full flex flex-col w-full max-w-full">
+        <h2 className="text-lg font-semibold truncate">Notebook Entries</h2>
+        <div className="text-sm text-red-500 text-center py-4">
+          {error}
+        </div>
+      </div>
+    )
+  }
 
   const handleEntryClick = (entryId: string) => {
     setSelectedNotebookEntryId(entryId)
@@ -99,9 +146,16 @@ export function NotebookEntries() {
                   <div className="flex items-start gap-2 min-w-0 w-full">
                     <BookOpen className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
                     <div className="flex-1 min-w-0 overflow-hidden">
-                      <h3 className="text-sm font-medium mb-1 truncate">
-                        {entry.title}
-                      </h3>
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
+                        <h3 className="text-sm font-medium truncate">
+                          {entry.title}
+                        </h3>
+                        {entry.agentData?.classification?.content_type && (
+                          <span className="px-2 py-0.5 bg-primary/20 text-primary rounded text-xs flex-shrink-0">
+                            {entry.agentData.classification.content_type}
+                          </span>
+                        )}
+                      </div>
                       <div className="text-xs font-mono text-muted-foreground mb-1 truncate">
                         {entry.snippet}
                       </div>

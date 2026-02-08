@@ -3,68 +3,37 @@ import { motion } from 'framer-motion'
 import { Clock, BookOpen, FileText, Sparkles, MoreVertical, CheckCircle2, RotateCcw, Edit2, Search, Menu } from 'lucide-react'
 import { usePersonalPageStore } from '../../store/useStore'
 import { format } from 'date-fns'
+import { getSessions, updateSession, regenerateSessionSummary, Session } from '../../utils/api'
+import { LoadingSpinner } from '../ui/LoadingSpinner'
 
 interface SessionTimelineProps {
   onAISearchClick?: () => void
   onMenuClick?: () => void
 }
 
-interface Session {
-  id: string
-  date: string
-  time: string
-  duration: string
-  concepts: number
-  title: string
-  docTitle: string
-  triggers: string[]
-  gapLabels: string[]
-  isComplete: boolean
-}
-
-const initialSessions: Session[] = [
-    {
-      id: '1',
-      date: '2026-02-07',
-      time: '14:30',
-      duration: '2h 15m',
-      concepts: 12,
-      title: 'React Advanced Patterns',
-      docTitle: 'React Documentation',
-      triggers: ['scroll', 'hover'],
-      gapLabels: ['hooks', 'performance'],
-      isComplete: false,
-    },
-    {
-      id: '2',
-      date: '2026-02-07',
-      time: '10:00',
-      duration: '1h 45m',
-      concepts: 8,
-      title: 'TypeScript Fundamentals',
-      docTitle: 'TypeScript Handbook',
-      triggers: ['click', 'focus'],
-      gapLabels: ['generics', 'types'],
-      isComplete: true,
-    },
-    {
-      id: '3',
-      date: '2026-02-06',
-      time: '16:00',
-      duration: '3h 30m',
-      concepts: 15,
-      title: 'State Management Deep Dive',
-      docTitle: 'Zustand Guide',
-      triggers: ['scroll'],
-      gapLabels: ['state', 'store'],
-      isComplete: false,
-    },
-  ]
-
 export function SessionTimeline({ onAISearchClick, onMenuClick }: SessionTimelineProps = {}) {
   const { selectedSessionId, setSelectedSessionId } = usePersonalPageStore()
   const [openMenuId, setOpenMenuId] = useState<string | null>(null)
-  const [sessionsState, setSessionsState] = useState(initialSessions)
+  const [sessionsState, setSessionsState] = useState<Session[]>([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const fetchSessions = async () => {
+      try {
+        setIsLoading(true)
+        const sessions = await getSessions(50, 0)
+        setSessionsState(sessions)
+      } catch (err) {
+        console.error('Failed to fetch sessions:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load sessions')
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    fetchSessions()
+  }, [])
 
   // Close menu when clicking outside
   useEffect(() => {
@@ -104,29 +73,70 @@ export function SessionTimeline({ onAISearchClick, onMenuClick }: SessionTimelin
     setSelectedSessionId(sessionId)
   }
 
-  const handleMarkComplete = (sessionId: string) => {
-    setSessionsState((prev) =>
-      prev.map((s) => (s.id === sessionId ? { ...s, isComplete: !s.isComplete } : s))
-    )
-    setOpenMenuId(null)
-    // API call would go here
-  }
+  const handleMarkComplete = async (sessionId: string) => {
+    try {
+      const session = sessionsState.find(s => s.id === sessionId)
+      if (!session) return
 
-  const handleRegenerateSummary = (sessionId: string) => {
-    setOpenMenuId(null)
-    // API call would go here - regenerates summary with merge rules
-    console.log('Regenerating summary for session:', sessionId)
-  }
-
-  const handleRenameSession = (sessionId: string) => {
-    const newTitle = prompt('Enter new session title:')
-    if (newTitle) {
+      const updated = await updateSession(sessionId, { isComplete: !session.isComplete })
       setSessionsState((prev) =>
-        prev.map((s) => (s.id === sessionId ? { ...s, title: newTitle } : s))
+        prev.map((s) => (s.id === sessionId ? updated : s))
       )
+    } catch (err) {
+      console.error('Failed to update session:', err)
+      alert('Failed to update session. Please try again.')
     }
     setOpenMenuId(null)
-    // API call would go here
+  }
+
+  const handleRegenerateSummary = async (sessionId: string) => {
+    try {
+      await regenerateSessionSummary(sessionId)
+      // Refresh sessions to get updated data
+      const sessions = await getSessions(50, 0)
+      setSessionsState(sessions)
+      alert('Summary regenerated successfully')
+    } catch (err) {
+      console.error('Failed to regenerate summary:', err)
+      alert('Failed to regenerate summary. Please try again.')
+    }
+    setOpenMenuId(null)
+  }
+
+  const handleRenameSession = async (sessionId: string) => {
+    const newTitle = prompt('Enter new session title:')
+    if (newTitle) {
+      try {
+        const updated = await updateSession(sessionId, { title: newTitle })
+        setSessionsState((prev) =>
+          prev.map((s) => (s.id === sessionId ? updated : s))
+        )
+      } catch (err) {
+        console.error('Failed to rename session:', err)
+        alert('Failed to rename session. Please try again.')
+      }
+    }
+    setOpenMenuId(null)
+  }
+
+  if (isLoading) {
+    return (
+      <div className="space-y-4 w-full min-w-0 max-w-full overflow-hidden">
+        <div className="flex items-center justify-center py-8">
+          <LoadingSpinner />
+        </div>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="space-y-4 w-full min-w-0 max-w-full overflow-hidden">
+        <div className="text-sm text-red-500 text-center py-4">
+          {error}
+        </div>
+      </div>
+    )
   }
 
   return (

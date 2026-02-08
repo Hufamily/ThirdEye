@@ -9,13 +9,15 @@ from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func, desc, and_
-from utils.database import get_db, ensure_warehouse_resumed
+from utils.database import get_db, ensure_warehouse_resumed, engine
 from routes.auth import get_current_user
 from models.user import User
 from models.document import Document
 from models.suggestion import Suggestion
 from models.organization import Organization
+from services.whitelist_service import WhitelistService
 import uuid
+import json
 
 router = APIRouter()
 
@@ -86,7 +88,7 @@ async def get_documents(
     GET /api/enterprise/documents
     Get all documents with confusion metrics
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # TODO: Filter by org_id when organization membership is implemented
     query = """
@@ -150,7 +152,7 @@ async def get_document_content(
     GET /api/enterprise/documents/{document_id}
     Get document content with hotspots
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     result = db.execute(text("""
         SELECT DOC_ID, TITLE, CONTENT, GOOGLE_DOC, HOTSPOTS
@@ -201,7 +203,7 @@ async def get_suggestions(
     GET /api/enterprise/suggestions
     Get AI suggestions for documents
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     query = """
         SELECT SUGGESTION_ID, DOC_ID, HOTSPOT_ID, ORIGINAL_TEXT, SUGGESTED_TEXT,
@@ -282,7 +284,7 @@ async def get_enterprise_suggestions(
     GET /api/enterprise/suggestions (enterprise format)
     Get all AI suggestions with diagnosis
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     result = db.execute(text("""
         SELECT S.SUGGESTION_ID, S.DOC_ID, S.HOTSPOT_ID, S.CONFUSION_TYPE,
@@ -326,7 +328,7 @@ async def get_kpis(
     GET /api/enterprise/kpis
     Get diagnostic KPIs
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # Calculate time reclaimed (estimate: 15 min per trigger = 0.25 hours)
     triggers_result = db.execute(text("""
@@ -393,7 +395,7 @@ async def accept_suggestion(
     POST /api/enterprise/suggestions/{suggestion_id}/accept
     Accept a suggestion
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     db.execute(text("""
         UPDATE THIRDEYE_DEV.PUBLIC.SUGGESTIONS
@@ -416,7 +418,7 @@ async def reject_suggestion(
     POST /api/enterprise/suggestions/{suggestion_id}/reject
     Reject a suggestion
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     db.execute(text("""
         UPDATE THIRDEYE_DEV.PUBLIC.SUGGESTIONS
@@ -439,7 +441,7 @@ async def apply_suggestion(
     POST /api/enterprise/suggestions/{suggestion_id}/apply
     Apply suggestion actions
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # Update suggestion status
     db.execute(text("""
@@ -468,7 +470,7 @@ async def dismiss_suggestion(
     POST /api/enterprise/suggestions/{suggestion_id}/dismiss
     Dismiss suggestion
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     db.execute(text("""
         UPDATE THIRDEYE_DEV.PUBLIC.SUGGESTIONS
@@ -493,7 +495,7 @@ async def get_growth_analytics(
     GET /api/enterprise/analytics/growth
     Get growth trends data
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # TODO: Implement real analytics from SESSIONS and USERS tables
     # For now, return mock data
@@ -520,7 +522,7 @@ async def get_department_analytics(
     GET /api/enterprise/analytics/departments
     Get department performance data
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # TODO: Implement real department analytics
     # For now, return mock data
@@ -543,7 +545,7 @@ async def get_topic_analytics(
     GET /api/enterprise/analytics/topics
     Get topic distribution data
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # TODO: Implement real topic analytics from NOTEBOOK_ENTRIES or INTERACTION_LOGS
     # For now, return mock data
@@ -567,7 +569,7 @@ async def get_organization(
     GET /api/enterprise/organization
     Get organization info
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # Get user's organization from ORG_MEMBERSHIPS table
     result = db.execute(text("""
@@ -667,7 +669,7 @@ async def update_organization(
     PUT /api/enterprise/organization
     Update organization info (admin only)
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     # Check if user is admin
     admin_check = db.execute(text("""
@@ -738,7 +740,7 @@ async def generate_report(
     POST /api/enterprise/exports/generate-report
     Generate clarity report from selected suggestions
     """
-    ensure_warehouse_resumed()
+    await ensure_warehouse_resumed()
     
     document_id = request.get("documentId")
     suggestion_ids = request.get("suggestionIds", [])
@@ -815,4 +817,899 @@ async def download_report(
         content=markdown_content,
         media_type="text/markdown",
         headers={"Content-Disposition": f'attachment; filename="report-{export_id}.md"'}
+    )
+
+
+# Whitelist Management Endpoints
+
+async def _get_user_org_id(user_id: str) -> Optional[str]:
+    """Get user's organization ID from ORG_MEMBERSHIPS table"""
+    try:
+        await ensure_warehouse_resumed()
+        with engine.connect() as conn:
+            query = text("""
+                SELECT ORG_ID
+                FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+                WHERE USER_ID = :user_id
+                LIMIT 1
+            """)
+            
+            result = conn.execute(query, {"user_id": user_id})
+            row = result.fetchone()
+            
+            return row[0] if row else None
+            
+    except Exception as e:
+        print(f"Error getting user org_id: {e}")
+        return None
+
+
+@router.get("/whitelisted-folders")
+async def get_whitelisted_folders(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    GET /api/enterprise/whitelisted-folders
+    List all whitelisted folders for user's organization
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail="User is not a member of any organization"
+        )
+    
+    whitelist_service = WhitelistService()
+    folders = await whitelist_service.get_whitelisted_folders(org_id)
+    
+    return {
+        "success": True,
+        "data": {
+            "folders": folders,
+            "org_id": org_id
+        }
+    }
+
+
+@router.post("/whitelisted-folders")
+async def add_whitelisted_folder(
+    request: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    POST /api/enterprise/whitelisted-folders
+    Add a whitelisted folder for the organization
+    
+    Request body:
+    {
+        "folder_path": "/Engineering/Documentation",
+        "folder_id_google": "optional_google_folder_id"
+    }
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail="User is not a member of any organization"
+        )
+    
+    folder_path = request.get("folder_path")
+    if not folder_path:
+        raise HTTPException(
+            status_code=400,
+            detail="folder_path is required"
+        )
+    
+    folder_id_google = request.get("folder_id_google")
+    
+    whitelist_service = WhitelistService()
+    folder = await whitelist_service.add_whitelisted_folder(
+        org_id=org_id,
+        folder_path=folder_path,
+        created_by=current_user.user_id,
+        folder_id_google=folder_id_google
+    )
+    
+    return {
+        "success": True,
+        "data": folder
+    }
+
+
+@router.delete("/whitelisted-folders/{folder_id}")
+async def remove_whitelisted_folder(
+    folder_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    DELETE /api/enterprise/whitelisted-folders/{folder_id}
+    Remove (deactivate) a whitelisted folder
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail="User is not a member of any organization"
+        )
+    
+    whitelist_service = WhitelistService()
+    success = await whitelist_service.remove_whitelisted_folder(org_id, folder_id)
+    
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail="Whitelisted folder not found"
+        )
+    
+    return {
+        "success": True,
+        "message": "Whitelisted folder removed"
+    }
+
+
+@router.get("/documents/{doc_id}/whitelist-status")
+async def check_document_whitelist_status(
+    doc_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    google_access_token: Optional[str] = Query(None)
+):
+    """
+    GET /api/enterprise/documents/{doc_id}/whitelist-status
+    Check if a document is whitelisted
+    
+    Query params:
+    - google_access_token: Optional Google access token for folder lookup
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail="User is not a member of any organization"
+        )
+    
+    whitelist_service = WhitelistService()
+    status = await whitelist_service.check_document_whitelist_status(
+        doc_id=doc_id,
+        org_id=org_id,
+        access_token=google_access_token
+    )
+    
+    return {
+        "success": True,
+        "data": status
+    }
+
+
+# ============================================================================
+# Google Drive Sources Management
+# ============================================================================
+
+@router.get("/google-drive/sources")
+async def get_google_drive_sources(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    GET /api/enterprise/google-drive/sources
+    Get configured Google Drive sources for organization
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    # Get drive sources from organization
+    result = db.execute(text("""
+        SELECT DRIVE_SOURCES
+        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        WHERE ORG_ID = :org_id
+        LIMIT 1
+    """), {"org_id": org_id})
+    row = result.fetchone()
+    
+    drive_sources = row[0] if row and isinstance(row[0], list) else []
+    
+    return {
+        "sources": drive_sources
+    }
+
+
+@router.post("/google-drive/sources")
+async def add_google_drive_source(
+    request: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    POST /api/enterprise/google-drive/sources
+    Add Google Drive source (admin only)
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Check if user is admin
+    admin_check = db.execute(text("""
+        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        WHERE USER_ID = :user_id AND ROLE = 'admin'
+        LIMIT 1
+    """), {"user_id": current_user.user_id})
+    
+    if not admin_check.fetchone():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Only admins can add Google Drive sources",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    # Get current drive sources
+    result = db.execute(text("""
+        SELECT DRIVE_SOURCES
+        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        WHERE ORG_ID = :org_id
+        LIMIT 1
+    """), {"org_id": org_id})
+    row = result.fetchone()
+    
+    drive_sources = row[0] if row and isinstance(row[0], list) else []
+    
+    # Add new source
+    new_source = {
+        "id": str(uuid.uuid4()),
+        "name": request.get("name", ""),
+        "type": request.get("type", "folder"),
+        "path": request.get("path", ""),
+        "googleDriveId": request.get("googleDriveId")
+    }
+    
+    drive_sources.append(new_source)
+    
+    # Update organization
+    db.execute(text("""
+        UPDATE THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        SET DRIVE_SOURCES = :drive_sources,
+            UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE ORG_ID = :org_id
+    """), {
+        "org_id": org_id,
+        "drive_sources": json.dumps(drive_sources)
+    })
+    db.commit()
+    
+    return new_source
+
+
+@router.delete("/google-drive/sources/{source_id}")
+async def remove_google_drive_source(
+    source_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    DELETE /api/enterprise/google-drive/sources/{source_id}
+    Remove Google Drive source (admin only)
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Check if user is admin
+    admin_check = db.execute(text("""
+        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        WHERE USER_ID = :user_id AND ROLE = 'admin'
+        LIMIT 1
+    """), {"user_id": current_user.user_id})
+    
+    if not admin_check.fetchone():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Only admins can remove Google Drive sources",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    # Get current drive sources
+    result = db.execute(text("""
+        SELECT DRIVE_SOURCES
+        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        WHERE ORG_ID = :org_id
+        LIMIT 1
+    """), {"org_id": org_id})
+    row = result.fetchone()
+    
+    drive_sources = row[0] if row and isinstance(row[0], list) else []
+    
+    # Remove source
+    drive_sources = [s for s in drive_sources if s.get("id") != source_id]
+    
+    # Update organization
+    db.execute(text("""
+        UPDATE THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        SET DRIVE_SOURCES = :drive_sources,
+            UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE ORG_ID = :org_id
+    """), {
+        "org_id": org_id,
+        "drive_sources": json.dumps(drive_sources)
+    })
+    db.commit()
+    
+    return {"success": True}
+
+
+# ============================================================================
+# Team Members Management
+# ============================================================================
+
+@router.get("/members")
+async def get_team_members(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    GET /api/enterprise/members
+    Get team members list
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    # Get members
+    members_result = db.execute(text("""
+        SELECT U.USER_ID, U.NAME, U.EMAIL, OM.ROLE, OM.JOINED_AT
+        FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS OM
+        JOIN THIRDEYE_DEV.PUBLIC.USERS U ON OM.USER_ID = U.USER_ID
+        WHERE OM.ORG_ID = :org_id
+    """), {"org_id": org_id})
+    members_rows = members_result.fetchall()
+    
+    members = []
+    for m_row in members_rows:
+        members.append({
+            "id": m_row[0],
+            "name": m_row[1] or "",
+            "email": m_row[2],
+            "role": m_row[3] or "member",
+            "joinedAt": m_row[4].isoformat() if m_row[4] else None
+        })
+    
+    return {
+        "members": members
+    }
+
+
+@router.post("/members")
+async def add_team_member(
+    request: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    POST /api/enterprise/members
+    Add team member (admin only)
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Check if user is admin
+    admin_check = db.execute(text("""
+        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        WHERE USER_ID = :user_id AND ROLE = 'admin'
+        LIMIT 1
+    """), {"user_id": current_user.user_id})
+    
+    if not admin_check.fetchone():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Only admins can add team members",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    email = request.get("email")
+    role = request.get("role", "member")
+    
+    if not email:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": "MISSING_EMAIL",
+                    "message": "Email is required",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Find user by email
+    user_result = db.execute(text("""
+        SELECT USER_ID FROM THIRDEYE_DEV.PUBLIC.USERS
+        WHERE EMAIL = :email
+        LIMIT 1
+    """), {"email": email})
+    user_row = user_result.fetchone()
+    
+    if not user_row:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User with this email not found",
+                    "details": {}
+                }
+            }
+        )
+    
+    user_id = user_row[0]
+    
+    # Check if already a member
+    existing_check = db.execute(text("""
+        SELECT USER_ID FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        WHERE ORG_ID = :org_id AND USER_ID = :user_id
+        LIMIT 1
+    """), {"org_id": org_id, "user_id": user_id})
+    
+    if existing_check.fetchone():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": "ALREADY_MEMBER",
+                    "message": "User is already a member of this organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Add membership
+    db.execute(text("""
+        INSERT INTO THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        (ORG_ID, USER_ID, ROLE, JOINED_AT)
+        VALUES (:org_id, :user_id, :role, CURRENT_TIMESTAMP())
+    """), {
+        "org_id": org_id,
+        "user_id": user_id,
+        "role": role
+    })
+    db.commit()
+    
+    # Get user info
+    user_info_result = db.execute(text("""
+        SELECT USER_ID, NAME, EMAIL FROM THIRDEYE_DEV.PUBLIC.USERS
+        WHERE USER_ID = :user_id
+        LIMIT 1
+    """), {"user_id": user_id})
+    user_info_row = user_info_result.fetchone()
+    
+    return {
+        "id": user_info_row[0],
+        "name": user_info_row[1] or "",
+        "email": user_info_row[2],
+        "role": role,
+        "joinedAt": datetime.now().isoformat()
+    }
+
+
+@router.delete("/members/{member_id}")
+async def remove_team_member(
+    member_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    DELETE /api/enterprise/members/{member_id}
+    Remove team member (admin only)
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Check if user is admin
+    admin_check = db.execute(text("""
+        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        WHERE USER_ID = :user_id AND ROLE = 'admin'
+        LIMIT 1
+    """), {"user_id": current_user.user_id})
+    
+    if not admin_check.fetchone():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Only admins can remove team members",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    # Remove membership
+    db.execute(text("""
+        DELETE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        WHERE ORG_ID = :org_id AND USER_ID = :member_id
+    """), {
+        "org_id": org_id,
+        "member_id": member_id
+    })
+    db.commit()
+    
+    return {"success": True}
+
+
+@router.patch("/members/{member_id}/role")
+async def update_team_member_role(
+    member_id: str,
+    request: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    PATCH /api/enterprise/members/{member_id}/role
+    Update member role (admin only)
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Check if user is admin
+    admin_check = db.execute(text("""
+        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        WHERE USER_ID = :user_id AND ROLE = 'admin'
+        LIMIT 1
+    """), {"user_id": current_user.user_id})
+    
+    if not admin_check.fetchone():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Only admins can update member roles",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    role = request.get("role")
+    if role not in ["admin", "member"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": "INVALID_ROLE",
+                    "message": "Role must be 'admin' or 'member'",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Update role
+    db.execute(text("""
+        UPDATE THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        SET ROLE = :role,
+            UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE ORG_ID = :org_id AND USER_ID = :member_id
+    """), {
+        "org_id": org_id,
+        "member_id": member_id,
+        "role": role
+    })
+    db.commit()
+    
+    return {"success": True}
+
+
+# ============================================================================
+# Enterprise Settings
+# ============================================================================
+
+class EnterpriseSettings(BaseModel):
+    """Enterprise settings model"""
+    classificationRules: List[str]
+    privacyPolicies: List[str]
+    notificationSettings: dict
+
+
+@router.get("/settings", response_model=EnterpriseSettings)
+async def get_enterprise_settings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    GET /api/enterprise/settings
+    Get enterprise settings
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    # Get settings from organization metadata
+    result = db.execute(text("""
+        SELECT SETTINGS
+        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        WHERE ORG_ID = :org_id
+        LIMIT 1
+    """), {"org_id": org_id})
+    row = result.fetchone()
+    
+    settings = row[0] if row and isinstance(row[0], dict) else {}
+    
+    return EnterpriseSettings(
+        classificationRules=settings.get("classificationRules", []),
+        privacyPolicies=settings.get("privacyPolicies", []),
+        notificationSettings=settings.get("notificationSettings", {
+            "emailAlerts": True,
+            "weeklyReports": True
+        })
+    )
+
+
+@router.put("/settings", response_model=EnterpriseSettings)
+async def update_enterprise_settings(
+    request: EnterpriseSettings,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    PUT /api/enterprise/settings
+    Update enterprise settings (admin only)
+    """
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Check if user is admin
+    admin_check = db.execute(text("""
+        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+        WHERE USER_ID = :user_id AND ROLE = 'admin'
+        LIMIT 1
+    """), {"user_id": current_user.user_id})
+    
+    if not admin_check.fetchone():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Only admins can update enterprise settings",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    # Update settings
+    db.execute(text("""
+        UPDATE THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        SET SETTINGS = :settings,
+            UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE ORG_ID = :org_id
+    """), {
+        "org_id": org_id,
+        "settings": json.dumps(request.dict())
+    })
+    db.commit()
+    
+    return request
+
+
+# ============================================================================
+# Organization Data Export
+# ============================================================================
+
+@router.get("/exports/organization-data")
+async def export_organization_data(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    GET /api/enterprise/exports/organization-data
+    Export organization data as JSON
+    """
+    from fastapi.responses import Response
+    
+    org_id = await _get_user_org_id(current_user.user_id)
+    
+    if not org_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "NO_ORGANIZATION",
+                    "message": "User is not a member of any organization",
+                    "details": {}
+                }
+            }
+        )
+    
+    await ensure_warehouse_resumed()
+    
+    # Get organization data
+    org_result = db.execute(text("""
+        SELECT ORG_ID, ORG_NAME, ADMIN_EMAIL, CREATED_AT, DRIVE_SOURCES, SETTINGS
+        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        WHERE ORG_ID = :org_id
+        LIMIT 1
+    """), {"org_id": org_id})
+    org_row = org_result.fetchone()
+    
+    if not org_row:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "code": "ORGANIZATION_NOT_FOUND",
+                    "message": "Organization not found",
+                    "details": {}
+                }
+            }
+        )
+    
+    # Get members
+    members_result = db.execute(text("""
+        SELECT U.USER_ID, U.NAME, U.EMAIL, OM.ROLE, OM.JOINED_AT
+        FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS OM
+        JOIN THIRDEYE_DEV.PUBLIC.USERS U ON OM.USER_ID = U.USER_ID
+        WHERE OM.ORG_ID = :org_id
+    """), {"org_id": org_id})
+    members_rows = members_result.fetchall()
+    
+    members = []
+    for m_row in members_rows:
+        members.append({
+            "id": m_row[0],
+            "name": m_row[1] or "",
+            "email": m_row[2],
+            "role": m_row[3] or "member",
+            "joinedAt": m_row[4].isoformat() if m_row[4] else None
+        })
+    
+    # Compile export data
+    export_data = {
+        "organization": {
+            "id": org_row[0],
+            "name": org_row[1] or "",
+            "adminEmail": org_row[2] or "",
+            "createdAt": org_row[3].isoformat() if org_row[3] else None,
+            "driveSources": org_row[4] if isinstance(org_row[4], list) else [],
+            "settings": org_row[5] if isinstance(org_row[5], dict) else {}
+        },
+        "members": members,
+        "exportedAt": datetime.now().isoformat(),
+        "exportedBy": current_user.user_id
+    }
+    
+    return Response(
+        content=json.dumps(export_data, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="organization-{org_id[:8]}-export.json"'}
     )

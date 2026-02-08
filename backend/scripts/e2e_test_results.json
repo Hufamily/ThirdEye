@@ -1,0 +1,36 @@
+{
+  "server": {
+    "root": true,
+    "health": true,
+    "docs": true,
+    "404_handling": true,
+    "json_error_handling": true
+  },
+  "auth": {
+    "me_endpoint": true,
+    "protected": true
+  },
+  "agents": {
+    "/api/agents/persona-architect": true,
+    "/api/agents/traffic-controller": true,
+    "/api/agents/capture-scrape": true,
+    "/api/agents/target-interpreter": true,
+    "/api/agents/gap-hypothesis": true,
+    "/api/agents/explanation-composer": true,
+    "/api/agents/memory-vault": true,
+    "/api/agents/document-surgeon": true,
+    "/api/agents/orchestrate": true,
+    "orchestrate_auth": true
+  },
+  "enterprise": {
+    "/api/enterprise/whitelisted-folders_GET": true,
+    "/api/enterprise/whitelisted-folders_POST": true,
+    "/api/enterprise/documents_GET": true,
+    "/api/enterprise/suggestions_GET": true
+  },
+  "overall": {
+    "passed": 0,
+    "failed": 0,
+    "errors": []
+  }
+}

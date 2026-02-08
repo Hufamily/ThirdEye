@@ -8,6 +8,10 @@ from typing import Dict, Any, Optional, List
 from .base_agent import BaseAgent
 from services.google_drive_client import GoogleDriveClient
 from services.vision_client import VisionClient
+from utils.database import engine, ensure_warehouse_resumed
+from sqlalchemy import text
+import json
+import uuid
 import re
 from urllib.parse import urlparse
 import hashlib
@@ -536,3 +540,54 @@ class CaptureScrape(BaseAgent):
                 return data_url[comma_index + 1:]
         
         return data_url
+    
+    async def _store_capture_result(
+        self,
+        capture_result: Dict[str, Any],
+        user_id: Optional[str],
+        session_id: Optional[str]
+    ):
+        """Store capture result in database (INTERACTIONS table)"""
+        if not user_id:
+            return
+        
+        try:
+            await ensure_warehouse_resumed()
+            interaction_id = str(uuid.uuid4())
+            
+            doc_id = capture_result.get("metadata", {}).get("doc_id")
+            anchor_id = capture_result.get("metadata", {}).get("anchor_id")
+            
+            with engine.connect() as conn:
+                insert_query = text("""
+                    INSERT INTO THIRDEYE_DEV.PUBLIC.INTERACTIONS (
+                        INTERACTION_ID, USER_ID, SESSION_ID, DOC_ID, ANCHOR_ID,
+                        INTERACTION_TYPE, CONTENT, METADATA, CREATED_AT
+                    ) VALUES (
+                        :interaction_id, :user_id, :session_id, :doc_id, :anchor_id,
+                        'capture', :content, PARSE_JSON(:metadata_json), CURRENT_TIMESTAMP()
+                    )
+                """)
+                
+                conn.execute(insert_query, {
+                    "interaction_id": interaction_id,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "doc_id": doc_id,
+                    "anchor_id": anchor_id,
+                    "content": capture_result.get("extracted_text", "")[:1000],  # Truncate if too long
+                    "metadata_json": json.dumps({
+                        "source_type": capture_result.get("source_type"),
+                        "text_source": capture_result.get("text_source"),
+                        "screenshot_used": capture_result.get("screenshot_used"),
+                        "vision_confidence": capture_result.get("vision_confidence"),
+                        "content_types_detected": capture_result.get("content_types_detected", []),
+                        "cursor_position": capture_result.get("metadata", {}).get("cursor_position"),
+                        "url": capture_result.get("metadata", {}).get("url")
+                    })
+                })
+                conn.commit()
+                
+        except Exception as e:
+            print(f"Error storing capture result: {e}")
+            # Don't fail the request if storage fails

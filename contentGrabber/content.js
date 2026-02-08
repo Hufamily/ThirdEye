@@ -4128,6 +4128,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     showImageResultsInOverlay(message.data);
     sendResponse({ success: true });
   }
+
+  // Receive agent orchestration results
+  if (message.type === 'SHOW_AGENT_RESULTS') {
+    showAgentResultsOverlay(message.data.orchestrationResult, message.data.relevantWebpages || []);
+    sendResponse({ success: true });
+  }
 });
 
 // ============================================================================
@@ -4298,6 +4304,236 @@ function showImageResultsInOverlay(data) {
   setOverlayStatus('Images loaded');
 }
 
+/**
+ * Searches for relevant webpages based on concepts and hypothesis
+ * @param {Array<string>} concepts - Concepts from Agent 2.0
+ * @param {Object} hypothesis - Winning hypothesis from Agent 3.0
+ * @returns {Promise<Array>} Array of {title, url, snippet}
+ */
+async function searchRelevantWebpages(concepts, hypothesis) {
+  return new Promise((resolve) => {
+    // Build search query from concepts and hypothesis
+    const conceptText = concepts && concepts.length > 0 ? concepts.join(' ') : '';
+    const hypothesisText = hypothesis?.hypothesis || '';
+    const searchQuery = `${conceptText} ${hypothesisText}`.trim().substring(0, 100);
+    
+    if (!searchQuery) {
+      resolve([]);
+      return;
+    }
+    
+    // Store pending search with unique ID
+    const searchId = `webpage_search_${Date.now()}_${Math.random()}`;
+    if (!window._pendingWebpageSearches) {
+      window._pendingWebpageSearches = new Map();
+    }
+    
+    // Set up one-time listener for search results
+    const listener = (message) => {
+      if (message.type === 'SHOW_SEARCH_RESULTS') {
+        const messageQuery = (message.data.query || '').toLowerCase();
+        const ourQuery = searchQuery.toLowerCase();
+        
+        // Match if queries are similar (check if they share significant words)
+        const ourWords = ourQuery.split(/\s+/).filter(w => w.length > 3);
+        const messageWords = messageQuery.split(/\s+/).filter(w => w.length > 3);
+        const matchingWords = ourWords.filter(w => messageWords.includes(w));
+        
+        // If at least 30% of words match, consider it our search
+        if (matchingWords.length > 0 && matchingWords.length >= Math.ceil(ourWords.length * 0.3)) {
+          chrome.runtime.onMessage.removeListener(listener);
+          if (window._pendingWebpageSearches) {
+            window._pendingWebpageSearches.delete(searchId);
+          }
+          resolve(message.data.results || []);
+        }
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    
+    // Store search info
+    window._pendingWebpageSearches.set(searchId, { query: searchQuery, resolve, listener });
+    
+    // Use existing Google search functionality
+    chrome.runtime.sendMessage(
+      {
+        type: 'SEARCH_GOOGLE',
+        data: {
+          url: window.location.href,
+          text: searchQuery
+        }
+      },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn('[ContextGrabber] Web search error:', chrome.runtime.lastError);
+          chrome.runtime.onMessage.removeListener(listener);
+          if (window._pendingWebpageSearches) {
+            window._pendingWebpageSearches.delete(searchId);
+          }
+          resolve([]);
+        }
+      }
+    );
+    
+    // Timeout after 5 seconds
+    setTimeout(() => {
+      chrome.runtime.onMessage.removeListener(listener);
+      if (window._pendingWebpageSearches) {
+        window._pendingWebpageSearches.delete(searchId);
+      }
+      resolve([]);
+    }, 5000);
+  });
+}
+
+/**
+ * Displays agent orchestration results in the overlay
+ * @param {Object} orchestrationResult - Full orchestration result with agent outputs
+ * @param {Array} relevantWebpages - Relevant webpages from search
+ */
+function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
+  if (!orchestrationResult || !orchestrationResult.data) {
+    console.warn('[ContextGrabber] Invalid orchestration result');
+    return;
+  }
+  
+  const agents = orchestrationResult.data.agents || {};
+  const agent2 = agents['2.0'] || agents['target_interpreter'] || {};
+  const agent3 = agents['3.0'] || agents['gap_hypothesis'] || {};
+  const agent4 = agents['4.0'] || agents['explanation_composer'] || {};
+  
+  // Get winning hypothesis
+  let winningHypothesis = null;
+  if (agent3.candidates && agent3.winning_hypothesis) {
+    winningHypothesis = agent3.candidates.find(c => c.id === agent3.winning_hypothesis) || agent3.candidates[0];
+  }
+  
+  let html = '';
+  
+  // Snapshot preview (if captured)
+  if (lastSnapshotDataUrl) {
+    html += `<div class="cg-section"><strong>Snapshot</strong><div class="cg-snapshot-wrap"><img src="${lastSnapshotDataUrl}" class="cg-snapshot-img" alt="Area snapshot" /></div></div>`;
+  }
+  
+  // Tab bar: Summary | Explanation | Resources
+  html += '<div class="cg-tab-bar">';
+  html += '<button class="cg-tab cg-tab-active" data-tab="summary">Summary</button>';
+  html += '<button class="cg-tab" data-tab="explanation">Explanation</button>';
+  html += '<button class="cg-tab" data-tab="resources">Resources</button>';
+  html += '</div>';
+  
+  // Summary Tab
+  html += '<div class="cg-tab-panel" id="cg-panel-summary">';
+  html += '<div class="cg-section">';
+  
+  // Content Type
+  if (agent2.content_type) {
+    html += `<div style="margin-bottom: 12px;"><strong>Content Type</strong><p style="display: inline-block; padding: 4px 8px; background: hsl(0, 0%, 18%); border-radius: 4px; margin-left: 8px;">${escapeHtml(agent2.content_type)}</p></div>`;
+  }
+  
+  // Concepts
+  if (agent2.concepts && agent2.concepts.length > 0) {
+    html += '<div style="margin-bottom: 12px;"><strong>Concepts</strong><ul style="margin: 8px 0 0 20px;">';
+    agent2.concepts.forEach(concept => {
+      html += `<li>${escapeHtml(concept)}</li>`;
+    });
+    html += '</ul></div>';
+  }
+  
+  // Gap Hypothesis
+  if (winningHypothesis) {
+    html += '<div style="margin-bottom: 12px;"><strong>Gap Hypothesis</strong>';
+    html += `<p style="margin-top: 8px;">${escapeHtml(winningHypothesis.hypothesis || '')}</p>`;
+    if (winningHypothesis.prerequisites && winningHypothesis.prerequisites.length > 0) {
+      html += '<div style="margin-top: 8px;"><strong style="font-size: 12px;">Prerequisites:</strong><ul style="margin: 4px 0 0 20px; font-size: 13px;">';
+      winningHypothesis.prerequisites.forEach(prereq => {
+        html += `<li>${escapeHtml(prereq)}</li>`;
+      });
+      html += '</ul></div>';
+    }
+    html += '</div>';
+  }
+  
+  html += '</div></div>';
+  
+  // Explanation Tab
+  html += '<div class="cg-tab-panel" id="cg-panel-explanation" style="display:none">';
+  
+  // Instant HUD
+  if (agent4.instant_hud) {
+    html += '<div class="cg-section">';
+    html += '<strong>Quick Summary</strong>';
+    if (agent4.instant_hud.summary) {
+      html += `<p>${escapeHtml(agent4.instant_hud.summary)}</p>`;
+    }
+    if (agent4.instant_hud.key_points && agent4.instant_hud.key_points.length > 0) {
+      html += '<ul style="margin: 8px 0 0 20px;">';
+      agent4.instant_hud.key_points.forEach(point => {
+        html += `<li>${escapeHtml(point)}</li>`;
+      });
+      html += '</ul>';
+    }
+    html += '</div>';
+  }
+  
+  // Deep Dive
+  if (agent4.deep_dive) {
+    html += '<div class="cg-section">';
+    html += '<strong>Deep Dive</strong>';
+    if (agent4.deep_dive.explanation) {
+      html += `<p style="white-space: pre-wrap;">${escapeHtml(agent4.deep_dive.explanation)}</p>`;
+    }
+    if (agent4.deep_dive.examples && agent4.deep_dive.examples.length > 0) {
+      html += '<div style="margin-top: 12px;"><strong style="font-size: 12px;">Examples:</strong>';
+      agent4.deep_dive.examples.forEach(example => {
+        html += `<div style="margin: 8px 0; padding: 8px; background: hsl(0, 0%, 14.9%); border-radius: 4px; font-size: 13px;">${escapeHtml(example)}</div>`;
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  
+  html += '</div>';
+  
+  // Resources Tab
+  html += '<div class="cg-tab-panel" id="cg-panel-resources" style="display:none">';
+  if (relevantWebpages && relevantWebpages.length > 0) {
+    html += '<div class="cg-results">';
+    relevantWebpages.forEach((page) => {
+      html += '<div class="cg-result-item">';
+      html += `<a href="${escapeHtml(page.url)}" target="_blank" class="cg-result-title">${escapeHtml(page.title || 'Untitled')}</a>`;
+      html += `<div class="cg-result-url">${escapeHtml(page.url.substring(0, 60))}${page.url.length > 60 ? '...' : ''}</div>`;
+      if (page.snippet) {
+        html += `<div class="cg-result-snippet">${escapeHtml(page.snippet)}</div>`;
+      }
+      html += '</div>';
+    });
+    html += '</div>';
+  } else {
+    html += '<p class="cg-loading">No relevant webpages found.</p>';
+  }
+  html += '</div>';
+  
+  updateOverlayContent(html);
+  setOverlayStatus('Analysis complete');
+  activeTab = 'summary';
+  
+  // Wire up tab switching
+  const tabs = currentOverlay.querySelectorAll('.cg-tab');
+  tabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      tabs.forEach(t => t.classList.remove('cg-tab-active'));
+      tab.classList.add('cg-tab-active');
+      
+      const panelId = tab.dataset.tab;
+      currentOverlay.querySelector('#cg-panel-summary').style.display = panelId === 'summary' ? 'block' : 'none';
+      currentOverlay.querySelector('#cg-panel-explanation').style.display = panelId === 'explanation' ? 'block' : 'none';
+      currentOverlay.querySelector('#cg-panel-resources').style.display = panelId === 'resources' ? 'block' : 'none';
+      activeTab = panelId;
+    });
+  });
+}
+
 // ============================================================================
 // DWELL DETECTION: Trigger scrape when position stays still
 // ============================================================================
@@ -4331,24 +4567,29 @@ async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtract
   try {
     // Get API base URL and auth token from storage
     const storageData = await new Promise((resolve) => {
-      chrome.storage.local.get(['api_base_url', 'auth_token'], (result) => {
+      chrome.storage.local.get(['api_base_url', 'auth_token', 'user_id', 'session_id'], (result) => {
         resolve({
           apiBase: result.api_base_url || 'http://localhost:8000',
-          authToken: result.auth_token || null
+          authToken: result.auth_token || null,
+          userId: result.user_id || null,
+          sessionId: result.session_id || null
         });
       });
     });
     
+    // First, call Agent 1.0 to capture content
     const agent10Url = `${storageData.apiBase}/api/agents/capture-scrape`;
     
-    // Prepare request payload
-    const payload = {
+    // Prepare capture request payload
+    const capturePayload = {
       url: url,
       cursor_position: cursorPos,
       screenshot: imageDataUrl,  // Base64 data URL
       text_extraction: textExtraction || '',  // Pre-extracted text
       context_lines: CONTEXT_LINES_BEFORE + CONTEXT_LINES_AFTER,
-      dwell_time_ms: DWELL_TIME_MS
+      dwell_time_ms: DWELL_TIME_MS,
+      user_id: storageData.userId,
+      session_id: storageData.sessionId
     };
     
     const headers = {
@@ -4360,38 +4601,75 @@ async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtract
     }
     
     // POST to Agent 1.0 API with timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);  // 10s timeout for vision processing
+    const controller1 = new AbortController();
+    const timeoutId1 = setTimeout(() => controller1.abort(), 10000);  // 10s timeout for vision processing
     
-    const response = await fetch(agent10Url, {
+    const captureResponse = await fetch(agent10Url, {
       method: 'POST',
       headers: headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal
+      body: JSON.stringify(capturePayload),
+      signal: controller1.signal
     });
     
-    clearTimeout(timeoutId);
+    clearTimeout(timeoutId1);
     
-    if (!response.ok) {
-      console.warn('[ContextGrabber] Agent 1.0 returned status:', response.status);
+    if (!captureResponse.ok) {
+      console.warn('[ContextGrabber] Agent 1.0 returned status:', captureResponse.status);
       return null;
     }
     
-    const data = await response.json();
-    if (data.success) {
-      console.log('[ContextGrabber] Agent 1.0 extraction successful');
-      return data;
-    } else {
-      console.warn('[ContextGrabber] Agent 1.0 error:', data.error || 'unknown');
-      return null;
+    const captureResult = await captureResponse.json();
+    
+    if (!captureResult.success || !captureResult.data) {
+      console.warn('[ContextGrabber] Agent 1.0 failed:', captureResult.error);
+      return captureResult;  // Return partial result
     }
+    
+    // Now call orchestration endpoint to process through full pipeline
+    const orchestrateUrl = `${storageData.apiBase}/api/agents/orchestrate`;
+    
+    const orchestratePayload = {
+      user_id: storageData.userId,
+      capture_result: captureResult.data,
+      session_id: storageData.sessionId
+    };
+    
+    const controller2 = new AbortController();
+    const timeoutId2 = setTimeout(() => controller2.abort(), 30000);  // 30s timeout for full orchestration
+    
+    const orchestrateResponse = await fetch(orchestrateUrl, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(orchestratePayload),
+      signal: controller2.signal
+    });
+    
+    clearTimeout(timeoutId2);
+    
+    if (!orchestrateResponse.ok) {
+      console.warn('[ContextGrabber] Orchestration returned status:', orchestrateResponse.status);
+      // Return capture result even if orchestration fails
+      return captureResult;
+    }
+    
+    const orchestrateResult = await orchestrateResponse.json();
+    
+    // Merge orchestration results with capture result
+    return {
+      success: orchestrateResult.success,
+      data: {
+        capture: captureResult.data,
+        orchestration: orchestrateResult.data
+      },
+      error: orchestrateResult.error
+    };
   } catch (err) {
     if (err.name === 'AbortError') {
-      console.warn('[ContextGrabber] Agent 1.0 request timed out');
+      console.warn('[ContextGrabber] Request timed out');
     } else if (err.message && err.message.includes('Failed to fetch')) {
-      console.warn('[ContextGrabber] Agent 1.0 request failed: Backend may be offline or CORS issue');
+      console.warn('[ContextGrabber] Request failed: Backend may be offline or CORS issue');
     } else {
-      console.warn('[ContextGrabber] Agent 1.0 request failed:', err.message || err.toString());
+      console.warn('[ContextGrabber] Request failed:', err.message || err.toString());
     }
     return null;
   }
@@ -4443,6 +4721,112 @@ async function sendImageToBackend(imageDataUrl) {
       console.warn('[ContextGrabber] Backend image analysis failed:', err.message || err.toString());
     }
     return null;
+  }
+}
+
+/**
+ * Auto-saves notebook entry with agent data
+ * @param {Object} orchestrationResult - Full orchestration result
+ * @param {Array} relevantWebpages - Relevant webpages
+ * @param {string} originalText - Original extracted text
+ * @param {string} url - Page URL
+ */
+async function autoSaveToNotebook(orchestrationResult, relevantWebpages, originalText, url) {
+  try {
+    const agents = orchestrationResult.data?.agents || {};
+    const agent2 = agents['2.0'] || agents['target_interpreter'] || {};
+    const agent3 = agents['3.0'] || agents['gap_hypothesis'] || {};
+    const agent4 = agents['4.0'] || agents['explanation_composer'] || {};
+    
+    // Get winning hypothesis
+    let winningHypothesis = null;
+    if (agent3.candidates && agent3.winning_hypothesis) {
+      winningHypothesis = agent3.candidates.find(c => c.id === agent3.winning_hypothesis) || agent3.candidates[0];
+    }
+    
+    // Get storage data
+    const storageData = await new Promise((resolve) => {
+      chrome.storage.local.get(['api_base_url', 'auth_token', 'user_id', 'session_id'], (result) => {
+        resolve({
+          apiBase: result.api_base_url || 'http://localhost:8000',
+          authToken: result.auth_token || null,
+          userId: result.user_id || null,
+          sessionId: result.session_id || null
+        });
+      });
+    });
+    
+    if (!storageData.userId || !storageData.authToken) {
+      console.warn('[ContextGrabber] Cannot auto-save: missing user_id or auth_token');
+      return;
+    }
+    
+    // Prepare notebook entry data
+    const title = agent2.content_type || winningHypothesis?.hypothesis?.substring(0, 50) || 'Untitled Entry';
+    const snippet = agent4.instant_hud?.summary || originalText.substring(0, 200);
+    const preview = agent4.deep_dive?.explanation?.substring(0, 500) || snippet;
+    const concepts = agent2.concepts || [];
+    const prerequisites = winningHypothesis?.prerequisites || [];
+    const tags = [...concepts, ...prerequisites].filter(Boolean);
+    
+    // Full content as JSON
+    const content = JSON.stringify({
+      agentData: {
+        classification: agent2,
+        hypothesis: agent3,
+        explanation: agent4
+      },
+      relevantWebpages: relevantWebpages,
+      originalText: originalText,
+      url: url,
+      timestamp: new Date().toISOString()
+    });
+    
+    const entryData = {
+      sessionId: storageData.sessionId,
+      title: title,
+      snippet: snippet,
+      preview: preview,
+      content: content,
+      tags: tags,
+      date: new Date().toISOString().split('T')[0]
+    };
+    
+    // Call backend API
+    const response = await fetch(`${storageData.apiBase}/api/personal/notebook-entries`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${storageData.authToken}`
+      },
+      body: JSON.stringify(entryData)
+    });
+    
+    if (response.ok) {
+      const result = await response.json();
+      console.log('[ContextGrabber] Auto-saved to notebook:', result.id);
+      setOverlayStatus('Saved to notebook');
+      
+      // Show success notification briefly
+      setTimeout(() => {
+        if (currentOverlay) {
+          const statusEl = currentOverlay.querySelector('.cg-status');
+          if (statusEl) {
+            statusEl.textContent = 'Saved to notebook';
+            setTimeout(() => {
+              statusEl.textContent = '';
+            }, 3000);
+          }
+        }
+      }, 100);
+    } else {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+      console.warn('[ContextGrabber] Auto-save failed:', error);
+      setOverlayStatus('Save failed');
+    }
+  } catch (err) {
+    console.error('[ContextGrabber] Auto-save error:', err);
+    setOverlayStatus('Save error');
   }
 }
 
@@ -4531,7 +4915,7 @@ async function triggerSearchFromPoint(x, y) {
       }
     }
 
-    // 2) Send screenshot to Agent 1.0 (Capture & Scrape) API
+    // 2) Send screenshot to Agent 1.0 (Capture & Scrape) API and orchestrate
     if (lastSnapshotDataUrl) {
       console.log('[ContextGrabber] Sending screenshot to Agent 1.0 API...');
       setOverlayStatus('Extracting content from screenshot...');
@@ -4550,6 +4934,54 @@ async function triggerSearchFromPoint(x, y) {
           if (extractedData.extracted_text && extractedData.extracted_text.length > text.length) {
             text = extractedData.extracted_text;
             console.log('[ContextGrabber] Using Agent 1.0 extracted text (better than DOM)');
+          }
+          
+          // Check if orchestration result is available
+          // The structure from sendScreenshotToAgent10 is:
+          // { success: true, data: { capture: {...}, orchestration: { agents: {...} } } }
+          const orchestrationData = agent10Result.data?.orchestration;
+          const agents = orchestrationData?.agents || {};
+          
+          if (agents && Object.keys(agents).length > 0) {
+            console.log('[ContextGrabber] Orchestration complete, processing results...');
+            setOverlayStatus('Processing agent results...');
+            
+            // Extract concepts and hypothesis for web search
+            const agent2 = agents['2.0'] || agents['target_interpreter'] || {};
+            const agent3 = agents['3.0'] || agents['gap_hypothesis'] || {};
+            
+            // Get winning hypothesis
+            let winningHypothesis = null;
+            if (agent3.candidates && agent3.winning_hypothesis) {
+              winningHypothesis = agent3.candidates.find(c => c.id === agent3.winning_hypothesis) || agent3.candidates[0];
+            }
+            
+            // Search for relevant webpages
+            const concepts = agent2.concepts || [];
+            setOverlayStatus('Finding relevant resources...');
+            const relevantWebpages = await searchRelevantWebpages(concepts, winningHypothesis);
+            
+            // Display agent results
+            showAgentResultsOverlay({
+              success: true,
+              data: {
+                agents: agents,
+                capture: extractedData
+              }
+            }, relevantWebpages);
+            
+            // Auto-save to notebook
+            await autoSaveToNotebook({
+              success: true,
+              data: {
+                agents: agents,
+                capture: extractedData
+              }
+            }, relevantWebpages, text, url);
+            
+            return; // Done with agent flow
+          } else {
+            console.log('[ContextGrabber] No orchestration agents found, falling back to Google search');
           }
         }
       } catch (err) {
