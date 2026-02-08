@@ -1,9 +1,20 @@
-# API server
+# API server (api/app.py, test.py)
 flask>=3.0.0
+flask-cors>=4.0.0
 websockets>=12.0
 
-# Gaze tracking (installs from local GazeFollower package)
--e ./GazeFollower
+# Gaze tracking - GazeFollower dependencies
+mediapipe>=0.10.10,<0.10.19
+MNN>=3.0.0
+numpy<2
+opencv-contrib-python>=4.8,<4.12
+pandas>=2.0.0
+pygame>=2.5.0
+screeninfo>=0.8.0
 
-# Cursor control (optional, for gaze_cursor.py)
+# Cursor control (gaze_cursor.py)
 pyautogui>=0.9.50
+
+# OCR / content analysis (agent_action_template.py)
+pytesseract>=0.3.10
+Pillow>=10.0.0
