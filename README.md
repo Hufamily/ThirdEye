@@ -1,16 +1,9 @@
-<<<<<<< HEAD
-## Step 8: Agent Action Layer
-
-This module implements only Step 8:
-
-Input: AOI metadata + screenshot crop path  
-Output: lightweight, reversible `AssistPayload` JSON for UI actions.
-
-### Install
+# Install
 
 ```bash
 python -m pip install -r requirements.txt
 ```
+*make sure you're using python 3.11.9
 
 ### CLI
 
