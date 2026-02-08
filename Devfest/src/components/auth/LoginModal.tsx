@@ -166,9 +166,15 @@ export function LoginModal({ isOpen, onClose, initialAccountType }: LoginModalPr
                 ) : (
                   <GoogleLogin
                     onSuccess={(response) => {
+                      const credential = response.credential
+                      if (!credential) {
+                        setError('No credential received from Google. Please try again.')
+                        return
+                      }
+
                       // Store credential temporarily if account type not selected
                       if (!selectedAccountType) {
-                        sessionStorage.setItem('pending_google_credential', response.credential)
+                        sessionStorage.setItem('pending_google_credential', credential)
                         setShowAccountSelection(true)
                       } else {
                         handleGoogleSuccess(response)

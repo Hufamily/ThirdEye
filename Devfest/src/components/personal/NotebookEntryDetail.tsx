@@ -525,6 +525,7 @@ export function NotebookEntryDetail({
                     </button>
                   </div>
                 </div>
+              </div>
             </div>
           </motion.div>
         </>

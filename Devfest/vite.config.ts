@@ -4,6 +4,8 @@ import path from 'path'
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  // Frontend reads shared VITE_* vars from repo root .env.
+  envDir: path.resolve(__dirname, '..'),
   plugins: [react()],
   server: {
     hmr: {
