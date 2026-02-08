@@ -1,0 +1,242 @@
+<!doctype html>
+<html>
+  <head>
+    <base target="_top" />
+    <style>
+      :root {
+        --bg: #f4f8f6;
+        --card: #ffffff;
+        --ink: #12362d;
+        --muted: #55766c;
+        --line: #d4e3dc;
+        --accent: #0a7a5a;
+        --accent-2: #0c5f47;
+      }
+      body {
+        margin: 0;
+        font-family: 'Segoe UI', 'Helvetica Neue', sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at 20% 0%, #e9f5f0 0%, var(--bg) 45%, #eef4f1 100%);
+      }
+      .wrap {
+        padding: 12px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 12px;
+        margin-bottom: 10px;
+        box-shadow: 0 3px 12px rgba(18, 54, 45, 0.06);
+      }
+      .title {
+        margin: 0 0 8px;
+        font-size: 15px;
+      }
+      .sub {
+        color: var(--muted);
+        font-size: 12px;
+        margin: 0;
+      }
+      label {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+        margin-top: 8px;
+      }
+      input,
+      select,
+      textarea,
+      button {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        padding: 8px 9px;
+        margin-top: 4px;
+        font-size: 12px;
+      }
+      button {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #fff;
+        color: var(--ink);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+      }
+      .muted {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .hidden {
+        display: none;
+      }
+      .status {
+        font-size: 11px;
+        margin-top: 8px;
+        color: var(--muted);
+      }
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h3 class="title">Third Eye Settings</h3>
+        <p class="sub">Connect this Google Doc to your backend.</p>
+        <label>API Base URL</label>
+        <input id="apiBase" placeholder="http://localhost:8000" />
+
+        <label>Backend Bearer Token</label>
+        <input id="bearerToken" placeholder="JWT token from Third Eye login" />
+
+        <label>Org ID</label>
+        <input id="orgId" placeholder="org_123" />
+
+        <label>Assist Provider</label>
+        <select id="provider">
+          <option value="stub">Stub (local deterministic)</option>
+          <option value="k2">K2 Think</option>
+          <option value="gemini">Gemini</option>
+          <option value="dedalus">Dedalus</option>
+        </select>
+
+        <div class="grid" style="margin-top:10px;">
+          <button onclick="saveSettings()">Save</button>
+          <button class="secondary" onclick="syncDoc()">Sync AOI Map</button>
+        </div>
+        <div id="settingsStatus" class="status"></div>
+      </div>
+
+      <div class="card" id="needHelpCard">
+        <h3 class="title">Need help?</h3>
+        <p id="needHelpText" class="sub">No active confusion signal yet. Keep reading; this card updates automatically.</p>
+
+        <div class="grid" style="margin-top:10px;">
+          <button onclick="assist('explain')">Explain</button>
+          <button onclick="assist('summarize')">Summarize</button>
+          <button class="secondary" onclick="assist('define')">Define terms</button>
+          <button class="secondary" onclick="assist('flashcards')">Flashcards</button>
+        </div>
+
+        <div class="grid" style="margin-top:8px;">
+          <button class="secondary" onclick="sendFeedback('already_know')">I already know this</button>
+          <button class="secondary" onclick="sendFeedback('deeper')">Explain deeper</button>
+        </div>
+
+        <button class="secondary" style="margin-top:8px;" onclick="dismissCard()">Dismiss</button>
+      </div>
+
+      <div class="card">
+        <h3 class="title">Assist Output</h3>
+        <pre id="assistOutput" class="muted">No output yet.</pre>
+      </div>
+    </div>
+
+    <script>
+      let lastAoiKey = null;
+      let dismissedUntil = 0;
+
+      function setStatus(id, message) {
+        document.getElementById(id).textContent = message || '';
+      }
+
+      function loadSettings() {
+        google.script.run.withSuccessHandler((s) => {
+          document.getElementById('apiBase').value = s.apiBase || '';
+          document.getElementById('bearerToken').value = s.bearerToken || '';
+          document.getElementById('orgId').value = s.orgId || '';
+          document.getElementById('provider').value = s.provider || 'stub';
+        }).getSettings();
+      }
+
+      function saveSettings() {
+        const payload = {
+          apiBase: document.getElementById('apiBase').value.trim(),
+          bearerToken: document.getElementById('bearerToken').value.trim(),
+          orgId: document.getElementById('orgId').value.trim(),
+          provider: document.getElementById('provider').value,
+        };
+        google.script.run
+          .withSuccessHandler(() => setStatus('settingsStatus', 'Saved.'))
+          .withFailureHandler((e) => setStatus('settingsStatus', 'Error: ' + e.message))
+          .saveSettings(payload);
+      }
+
+      function syncDoc() {
+        setStatus('settingsStatus', 'Syncing AOI map...');
+        google.script.run
+          .withSuccessHandler((resp) => {
+            setStatus('settingsStatus', 'AOI sync complete: ' + (resp.aoi_count || 0) + ' sections');
+          })
+          .withFailureHandler((e) => setStatus('settingsStatus', 'Sync failed: ' + e.message))
+          .syncCurrentDoc();
+      }
+
+      function assist(action) {
+        const out = document.getElementById('assistOutput');
+        out.textContent = 'Loading...';
+        google.script.run
+          .withSuccessHandler((resp) => {
+            if (!resp || !resp.assist) {
+              out.textContent = 'No assist payload returned.';
+              return;
+            }
+            out.textContent = JSON.stringify(resp.assist, null, 2);
+          })
+          .withFailureHandler((e) => {
+            out.textContent = 'Assist failed: ' + e.message;
+          })
+          .requestAssist(action, lastAoiKey);
+      }
+
+      function sendFeedback(type) {
+        google.script.run
+          .withSuccessHandler(() => {
+            setStatus('settingsStatus', 'Feedback saved: ' + type);
+          })
+          .withFailureHandler((e) => setStatus('settingsStatus', 'Feedback failed: ' + e.message))
+          .sendFeedback(type, lastAoiKey);
+      }
+
+      function dismissCard() {
+        dismissedUntil = Date.now() + 90 * 1000;
+        document.getElementById('needHelpText').textContent = 'Dismissed for 90 seconds.';
+      }
+
+      function pollNeedHelp() {
+        if (Date.now() < dismissedUntil) {
+          return;
+        }
+
+        google.script.run
+          .withSuccessHandler((signal) => {
+            if (!signal || !signal.enabled) {
+              return;
+            }
+            lastAoiKey = signal.aoiKey || null;
+            const snippet = signal.snippet ? signal.snippet.slice(0, 180) : 'Attention signal detected in this section.';
+            document.getElementById('needHelpText').textContent = snippet;
+          })
+          .withFailureHandler(() => {})
+          .getNeedHelpSignal();
+      }
+
+      loadSettings();
+      setInterval(pollNeedHelp, 8000);
+      pollNeedHelp();
+    </script>
+  </body>
+</html>
