@@ -30,22 +30,37 @@ from .ui import CameraPreviewerUI, CalibrationUI
 
 class GazeFollower:
 
-    def __init__(self, camera: Camera = WebCamCamera(),
-                 face_alignment: FaceAlignment = MediaPipeFaceAlignment(),
-                 gaze_estimator: GazeEstimator = MGazeNetGazeEstimator(),
-                 gaze_filter: Filter = HeuristicFilter(),
-                 calibration: Calibration = SVRCalibration(),
-                 config: DefaultConfig = DefaultConfig()):
+    def __init__(self, camera: Camera = None,
+                 face_alignment: FaceAlignment = None,
+                 gaze_estimator: GazeEstimator = None,
+                 gaze_filter: Filter = None,
+                 calibration: Calibration = None,
+                 config: DefaultConfig = None):
         """
         Initializes the main components of the eye-tracking system.
 
         Parameters:
         camera (Camera): The camera object, default is WebCamCamera.
         face_alignment (FaceAlignment): The face alignment module, default is MediaPipeFaceAlignment.
-        gaze_estimator (GazeEstimator): The gaze estimation module, default is GazeEstimator.
+        gaze_estimator (GazeEstimator): The gaze estimation module, default is MGazeNetGazeEstimator.
         gaze_filter (Filter): The gaze filter for smoothing estimation results, default is HeuristicFilter.
         calibration (Calibration): The gaze calibration module, default is SVRCalibration.
+        config (DefaultConfig): The default configuration, default is DefaultConfig.
         """
+        # Lazy initialization of default components
+        if camera is None:
+            camera = WebCamCamera()
+        if face_alignment is None:
+            face_alignment = MediaPipeFaceAlignment()
+        if gaze_estimator is None:
+            gaze_estimator = MGazeNetGazeEstimator()
+        if gaze_filter is None:
+            gaze_filter = HeuristicFilter()
+        if calibration is None:
+            calibration = SVRCalibration()
+        if config is None:
+            config = DefaultConfig()
+        
         self._create_session("my_session")
 
         # eye tracking components

@@ -68,6 +68,37 @@ const CONTEXT_LINES_BEFORE = 10;
 const CONTEXT_LINES_AFTER = 10;
 
 // ============================================================================
+// HELPER FUNCTIONS - Get settings from background script
+// ============================================================================
+
+/**
+ * Get the analysis API URL from storage (via background script)
+ * @returns {Promise<string>} API URL
+ */
+async function getAnalyzeApiUrl() {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'GET_ANALYZE_API_URL' },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[ContextGrabber] Could not get API URL from background:', chrome.runtime.lastError.message);
+            resolve(ANALYZE_API_URL); // Fallback to default
+          } else if (response && response.apiUrl) {
+            resolve(response.apiUrl);
+          } else {
+            resolve(ANALYZE_API_URL); // Fallback to default
+          }
+        }
+      );
+    } catch (error) {
+      console.warn('[ContextGrabber] Error getting API URL:', error);
+      resolve(ANALYZE_API_URL); // Fallback to default
+    }
+  });
+}
+
+// ============================================================================
 // STATE
 // ============================================================================
 
@@ -4318,7 +4349,8 @@ function distance(a, b) {
  * @returns {Promise<Array|null>} - Array of results or null on error/timeout
  */
 async function sendImageToBackend(imageDataUrl) {
-  if (!imageDataUrl || !ANALYZE_API_URL) return null;
+  const apiUrl = await getAnalyzeApiUrl();
+  if (!imageDataUrl || !apiUrl) return null;
 
   try {
     // Convert data URL to blob
@@ -4333,7 +4365,7 @@ async function sendImageToBackend(imageDataUrl) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-    const backendResponse = await fetch(ANALYZE_API_URL, {
+    const backendResponse = await fetch(apiUrl, {
       method: 'POST',
       body: formData,
       signal: controller.signal
@@ -4453,14 +4485,15 @@ async function triggerSearchFromPoint(x, y) {
 
     // 2) Send to backend image analysis API
     let backendResults = null;
-    if (lastSnapshotDataUrl && ANALYZE_API_URL) {
+    const currentApiUrl = await getAnalyzeApiUrl();
+    if (lastSnapshotDataUrl && currentApiUrl) {
       console.log('[ContextGrabber] Sending snapshot to backend analysis...');
       setOverlayStatus('Analyzing screenshot...');
       backendResults = await sendImageToBackend(lastSnapshotDataUrl);
       
       // If backend failed, show helpful message (only for api-only mode)
       if (!backendResults && SCREENSHOT_PRIORITY === 'api-only') {
-        const backendUrl = ANALYZE_API_URL || 'configured endpoint';
+        const backendUrl = currentApiUrl || 'configured endpoint';
         showErrorOverlay('Backend Unavailable', 
           'The analysis backend is not responding. Please check if the backend server is running at ' + backendUrl + 
           '. Falling back to text-based search.');

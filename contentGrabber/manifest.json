@@ -4,11 +4,22 @@
   "version": "1.0.0",
   "description": "Chrome extension that uses gaze tracking to extract and analyze page context with click fallback",
   
+  "icons": {
+    "16": "images/icon-16.png",
+    "48": "images/icon-48.png",
+    "128": "images/icon-128.png"
+  },
+
+  "homepage_url": "https://github.com/yourusername/thirdeye",
+  
+  "options_page": "options.html",
+  
   "permissions": [
     "activeTab",
     "scripting",
     "tabs",
-    "storage"
+    "storage",
+    "contextMenus"
   ],
   
   "host_permissions": [
@@ -16,7 +27,8 @@
   ],
   
   "action": {
-    "default_title": "Toggle ThirdEye (Ctrl+Shift+G)"
+    "default_title": "Toggle ThirdEye (Ctrl+Shift+G)",
+    "default_icon": "images/icon-128.png"
   },
 
   "background": {

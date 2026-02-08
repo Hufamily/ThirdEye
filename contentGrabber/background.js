@@ -140,10 +140,54 @@ function updateBadgeForTab(tabId, enabled) {
 }
 
 // ============================================================================
+// CONTEXT MENU: Right-click → Settings
+// ============================================================================
+
+// Create context menu on extension load
+chrome.contextMenus.create({
+  id: 'thirdeye-settings',
+  title: 'ThirdEye Settings',
+  contexts: ['page']
+});
+
+// Handle context menu click → open options page
+chrome.contextMenus.onClicked.addListener((info) => {
+  if (info.menuItemId === 'thirdeye-settings') {
+    chrome.runtime.openOptionsPage();
+  }
+});
+
+// ============================================================================
+// GET ANALYZE API URL
+// ============================================================================
+
+/**
+ * Gets the Analysis API URL from storage
+ * @returns {Promise<string>} API URL
+ */
+async function getAnalyzeApiUrl() {
+  try {
+    const stored = await chrome.storage.local.get('analyze_api_url');
+    return stored.analyze_api_url || ANALYZE_API_URL;
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting API URL:', error);
+    return ANALYZE_API_URL;
+  }
+}
+
+// ============================================================================
 // MESSAGE HANDLER: Receive content from content script
 // ============================================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Handle request for API URL from content script
+  if (message.type === 'GET_ANALYZE_API_URL') {
+    getAnalyzeApiUrl().then(apiUrl => {
+      sendResponse({ apiUrl });
+    });
+    return true; // Indicate we'll send response asynchronously
+  }
+  
   // Handle extension state changes from content script
   if (message.type === 'EXTENSION_STATE_CHANGED') {
     if (sender.tab && sender.tab.id) {
@@ -1008,7 +1052,8 @@ async function tryOldAnalysisAPI(data) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-    const response = await fetch(ANALYZE_API_URL, {
+    const apiUrl = await getAnalyzeApiUrl();
+    const response = await fetch(apiUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
