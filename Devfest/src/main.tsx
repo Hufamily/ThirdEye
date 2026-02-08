@@ -36,6 +36,11 @@ const queryClient = new QueryClient({
 
 // Get Google Client ID from environment
 const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || ''
+if (!googleClientId) {
+  throw new Error(
+    'Missing VITE_GOOGLE_CLIENT_ID. Set it in root .env and restart the Vite dev server.'
+  )
+}
 
 // Render the app - Vite's Fast Refresh handles HMR automatically
 root.render(
