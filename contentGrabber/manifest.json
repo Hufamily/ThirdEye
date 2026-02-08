@@ -3,34 +3,28 @@
   "name": "ThirdEye",
   "version": "1.0.0",
   "description": "Chrome extension that uses gaze tracking to extract and analyze page context with click fallback",
-  
   "permissions": [
     "activeTab",
     "scripting",
     "tabs",
-    "storage"
+    "storage",
+    "offscreen",
+    "camera"
   ],
-  
-  "host_permissions": [
-    "<all_urls>"
-  ],
-  
+  "host_permissions": ["<all_urls>"],
   "action": {
     "default_title": "Toggle ThirdEye (Ctrl+Shift+G)"
   },
-
   "background": {
     "service_worker": "background.js"
   },
-  
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content.js"],
+      "js": ["content.js", "gaze-overlay.js"],
       "run_at": "document_idle"
     }
   ],
-  
   "web_accessible_resources": [
     {
       "resources": ["logo.png"],

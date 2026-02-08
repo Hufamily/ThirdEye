@@ -19,17 +19,11 @@ console.log('[ContextGrabber] Script starting to load...');
 // CONFIGURATION - MODIFY THESE FOR YOUR SETUP
 // ============================================================================
 
-/** Gaze tracking API endpoint (GET request) */
-const GAZE_API_URL = 'http://127.0.0.1:8000/gaze';
-
 /** Analysis API endpoint (POST request) */
 const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 
-/** Enable/disable gaze tracking (set to false to use cursor-only mode) */
+/** Enable/disable in-browser gaze tracking (MediaPipe Face Landmarker) */
 const ENABLE_GAZE_MODE = true;
-
-/** Gaze tracking poll interval in milliseconds */
-const GAZE_POLL_INTERVAL = 300;
 
 /** Request timeout in milliseconds */
 const REQUEST_TIMEOUT = 3000;
@@ -72,7 +66,8 @@ const CONTEXT_LINES_AFTER = 10;
 // ============================================================================
 
 let extensionEnabled = true;          // Toggle extension on/off without reload
-let gazeAvailable = ENABLE_GAZE_MODE; // Tracks if gaze API is working
+let gazeAvailable = false;            // Set true when in-browser gaze receives GAZE_STARTED
+let latestGaze = null;               // { x, y } in screen pixels (from normalized 0-1)
 let currentOverlay = null;            // Reference to persistent overlay element
 let isTyping = false;                 // Tracks if user is typing
 let isPDF = false;                    // Whether current page is a PDF
@@ -148,6 +143,11 @@ chrome.storage.local.get(['chatbotExpanded', 'chatbotPanelWidth', 'user'], (resu
   
   // Try to sync user info from React app's localStorage if on the dashboard domain
   syncUserInfoFromReactApp();
+
+  // Notify background of initial state so gaze tracking can start when enabled
+  if (extensionEnabled) {
+    chrome.runtime.sendMessage({ type: 'EXTENSION_STATE_CHANGED', enabled: true }).catch(() => {});
+  }
 });
 
 /**
@@ -197,55 +197,16 @@ setInterval(() => {
 // ============================================================================
 
 /**
- * Attempts to fetch gaze coordinates from the gaze tracking API
- * Falls back to null if API is unavailable or returns invalid data
- * 
- * @returns {Promise<{x: number, y: number} | null>} Gaze coordinates or null on failure
+ * Returns current gaze point from in-browser gaze tracking
+ * (MediaPipe Face Landmarker) or null if unavailable.
+ * Coordinates are in screen pixels (clientX/clientY space).
+ *
+ * @returns {Promise<{x: number, y: number} | null>} Gaze coordinates or null
  */
 async function getGazePoint() {
-  if (!gazeAvailable) return null;
-
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-
-    const response = await fetch(GAZE_API_URL, {
-      method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      console.warn('[ContextGrabber] Gaze API returned:', response.status);
-      gazeAvailable = false;
-      return null;
-    }
-
-    const data = await response.json();
-
-    // Validate response format
-    if (typeof data.x !== 'number' || typeof data.y !== 'number') {
-      console.warn('[ContextGrabber] Invalid gaze response format:', data);
-      return null;
-    }
-
-    // Check confidence if provided
-    if (data.confidence !== undefined && data.confidence < MIN_CONFIDENCE) {
-      return null;
-    }
-
-    return { x: data.x, y: data.y };
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      console.warn('[ContextGrabber] Gaze API timeout');
-    } else {
-      console.warn('[ContextGrabber] Gaze API error:', error.message);
-    }
-    gazeAvailable = false;
-    return null;
-  }
+  if (!ENABLE_GAZE_MODE) return null;
+  if (!gazeAvailable || !latestGaze) return null;
+  return latestGaze;
 }
 
 // ============================================================================
@@ -4115,6 +4076,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // If user clicks icon, toggle the extension instead of grabbing context
     toggleExtension();
     sendResponse({ received: true, enabled: extensionEnabled });
+  }
+
+  // In-browser gaze tracking updates (from offscreen document via background)
+  if (message.type === 'GAZE_UPDATE' && message.gaze) {
+    gazeAvailable = true;
+    latestGaze = {
+      x: message.gaze.x * window.innerWidth,
+      y: message.gaze.y * window.innerHeight
+    };
+  }
+  if (message.type === 'GAZE_STARTED') {
+    gazeAvailable = true;
+  }
+  if (message.type === 'GAZE_ERROR' || message.type === 'GAZE_STOPPED') {
+    gazeAvailable = false;
+    latestGaze = null;
   }
 
   // Receive Google search results from background

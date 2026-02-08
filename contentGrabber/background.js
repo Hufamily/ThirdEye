@@ -140,14 +140,87 @@ function updateBadgeForTab(tabId, enabled) {
 }
 
 // ============================================================================
-// MESSAGE HANDLER: Receive content from content script
+// GAZE TRACKING: Offscreen document + MediaPipe
+// ============================================================================
+
+const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
+
+async function ensureOffscreenDocument() {
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH)]
+  });
+  if (existingContexts.length > 0) return;
+  await chrome.offscreen.createDocument({
+    url: OFFSCREEN_DOCUMENT_PATH,
+    reasons: ['USER_MEDIA'],
+    justification: 'ThirdEye gaze tracking requires camera access for in-browser eye tracking'
+  });
+}
+
+async function closeOffscreenDocument() {
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH)]
+  });
+  if (existingContexts.length > 0) {
+    await chrome.offscreen.closeDocument();
+  }
+}
+
+async function startGazeTracking() {
+  await ensureOffscreenDocument();
+  const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH);
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [offscreenUrl]
+  });
+  if (contexts.length === 0) {
+    console.warn('[ThirdEye] Offscreen document not ready');
+    return;
+  }
+  try {
+    await chrome.runtime.sendMessage({ type: 'START_GAZE' });
+    console.log('[ThirdEye] Gaze tracking started');
+  } catch (e) {
+    console.error('[ThirdEye] Failed to start gaze:', e);
+  }
+}
+
+async function stopGazeTracking() {
+  try {
+    await chrome.runtime.sendMessage({ type: 'STOP_GAZE' });
+  } catch (e) {
+    // Offscreen may already be closed
+  }
+  await closeOffscreenDocument();
+}
+
+// ============================================================================
+// MESSAGE HANDLER: Receive content from content script / offscreen
 // ============================================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Forward gaze updates from offscreen document to active tab
+  if (message.type === 'GAZE_UPDATE' || message.type === 'GAZE_ERROR' || message.type === 'GAZE_STOPPED') {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs[0] && tabs[0].id) {
+        chrome.tabs.sendMessage(tabs[0].id, message).catch(() => {});
+      }
+    });
+  }
+
   // Handle extension state changes from content script
   if (message.type === 'EXTENSION_STATE_CHANGED') {
     if (sender.tab && sender.tab.id) {
       updateBadgeForTab(sender.tab.id, message.enabled);
+
+      // Start/stop in-browser gaze tracking
+      if (message.enabled) {
+        startGazeTracking();
+      } else {
+        stopGazeTracking();
+      }
       
       // Start or stop session based on enabled state
       if (message.enabled && sender.tab.url) {
