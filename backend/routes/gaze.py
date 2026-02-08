@@ -32,11 +32,16 @@ _ws_clients: set[WebSocket] = set()
 
 class GazeUpdate(BaseModel):
     """Request body for POST /api/gaze"""
+    model_config = {"populate_by_name": True}
+
     x: float
     y: float
     confidence: float = 1.0
     screenWidth: Optional[int] = None
     screenHeight: Optional[int] = None
+    # Accept snake_case aliases from gaze_cursor.py
+    screen_width: Optional[int] = None
+    screen_height: Optional[int] = None
 
 
 @router.get("")
@@ -66,13 +71,16 @@ async def update_gaze(update: GazeUpdate):
     Also broadcasts to all connected WebSocket clients.
     """
     global _gaze_data
+    # Accept both camelCase (screenWidth) and snake_case (screen_width) fields
+    sw = update.screenWidth or update.screen_width or _gaze_data.get("screenWidth", 1920)
+    sh = update.screenHeight or update.screen_height or _gaze_data.get("screenHeight", 1080)
     _gaze_data = {
         "x": update.x,
         "y": update.y,
         "confidence": update.confidence,
         "available": True,
-        "screenWidth": update.screenWidth or _gaze_data.get("screenWidth", 1920),
-        "screenHeight": update.screenHeight or _gaze_data.get("screenHeight", 1080),
+        "screenWidth": sw,
+        "screenHeight": sh,
     }
 
     # Broadcast to all WebSocket clients

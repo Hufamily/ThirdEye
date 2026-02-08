@@ -220,8 +220,8 @@ while running:
                     "x": float(last_published_x),
                     "y": float(last_published_y),
                     "confidence": 1.0,
-                    "screen_width": screen_width,
-                    "screen_height": screen_height,
+                    "screenWidth": screen_width,
+                    "screenHeight": screen_height,
                 }, timeout=0.05)
             except Exception:
                 pass  # Non-blocking — don't stall the 60 FPS loop

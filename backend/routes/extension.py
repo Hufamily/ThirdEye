@@ -371,3 +371,163 @@ async def analyze_history(
                 }
             }
         )
+
+
+# ============================================================================
+# Chat Routes
+# ============================================================================
+
+class ChatMessageRequest(BaseModel):
+    """Request model for chat messages"""
+    message: str
+    sessionId: Optional[str] = None
+    context: Optional[dict] = None
+
+
+class ChatMessageResponse(BaseModel):
+    """Response model for chat messages"""
+    reply: str
+    sessionId: Optional[str] = None
+    timestamp: str
+
+
+@router.post("/chat", response_model=ChatMessageResponse)
+async def send_chat_message(
+    request: ChatMessageRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    POST /api/extension/chat
+    Send a chat message and get an AI response.
+    Uses Gemini for conversational responses about the user's learning context.
+    """
+    await ensure_warehouse_resumed()
+
+    try:
+        from services.gemini_client import GeminiClient
+        gemini = GeminiClient()
+
+        # Build context from session if available
+        context_text = ""
+        if request.sessionId:
+            result = db.execute(text(f"""
+                SELECT DOC_TITLE, DOC_TYPE, METADATA
+                FROM {qt("SESSIONS")}
+                WHERE SESSION_ID = :session_id AND USER_ID = :user_id
+                LIMIT 1
+            """), {
+                "session_id": request.sessionId,
+                "user_id": current_user.user_id
+            })
+            row = result.fetchone()
+            if row:
+                context_text = f"The user is studying: {row[0]} ({row[1]}). "
+
+        if request.context:
+            import json as _json
+            context_text += f"Additional context: {_json.dumps(request.context)[:500]}"
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are ThirdEye, a helpful learning assistant. "
+                    "Help the user understand what they are reading. "
+                    "Keep answers concise and educational. "
+                    + context_text
+                )
+            },
+            {"role": "user", "content": request.message}
+        ]
+
+        response = await gemini.chat(messages=messages, temperature=0.7, max_tokens=1024)
+        reply_text = response.get("text", response.get("content", "I'm sorry, I couldn't generate a response."))
+
+        # Persist the exchange in session metadata
+        if request.sessionId:
+            try:
+                import json as _json
+                meta_result = db.execute(text(f"""
+                    SELECT METADATA FROM {qt("SESSIONS")}
+                    WHERE SESSION_ID = :sid AND USER_ID = :uid LIMIT 1
+                """), {"sid": request.sessionId, "uid": current_user.user_id})
+                meta_row = meta_result.fetchone()
+                metadata = _json.loads(meta_row[0]) if meta_row and meta_row[0] else {}
+                if "chat_history" not in metadata:
+                    metadata["chat_history"] = []
+                metadata["chat_history"].append({
+                    "role": "user",
+                    "content": request.message,
+                    "timestamp": datetime.now().isoformat()
+                })
+                metadata["chat_history"].append({
+                    "role": "assistant",
+                    "content": reply_text,
+                    "timestamp": datetime.now().isoformat()
+                })
+                # Keep last 100 messages to avoid unbounded growth
+                metadata["chat_history"] = metadata["chat_history"][-100:]
+                db.execute(text(f"""
+                    UPDATE {qt("SESSIONS")}
+                    SET METADATA = :metadata, UPDATED_AT = CURRENT_TIMESTAMP()
+                    WHERE SESSION_ID = :sid
+                """), {"metadata": _json.dumps(metadata), "sid": request.sessionId})
+                db.commit()
+            except Exception as persist_err:
+                print(f"[Chat] Could not persist chat history: {persist_err}")
+
+        return ChatMessageResponse(
+            reply=reply_text,
+            sessionId=request.sessionId,
+            timestamp=datetime.now().isoformat()
+        )
+
+    except Exception as e:
+        # Fallback when Gemini is unavailable
+        print(f"[Chat] Gemini error: {e}")
+        return ChatMessageResponse(
+            reply="I'm currently unable to respond. Please make sure the Gemini API key is configured.",
+            sessionId=request.sessionId,
+            timestamp=datetime.now().isoformat()
+        )
+
+
+@router.get("/chat/history")
+async def get_chat_history(
+    sessionId: str,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    GET /api/extension/chat/history?sessionId=...&limit=50
+    Get chat history for a session
+    """
+    await ensure_warehouse_resumed()
+
+    try:
+        import json as _json
+        result = db.execute(text(f"""
+            SELECT METADATA FROM {qt("SESSIONS")}
+            WHERE SESSION_ID = :sid AND USER_ID = :uid LIMIT 1
+        """), {"sid": sessionId, "uid": current_user.user_id})
+        row = result.fetchone()
+        if not row or not row[0]:
+            return {"messages": [], "sessionId": sessionId}
+
+        metadata = _json.loads(row[0])
+        messages = metadata.get("chat_history", [])[-limit:]
+        return {"messages": messages, "sessionId": sessionId}
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "code": "CHAT_HISTORY_ERROR",
+                    "message": f"Failed to get chat history: {str(e)}",
+                    "details": {}
+                }
+            }
+        )

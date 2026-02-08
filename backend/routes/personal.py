@@ -391,6 +391,211 @@ async def ai_search(
 
 
 # ============================================================================
+# Analyze Route (called by extension for text analysis)
+# ============================================================================
+
+@router.post("/analyze")
+async def analyze_text(
+    request: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    POST /api/personal/analyze
+    Analyze extracted text from the extension to identify confusion points
+    and generate image search queries. Uses Gemini for analysis.
+    """
+    url = request.get("url", "")
+    text_content = request.get("text", "")
+    session_id = request.get("sessionId")
+
+    if not text_content:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": "Text content is required for analysis",
+                    "details": {}
+                }
+            }
+        )
+
+    try:
+        from services.gemini_client import GeminiClient
+        gemini = GeminiClient()
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a learning assistant that analyzes text to help students. "
+                    "Given text that a student is reading, provide:\n"
+                    "1. A concise summary (1-2 sentences)\n"
+                    "2. Potential confusion points (concepts that may need clarification)\n"
+                    "3. Suggested image search queries to help visualize concepts\n"
+                    "Respond in JSON format: "
+                    '{"summary": "...", "confusion_points": ["..."], "image_queries": ["..."]}'
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Analyze this text from {url}:\n\n{text_content[:3000]}"
+            }
+        ]
+
+        response = await gemini.chat(
+            messages=messages,
+            temperature=0.5,
+            max_tokens=1024,
+            response_format={"type": "json_object"}
+        )
+
+        reply_text = response.get("text", response.get("content", "{}"))
+
+        # Parse JSON from response
+        try:
+            result = json.loads(reply_text)
+        except json.JSONDecodeError:
+            result = {
+                "summary": reply_text[:200] if reply_text else "Could not generate summary.",
+                "confusion_points": [],
+                "image_queries": []
+            }
+
+        # Ensure expected keys exist
+        result.setdefault("summary", "")
+        result.setdefault("confusion_points", [])
+        result.setdefault("image_queries", [])
+
+        return result
+
+    except Exception as e:
+        print(f"[Analyze] Error: {e}")
+        # Return a graceful fallback
+        text_preview = text_content[:100].strip()
+        return {
+            "summary": f"Content from {url}: \"{text_preview}...\"",
+            "confusion_points": [
+                "Analysis service is temporarily unavailable.",
+                "The backend will retry automatically."
+            ],
+            "image_queries": []
+        }
+
+
+# ============================================================================
+# Session Triggers Routes
+# ============================================================================
+
+@router.post("/sessions/{session_id}/triggers")
+async def record_trigger(
+    session_id: str,
+    request: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    POST /api/personal/sessions/{session_id}/triggers
+    Record a confusion trigger (hover, scroll, click) for a session.
+    Stored in session metadata.
+    """
+    await ensure_warehouse_resumed()
+
+    trigger_type = request.get("triggerType", "unknown")
+    location = request.get("location", {})
+    trigger_text = request.get("text", "")
+    timestamp = request.get("timestamp", datetime.now().isoformat())
+
+    try:
+        result = db.execute(text(f"""
+            SELECT METADATA FROM {qt("SESSIONS")}
+            WHERE SESSION_ID = :sid AND USER_ID = :uid LIMIT 1
+        """), {"sid": session_id, "uid": current_user.user_id})
+        row = result.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail={
+                "error": {"code": "SESSION_NOT_FOUND", "message": "Session not found", "details": {}}
+            })
+
+        metadata = json.loads(row[0]) if row[0] else {}
+        if "triggers" not in metadata:
+            metadata["triggers"] = []
+
+        metadata["triggers"].append({
+            "type": trigger_type,
+            "location": location,
+            "text": trigger_text[:500],  # Cap text length
+            "timestamp": timestamp
+        })
+
+        # Keep last 200 triggers per session to avoid unbounded growth
+        metadata["triggers"] = metadata["triggers"][-200:]
+
+        db.execute(text(f"""
+            UPDATE {qt("SESSIONS")}
+            SET METADATA = :metadata, UPDATED_AT = CURRENT_TIMESTAMP()
+            WHERE SESSION_ID = :sid
+        """), {"metadata": json.dumps(metadata), "sid": session_id})
+        db.commit()
+
+        return {"success": True, "triggerCount": len(metadata["triggers"])}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={
+            "error": {
+                "code": "TRIGGER_RECORD_ERROR",
+                "message": f"Failed to record trigger: {str(e)}",
+                "details": {}
+            }
+        })
+
+
+@router.get("/sessions/{session_id}/triggers")
+async def get_triggers(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    GET /api/personal/sessions/{session_id}/triggers
+    Get confusion triggers recorded for a session.
+    """
+    await ensure_warehouse_resumed()
+
+    try:
+        result = db.execute(text(f"""
+            SELECT METADATA FROM {qt("SESSIONS")}
+            WHERE SESSION_ID = :sid AND USER_ID = :uid LIMIT 1
+        """), {"sid": session_id, "uid": current_user.user_id})
+        row = result.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail={
+                "error": {"code": "SESSION_NOT_FOUND", "message": "Session not found", "details": {}}
+            })
+
+        metadata = json.loads(row[0]) if row[0] else {}
+        triggers = metadata.get("triggers", [])
+
+        return {"triggers": triggers, "count": len(triggers), "sessionId": session_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={
+            "error": {
+                "code": "TRIGGER_FETCH_ERROR",
+                "message": f"Failed to get triggers: {str(e)}",
+                "details": {}
+            }
+        })
+
+
+# ============================================================================
 # Session Management Routes
 # ============================================================================
 

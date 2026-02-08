@@ -3795,11 +3795,12 @@ async function sendChatMessageFromText(messageText) {
       }
       
       if (response?.success && response?.response) {
-        // Add assistant response
+        // Add assistant response — backend returns { reply, sessionId, timestamp }
+        const resp = response.response;
         const assistantMessage = {
           role: 'assistant',
-          content: response.response.response || response.response,
-          timestamp: response.response.timestamp || new Date().toISOString()
+          content: resp.reply || resp.response || resp.content || (typeof resp === 'string' ? resp : JSON.stringify(resp)),
+          timestamp: resp.timestamp || new Date().toISOString()
         };
         chatMessages.push(assistantMessage);
         updateChatMessages();
@@ -3843,9 +3844,14 @@ function loadUserInfo() {
  * Opens personal dashboard
  */
 function openPersonalDashboard() {
-  chrome.storage.local.get(['api_base_url'], (result) => {
-    const apiBase = result.analyze_api_url ? new URL(result.analyze_api_url).origin : 'http://127.0.0.1:8000';
-    const dashboardUrl = `${apiBase.replace('/api', '')}/personal`;
+  chrome.storage.local.get(['api_base_url', 'analyze_api_url'], (result) => {
+    let apiBase = 'http://127.0.0.1:8000';
+    if (result.api_base_url) {
+      apiBase = result.api_base_url;
+    } else if (result.analyze_api_url) {
+      try { apiBase = new URL(result.analyze_api_url).origin; } catch (_) {}
+    }
+    const dashboardUrl = 'http://localhost:5173/personal';
     chrome.tabs.create({ url: dashboardUrl });
   });
 }
@@ -4343,6 +4349,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Real-time gaze updates from WebSocket or HTTP poll (gaze2 stream)
   if (message.type === 'GAZE_UPDATE') {
+    // In cursor-only mode, ignore gaze updates entirely
+    if (trackingMode === 'cursor') {
+      sendResponse({ received: true });
+      return;
+    }
     const raw = message.data;
     gazeAvailable = true;
 
@@ -5705,13 +5716,6 @@ async function dwellDetectionLoop() {
 // ============================================================================
 
 function main() {
-  // Load tracking mode from storage before anything else
-  chrome.storage.local.get(['tracking_mode'], (result) => {
-    trackingMode = result.tracking_mode || 'gaze+cursor';
-    gazeAvailable = trackingMode !== 'cursor';
-    console.log('[ContextGrabber] Tracking mode:', trackingMode);
-  });
-
   // Listen for tracking mode changes at runtime (from options page or overlay toggle)
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.tracking_mode) {
@@ -5791,8 +5795,15 @@ function main() {
   // Create the persistent overlay immediately
   createPersistentOverlay();
 
-  // Start dwell detection loop
-  dwellDetectionLoop();
+  // Load tracking mode from storage BEFORE starting the dwell loop
+  chrome.storage.local.get(['tracking_mode'], (result) => {
+    trackingMode = result.tracking_mode || 'gaze+cursor';
+    gazeAvailable = trackingMode !== 'cursor';
+    console.log('[ContextGrabber] Tracking mode:', trackingMode);
+
+    // Start dwell detection loop only after mode is loaded
+    dwellDetectionLoop();
+  });
 }
 
 // Start the extension
