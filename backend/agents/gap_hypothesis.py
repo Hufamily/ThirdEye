@@ -1,12 +1,12 @@
 """
 Agent 3.0: Gap Hypothesis
 "The Predictor" - Knowledge Gap Analysis
-Hypothesizes why the user is stuck using deep reasoning with K2-Think
+Hypothesizes why the user is stuck using Gemini API
 """
 
 from typing import Dict, Any, Optional, List
 from .base_agent import BaseAgent
-from services.k2think_client import K2ThinkClient
+from services.gemini_client import GeminiClient
 from utils.database import engine, ensure_warehouse_resumed
 from sqlalchemy import text
 import json
@@ -27,10 +27,10 @@ class GapHypothesis(BaseAgent):
             agent_version="1.0.0"
         )
         try:
-            self.k2think = K2ThinkClient()
+            self.gemini = GeminiClient()
         except Exception as e:
-            print(f"Warning: K2-Think client initialization failed: {e}")
-            self.k2think = None
+            print(f"Warning: Gemini client initialization failed: {e}")
+            self.gemini = None
     
     async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -79,29 +79,57 @@ class GapHypothesis(BaseAgent):
                 classification, persona_card, session_history, related_content
             )
             
-            # Use K2-Think for deep reasoning
-            if self.k2think:
+            # Use Gemini for gap analysis
+            if self.gemini:
                 try:
-                    # Use analyze_gap method for gap analysis
-                    user_context = {
-                        "persona": persona_card,
-                        "learning_style": persona_card.get("learningStyle", "unknown"),
-                        "expertise_level": classification.get("complexity", "unknown")
-                    }
-                    
-                    reasoning_result = await self.k2think.analyze_gap(
-                        user_content=classification.get("text", ""),
-                        user_question=f"Understanding {classification.get('content_type', 'content')}",
-                        user_context=user_context
+                    # Use Gemini to analyze gaps
+                    gemini_result = await self.gemini.analyze(
+                        prompt=prompt,
+                        system_instruction="You are an expert at analyzing knowledge gaps. Always respond with valid JSON only. Do NOT include reasoning steps or thinking process - only return the JSON output.",
+                        temperature=0.3,
+                        json_mode=True
                     )
                     
-                    # Parse K2-Think response
-                    hypotheses = self._parse_reasoning_result(reasoning_result)
+                    # Parse Gemini response
+                    content = self.gemini.extract_text_from_response(gemini_result)
+                    content = content.strip()
+                    if content.startswith("```json"):
+                        content = content[7:]
+                    if content.startswith("```"):
+                        content = content[3:]
+                    if content.endswith("```"):
+                        content = content[:-3]
+                    content = content.strip()
+                    
+                    parsed = json.loads(content)
+                    hypotheses = parsed.get("candidates", [])
+                    
+                    # Ensure each candidate has required fields
+                    for i, candidate in enumerate(hypotheses):
+                        if "id" not in candidate:
+                            candidate["id"] = f"gap_{i+1}"
+                        if "confidence" not in candidate:
+                            candidate["confidence"] = 0.7
+                        if "impact" not in candidate:
+                            candidate["impact"] = "medium"
+                    
+                    if not hypotheses:
+                        print("Warning: Gemini returned empty hypotheses, using fallback")
+                        hypotheses = self._fallback_hypothesis(classification, persona_card)
+                        
                 except Exception as e:
-                    print(f"K2-Think reasoning failed: {e}, using fallback")
+                    print(f"Gemini gap analysis failed: {e}, using fallback")
+                    import traceback
+                    traceback.print_exc()
                     hypotheses = self._fallback_hypothesis(classification, persona_card)
             else:
                 # Fallback to simpler heuristics
+                print("Warning: Gemini client not available, using fallback")
+                hypotheses = self._fallback_hypothesis(classification, persona_card)
+            
+            # Ensure we have at least one hypothesis
+            if not hypotheses:
+                print("Error: No hypotheses generated even after fallback")
                 hypotheses = self._fallback_hypothesis(classification, persona_card)
             
             # Determine winning hypothesis
@@ -143,7 +171,7 @@ class GapHypothesis(BaseAgent):
         session_history: List[Dict],
         related_content: str
     ) -> str:
-        """Build reasoning prompt for K2-Think"""
+        """Build reasoning prompt for Gemini"""
         
         content = classification.get("text", "")
         content_type = classification.get("content_type", "unknown")
@@ -165,12 +193,12 @@ class GapHypothesis(BaseAgent):
         
         prompt = f"""You are analyzing why a user might be confused about this content.
 
-**Content:**
-{content[:500]}
+**EXTRACTED CONTENT:**
+{content[:1000]}
 
 **Content Type:** {content_type}
 **Complexity:** {complexity}
-**Concepts:** {', '.join(concepts[:10])}
+**Concepts Found:** {', '.join(concepts[:10]) if concepts else 'None'}
 
 **User Profile:**
 - Expertise Levels: {json.dumps(expertise_levels, indent=2)}
@@ -184,13 +212,14 @@ class GapHypothesis(BaseAgent):
 {related_content[:300] if related_content else 'None'}
 
 **Your Task:**
-Analyze why the user might be stuck. Follow these steps:
+Analyze what knowledge gaps might prevent the user from understanding this SPECIFIC content. 
 
-Step 1: Identify prerequisite knowledge needed to understand this content
-Step 2: Compare prerequisites with user's known expertise levels
-Step 3: Identify specific gaps that would cause confusion
-Step 4: Rank gaps by likelihood and impact
-Step 5: Generate 2-4 hypotheses with confidence scores
+Look at the ACTUAL content:
+- If it's about "AI in Business" - what background knowledge about AI or business is needed?
+- If it mentions a speaker (e.g., "Dr. Ronnie Chatterji, Chief Economist") - what knowledge about economics or OpenAI might be needed?
+- If it's about a specific topic - what prerequisites are needed to understand that topic?
+
+Generate 2-4 hypotheses about what knowledge gaps exist for understanding THIS SPECIFIC CONTENT.
 
 **Output Format (JSON):**
 {{
@@ -199,68 +228,22 @@ Step 5: Generate 2-4 hypotheses with confidence scores
       "id": "gap_1",
       "hypothesis": "Missing prerequisite: [specific knowledge]",
       "confidence": 0.0-1.0,
-      "reasoning": "Explanation of why this gap causes confusion",
+      "reasoning": "Brief explanation of why this gap causes confusion",
       "prerequisites": ["prereq1", "prereq2"],
       "impact": "high|medium|low",
       "evidence": ["evidence1", "evidence2"]
     }}
-  ],
-  "reasoning_steps": ["step1", "step2", "step3"]
+  ]
 }}
 
-Show your reasoning step-by-step, then provide the JSON output."""
+CRITICAL: Return ONLY valid JSON. Do NOT include reasoning steps, thinking process, or any text outside the JSON structure."""
         
         return prompt
     
     def _parse_reasoning_result(self, reasoning_result: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Parse K2-Think reasoning result into hypotheses"""
-        try:
-            # Extract text from response
-            text = ""
-            if isinstance(reasoning_result, dict):
-                # Try different response formats
-                if "choices" in reasoning_result:
-                    # OpenAI-style format
-                    text = reasoning_result["choices"][0].get("message", {}).get("content", "")
-                elif "text" in reasoning_result:
-                    text = reasoning_result["text"]
-                elif "content" in reasoning_result:
-                    text = reasoning_result["content"]
-                else:
-                    # Try to find any text field
-                    text = str(reasoning_result)
-            
-            if not text:
-                return []
-            
-            # Try to extract JSON from response
-            json_match = re.search(r'\{[\s\S]*\}', text)
-            if json_match:
-                json_str = json_match.group(0)
-                # Remove markdown code blocks if present
-                json_str = re.sub(r'```json\s*', '', json_str)
-                json_str = re.sub(r'```\s*', '', json_str)
-                
-                parsed = json.loads(json_str)
-                candidates = parsed.get("candidates", [])
-                
-                # Ensure each candidate has required fields
-                for i, candidate in enumerate(candidates):
-                    if "id" not in candidate:
-                        candidate["id"] = f"gap_{i+1}"
-                    if "confidence" not in candidate:
-                        candidate["confidence"] = 0.7
-                    if "impact" not in candidate:
-                        candidate["impact"] = "medium"
-                
-                return candidates
-            
-            # Fallback: extract hypotheses from text
-            return self._extract_hypotheses_from_text(text)
-            
-        except Exception as e:
-            print(f"Error parsing reasoning result: {e}")
-            return []
+        """Parse Gemini reasoning result into hypotheses (kept for compatibility, but now handled in process method)"""
+        # This method is kept for backward compatibility but parsing is now done in process()
+        return []
     
     def _extract_hypotheses_from_text(self, text: str) -> List[Dict[str, Any]]:
         """Extract hypotheses from unstructured text"""

@@ -440,34 +440,43 @@ class CaptureScrape(BaseAgent):
                 print(f"Vision extraction failed: {e}")
                 vision_result = None
         
-        # Combine results intelligently
+        # Combine results intelligently - prioritize vision for accuracy
         extracted_text = ""
         text_source = "dom"
         
-        if text_extraction and len(text_extraction.strip()) > 50:
-            # Text extraction has good content
-            if vision_result and vision_result.get("text"):
-                vision_text = vision_result.get("text", "").strip()
-                # Combine: prefer text extraction, supplement with vision
-                if len(vision_text) > len(text_extraction) * 1.5:
-                    # Vision found significantly more content (likely canvas-rendered)
-                    extracted_text = vision_text
-                    text_source = "vision"
+        vision_text = ""
+        if vision_result and vision_result.get("text"):
+            vision_text = vision_result.get("text", "").strip()
+        
+        # Prioritize vision extraction for screenshots (more accurate for images)
+        if vision_text and len(vision_text.strip()) > 30:
+            # Vision extraction found content - use it as primary source
+            if text_extraction and len(text_extraction.strip()) > 50:
+                # Both available - merge but prioritize vision (it's more accurate for images)
+                # Vision often captures text that DOM extraction misses (e.g., rendered text, images)
+                merged = self._merge_texts(vision_text, text_extraction)
+                # If vision is significantly longer, it likely captured more content
+                if len(vision_text) > len(text_extraction) * 0.8:
+                    extracted_text = merged
+                    text_source = "hybrid"
                 else:
-                    # Merge both, prioritizing text extraction
-                    extracted_text = self._merge_texts(text_extraction, vision_text)
+                    extracted_text = merged
                     text_source = "hybrid"
             else:
-                extracted_text = text_extraction
-                text_source = "dom"
-        elif vision_result and vision_result.get("text"):
-            # No good text extraction, use vision
-            extracted_text = vision_result.get("text", "")
-            text_source = "vision"
+                # Only vision available - use it
+                extracted_text = vision_text
+                text_source = "vision"
+        elif text_extraction and len(text_extraction.strip()) > 50:
+            # Only DOM extraction available
+            extracted_text = text_extraction
+            text_source = "dom"
         else:
             # Fallback: use whatever we have
-            extracted_text = text_extraction or ""
-            text_source = "dom"
+            extracted_text = vision_text or text_extraction or ""
+            text_source = "vision" if vision_text else "dom"
+        
+        # Log extraction source for debugging
+        print(f"[CaptureScrape] Text extraction - source: {text_source}, length: {len(extracted_text)}, vision_length: {len(vision_text)}, dom_length: {len(text_extraction or '')}")
         
         # Extract context (simplified - in full implementation would use vision for context too)
         lines = extracted_text.split('\n')
@@ -501,25 +510,34 @@ class CaptureScrape(BaseAgent):
         }
     
     def _merge_texts(self, text1: str, text2: str) -> str:
-        """Intelligently merge two text extractions"""
-        # Simple merge: combine unique lines
-        lines1 = set(text1.split('\n'))
-        lines2 = set(text2.split('\n'))
+        """Intelligently merge two text extractions - prioritize longer, more complete text"""
+        # If one is significantly longer and more complete, prefer it
+        if len(text1.strip()) > len(text2.strip()) * 1.5:
+            return text1
+        elif len(text2.strip()) > len(text1.strip()) * 1.5:
+            return text2
         
-        # Combine unique lines, preserving order from text1
-        merged_lines = []
+        # Both are similar length - merge intelligently
+        lines1 = [line.strip() for line in text1.split('\n') if line.strip()]
+        lines2 = [line.strip() for line in text2.split('\n') if line.strip()]
+        
+        # Use a set to track seen content (normalized)
         seen = set()
+        merged_lines = []
         
-        for line in text1.split('\n'):
-            if line.strip() and line not in seen:
+        # Add all lines from text1 first (prioritize vision text if it's text1)
+        for line in lines1:
+            normalized = line.lower().strip()
+            if normalized and normalized not in seen:
                 merged_lines.append(line)
-                seen.add(line)
+                seen.add(normalized)
         
         # Add lines from text2 that aren't duplicates
-        for line in text2.split('\n'):
-            if line.strip() and line not in seen:
+        for line in lines2:
+            normalized = line.lower().strip()
+            if normalized and normalized not in seen:
                 merged_lines.append(line)
-                seen.add(line)
+                seen.add(normalized)
         
         return '\n'.join(merged_lines)
     

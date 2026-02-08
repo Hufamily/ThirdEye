@@ -80,15 +80,28 @@ class VisionClient:
                     "metadata": {"error": "Invalid image data URL"}
                 }
             
-            # Build prompt for OCR
-            extraction_prompt = prompt or """Extract all text from this image. 
-            Preserve the structure and formatting. Include:
-            - All visible text content
-            - Code blocks if present
-            - Mathematical equations if present
-            - Any labels or captions
-            
-            Return the extracted text exactly as it appears, maintaining line breaks and spacing."""
+            # Build prompt for OCR - focus on extracting ALL text accurately
+            extraction_prompt = prompt or """Extract ALL text from this image with high accuracy.
+
+CRITICAL INSTRUCTIONS:
+- Extract EVERY piece of visible text exactly as it appears
+- Preserve the structure: maintain line breaks, spacing, and formatting
+- Include ALL text elements:
+  * Event titles and names
+  * Speaker names, titles, and affiliations
+  * Dates and times
+  * Organizer names and co-hosts
+  * Headings and subheadings
+  * Body text and descriptions
+  * Navigation links and labels
+  * Any other visible text
+
+- For event pages: Extract event title, speaker name, speaker title/role, organization, date, organizers
+- For documents: Extract all headings, paragraphs, lists, and structured content
+- Do NOT skip any text, even if it seems like navigation or UI elements
+- Maintain the order of text as it appears top-to-bottom, left-to-right
+
+Return ONLY the extracted text, nothing else. No explanations, no analysis - just the raw text content."""
             
             # Prepare Gemini Vision API request
             payload = {

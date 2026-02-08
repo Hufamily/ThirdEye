@@ -2,6 +2,7 @@
 Agent 2.0: Target Interpreter
 Content Classification
 Classifies captured content using PersonaCard to understand context
+Uses Gemini API for all LLM operations
 """
 
 from typing import Dict, Any, Optional, List
@@ -66,9 +67,12 @@ class TargetInterpreter(BaseAgent):
             persona_card = input_data["persona_card"]
             session_history = input_data.get("session_history", [])
             
-            text = capture_result.get("text", "")
-            if not text:
-                raise ValueError("Capture result must contain text")
+            text = capture_result.get("text", "") or capture_result.get("extracted_text", "")
+            if not text or len(text.strip()) < 10:
+                return self.create_response(
+                    success=False, 
+                    error=f"Capture result must contain text (got {len(text) if text else 0} chars)"
+                )
             
             # Extract basic content type
             aoi_type = capture_result.get("aoi_type", self._detect_aoi_type(text))
@@ -379,26 +383,50 @@ Return JSON with only meaningful, substantive concepts:
         return filtered
     
     async def _generate_summary(self, text: str, content_type: str, concepts: List[str]) -> str:
-        """Generate a brief summary of the content"""
+        """Generate a brief summary of the EXTRACTED content from image/Google Docs"""
         try:
-            prompt = f"""Write a concise 2-3 sentence summary of this content. Focus on the main ideas and key information.
-IMPORTANT: Do NOT mention any product names, tools, or monitoring platforms. Only explain the actual content and concepts.
+            prompt = f"""Extract and summarize the key information from the content below. This content was extracted from an image screenshot or Google Docs.
 
-Content Type: {content_type}
-Key Concepts: {', '.join(concepts[:5]) if concepts else 'None'}
+EXTRACTED CONTENT:
+{text[:2000]}
 
-Text:
-{text[:1500]}
+YOUR TASK:
+Extract and summarize the ACTUAL information present in the content. Look for:
+- Event titles, topics, or subjects (e.g., "AI in Business", "Fireside Chat")
+- Speaker names, titles, and affiliations (e.g., "Dr. Ronnie Chatterji, Chief Economist, OpenAI")
+- Dates, times, locations
+- Organizers, hosts, or sponsors
+- Key topics or themes discussed
+- Any specific details mentioned
 
-Return a clear, informative summary in 2-3 sentences. Focus on the subject matter, not any tools or products."""
+Write a concise 2-3 sentence summary that captures:
+1. What the main topic/subject is (e.g., "This is about AI in Business")
+2. Key details about speakers, events, or subjects mentioned
+3. Important context (dates, organizers, etc.)
+
+CRITICAL:
+- Summarize ONLY what is actually in the extracted content
+- Do NOT use generic phrases like "Understanding general content" or "This concept"
+- Be specific: mention actual names, topics, and details from the content
+- Do NOT mention any product names, tools, or monitoring platforms
+- If it's an event, mention the event topic and speaker details
+- If it's about a person, mention their name and role
+- If it's about a topic, mention the specific topic
+
+Return ONLY the summary text (2-3 sentences), nothing else."""
             
             response = await self.gemini.analyze(
                 prompt=prompt,
-                system_instruction="You are an expert at summarizing content. Write clear, concise summaries.",
-                temperature=0.5
+                system_instruction="You are a summarization expert. Your task is to summarize extracted content from images or documents. Return ONLY the summary text, nothing else. Do not analyze or explain - just summarize what was extracted.",
+                temperature=0.3,
+                json_mode=False
             )
             
             summary = self.gemini.extract_text_from_response(response)
+            # Clean up summary - remove any reasoning markers
+            summary = summary.strip()
+            # Remove common reasoning prefixes
+            summary = re.sub(r'^(Let me|First|To summarize|In summary|This content|The extracted)[\s,:-]+\s*', '', summary, flags=re.IGNORECASE)
             return summary.strip()[:500]  # Limit length
         except Exception as e:
             print(f"Error generating summary: {e}")

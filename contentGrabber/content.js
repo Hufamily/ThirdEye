@@ -1873,6 +1873,10 @@ function updateOverlayContent(html) {
   if (!currentOverlay) createPersistentOverlay();
   const body = currentOverlay.querySelector('#cg-body');
   const overlayContent = currentOverlay.querySelector('.cg-overlay-content');
+  
+  // Save current tab state before updating
+  const currentActiveTab = activeTab || 'summary';
+  
   if (body) {
     body.innerHTML = html;
     // Ensure body is visible (in case overlay was minimized)
@@ -1887,6 +1891,64 @@ function updateOverlayContent(html) {
     // Ensure overlay content is visible
     if (overlayContent) {
       overlayContent.style.display = 'block';
+    }
+    
+    // Restore tab state after innerHTML update
+    // Re-attach tab event listeners if tabs exist
+    const tabBar = currentOverlay.querySelector('.cg-tab-bar');
+    if (tabBar) {
+      // Remove any existing listeners by checking if handler exists
+      // Use a data attribute to track if listener is attached
+      if (!tabBar.dataset.tabListenerAttached) {
+        tabBar.dataset.tabListenerAttached = 'true';
+        
+        // Attach event listener using event delegation (survives innerHTML updates)
+        tabBar.addEventListener('click', function tabClickHandler(e) {
+          const tab = e.target.closest('.cg-tab');
+          if (!tab) return;
+          
+          e.preventDefault();
+          e.stopPropagation();
+          
+          const panelId = tab.dataset.tab;
+          if (!panelId) return;
+          
+          // Update active tab
+          const tabs = tabBar.querySelectorAll('.cg-tab');
+          tabs.forEach(t => t.classList.remove('cg-tab-active'));
+          tab.classList.add('cg-tab-active');
+          
+          // Show/hide panels
+          const summaryPanel = currentOverlay.querySelector('#cg-panel-summary');
+          const explanationPanel = currentOverlay.querySelector('#cg-panel-explanation');
+          const resourcesPanel = currentOverlay.querySelector('#cg-panel-resources');
+          
+          if (summaryPanel) summaryPanel.style.display = panelId === 'summary' ? 'block' : 'none';
+          if (explanationPanel) explanationPanel.style.display = panelId === 'explanation' ? 'block' : 'none';
+          if (resourcesPanel) resourcesPanel.style.display = panelId === 'resources' ? 'block' : 'none';
+          
+          activeTab = panelId;
+        }, { capture: false });
+      }
+      
+      // Restore active tab state
+      const tabs = tabBar.querySelectorAll('.cg-tab');
+      tabs.forEach(t => {
+        if (t.dataset.tab === currentActiveTab) {
+          t.classList.add('cg-tab-active');
+        } else {
+          t.classList.remove('cg-tab-active');
+        }
+      });
+      
+      // Show/hide panels based on active tab
+      const summaryPanel = currentOverlay.querySelector('#cg-panel-summary');
+      const explanationPanel = currentOverlay.querySelector('#cg-panel-explanation');
+      const resourcesPanel = currentOverlay.querySelector('#cg-panel-resources');
+      
+      if (summaryPanel) summaryPanel.style.display = currentActiveTab === 'summary' ? 'block' : 'none';
+      if (explanationPanel) explanationPanel.style.display = currentActiveTab === 'explanation' ? 'block' : 'none';
+      if (resourcesPanel) resourcesPanel.style.display = currentActiveTab === 'resources' ? 'block' : 'none';
     }
   }
   // #region agent log
@@ -4475,14 +4537,16 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   // Snapshot preview removed per user request - no longer showing snapshot UI
   
   // Tab bar: Summary | Explanation | Resources
+  // Use current activeTab or default to 'summary'
+  const initialTab = activeTab || 'summary';
   html += '<div class="cg-tab-bar">';
-  html += '<button class="cg-tab cg-tab-active" data-tab="summary">Summary</button>';
-  html += '<button class="cg-tab" data-tab="explanation">Explanation</button>';
-  html += '<button class="cg-tab" data-tab="resources">Resources</button>';
+  html += `<button class="cg-tab ${initialTab === 'summary' ? 'cg-tab-active' : ''}" data-tab="summary">Summary</button>`;
+  html += `<button class="cg-tab ${initialTab === 'explanation' ? 'cg-tab-active' : ''}" data-tab="explanation">Explanation</button>`;
+  html += `<button class="cg-tab ${initialTab === 'resources' ? 'cg-tab-active' : ''}" data-tab="resources">Resources</button>`;
   html += '</div>';
   
   // Summary Tab
-  html += '<div class="cg-tab-panel" id="cg-panel-summary">';
+  html += `<div class="cg-tab-panel" id="cg-panel-summary" style="display: ${initialTab === 'summary' ? 'block' : 'none'}">`;
   html += '<div class="cg-section">';
   
   // Summary (detailed summary from Agent 2.0)
@@ -4521,7 +4585,7 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   html += '</div></div>';
   
   // Explanation Tab
-  html += '<div class="cg-tab-panel" id="cg-panel-explanation" style="display:none">';
+  html += `<div class="cg-tab-panel" id="cg-panel-explanation" style="display: ${initialTab === 'explanation' ? 'block' : 'none'}">`;
   
   // Check if Agent 4.0 has error
   if (agent4.error) {
@@ -4607,7 +4671,8 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   
   updateOverlayContent(html);
   setOverlayStatus('Analysis complete');
-  activeTab = 'summary';
+  // Don't reset activeTab - preserve user's current tab selection
+  if (!activeTab) activeTab = 'summary';
   
   // #region agent log
   const debugAfterUpdate = {location:'content.js:4525',message:'overlay content updated',data:{hasCurrentOverlay:!!currentOverlay,overlayVisible:currentOverlay?.style?.display!=='none'},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
@@ -4615,20 +4680,27 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugAfterUpdate)}).catch(()=>{});
   // #endregion
   
-  // Wire up tab switching
-  const tabs = currentOverlay.querySelectorAll('.cg-tab');
-  tabs.forEach(tab => {
-    tab.addEventListener('click', () => {
-      tabs.forEach(t => t.classList.remove('cg-tab-active'));
-      tab.classList.add('cg-tab-active');
+  // Tab switching is now handled in updateOverlayContent using event delegation
+  // This ensures tabs work even if overlay content is updated
+  // Just ensure initial state is set
+  const tabBar = currentOverlay.querySelector('.cg-tab-bar');
+  if (tabBar && !tabBar.dataset.tabListenerAttached) {
+    // Trigger updateOverlayContent logic to attach listener
+    // The listener will be attached in updateOverlayContent
+    const currentBody = currentOverlay.querySelector('#cg-body');
+    if (currentBody) {
+      // Force re-attachment by calling updateOverlayContent with current HTML
+      // But actually, the listener should already be attached from updateOverlayContent call above
+      // So we just need to ensure the initial tab state is correct
+      const summaryPanel = currentOverlay.querySelector('#cg-panel-summary');
+      const explanationPanel = currentOverlay.querySelector('#cg-panel-explanation');
+      const resourcesPanel = currentOverlay.querySelector('#cg-panel-resources');
       
-      const panelId = tab.dataset.tab;
-      currentOverlay.querySelector('#cg-panel-summary').style.display = panelId === 'summary' ? 'block' : 'none';
-      currentOverlay.querySelector('#cg-panel-explanation').style.display = panelId === 'explanation' ? 'block' : 'none';
-      currentOverlay.querySelector('#cg-panel-resources').style.display = panelId === 'resources' ? 'block' : 'none';
-      activeTab = panelId;
-    });
-  });
+      if (summaryPanel) summaryPanel.style.display = 'block';
+      if (explanationPanel) explanationPanel.style.display = 'none';
+      if (resourcesPanel) resourcesPanel.style.display = 'none';
+    }
+  }
 }
 
 // ============================================================================

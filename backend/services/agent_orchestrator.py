@@ -169,8 +169,12 @@ class AgentOrchestrator:
             if "extracted_text" in normalized_capture and "text" not in normalized_capture:
                 normalized_capture["text"] = normalized_capture["extracted_text"]
             
+            # Log extracted text preview for debugging
+            extracted_text_preview = normalized_capture.get('text', '')[:200]
             print(f"[AgentOrchestrator] Agent 2.0 input - capture keys: {list(normalized_capture.keys())}, has_text: {'text' in normalized_capture}, has_extracted_text: {'extracted_text' in normalized_capture}")
             print(f"[AgentOrchestrator] Agent 2.0 input - text length: {len(normalized_capture.get('text', ''))}")
+            print(f"[AgentOrchestrator] Agent 2.0 input - text preview: {extracted_text_preview}")
+            print(f"[AgentOrchestrator] Agent 2.0 input - text_source: {normalized_capture.get('text_source', 'unknown')}")
             print(f"[AgentOrchestrator] Agent 2.0 input - persona_card keys: {list(persona_card.keys()) if persona_card else 'None'}")
             
             target_interpreter = TargetInterpreter()
@@ -240,12 +244,32 @@ class AgentOrchestrator:
             # ALWAYS generate explanation even if no hypothesis - use content-based explanation
             if not winning_hypothesis:
                 print(f"[AgentOrchestrator] No hypothesis found, creating content-based explanation")
-                # Create a basic hypothesis from the content itself
+                # Create a basic hypothesis from the ACTUAL content text
                 concepts = classification_data.get("concepts", [])
                 content_type = classification_data.get("content_type", "content")
+                # Extract actual topic/subject from the text
+                content_text = classification_data.get("text", "") or normalized_capture.get("text", "") or normalized_capture.get("extracted_text", "")
+                # Try to extract a meaningful topic from the first 200 chars
+                topic_hint = ""
+                if content_text:
+                    # Look for event titles, speaker names, or key topics in first 200 chars
+                    preview = content_text[:200].strip()
+                    # Extract first meaningful sentence or phrase
+                    sentences = preview.split('.')[:2]
+                    if sentences:
+                        topic_hint = sentences[0].strip()[:100]
+                
+                # Create hypothesis based on actual content
+                if topic_hint and len(topic_hint) > 20:
+                    hypothesis_text = f"Understanding: {topic_hint}"
+                elif concepts and len(concepts) > 0:
+                    hypothesis_text = f"Understanding {concepts[0]}"
+                else:
+                    hypothesis_text = f"Understanding the content about {content_type}"
+                
                 winning_hypothesis = {
                     "id": "content_based",
-                    "hypothesis": f"Understanding {content_type} content",
+                    "hypothesis": hypothesis_text,
                     "prerequisites": concepts[:3] if concepts else [],
                     "impact": "medium"
                 }
