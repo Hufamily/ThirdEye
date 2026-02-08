@@ -25,17 +25,21 @@ def get_build_number():
 
 build_number = get_build_number()
 
-from gazefollower import version
-
-major_version, minor_version, patch_version = version.__version__.split(".")
+# Read version without importing gazefollower (which has dependencies not yet installed)
+import re
+version_file = os.path.join(os.path.dirname(__file__), 'gazefollower', 'version.py')
+with open(version_file) as f:
+    version_match = re.search(r"__version__ = ['\"]([^'\"]*)['\"]", f.read())
+    version_string = version_match.group(1) if version_match else "1.0.0"
+major_version, minor_version, patch_version = version_string.split(".")
 
 setup(
     name=package_name,
     version=f"{major_version}.{minor_version}.{patch_version}",
-    author=version.__author__,
-    author_email=version.__email__,
-    description=version.__description__,
-    url=version.__url__,
+    author="Gancheng Zhu",
+    author_email="zhugc2016@gmail.com",
+    description="GazeFollower is a pythonic library for web-cam gaze tracking.",
+    url="https://github.com/GanchengZhu/GazeFollower",
     packages=find_packages(),
     long_description=open('README.md').read(),  # 或者使用其他文档文件
     long_description_content_type='text/markdown',  # 如果使用 Markdown 格式
