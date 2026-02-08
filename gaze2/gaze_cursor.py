@@ -43,7 +43,7 @@ except ModuleNotFoundError:
     )
 
 try:
-    from gazefollower import GazeFollower
+    from gazefollower.GazeFollower import GazeFollower
 except ModuleNotFoundError:
     raise SystemExit(
         "Could not import 'gazefollower'.\n"

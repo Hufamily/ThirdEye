@@ -1,2 +1,9 @@
+# API server
 flask>=3.0.0
 websockets>=12.0
+
+# Gaze tracking (installs from local GazeFollower package)
+-e ./GazeFollower
+
+# Cursor control (optional, for gaze_cursor.py)
+pyautogui>=0.9.50
