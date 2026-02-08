@@ -1,5 +1,5 @@
 /**
- * CONTENT SCRIPT - Dwell-Based Context Grabber
+ * CONTENT SCRIPT - ThirdEye Dwell-Based Context Grabber
  * 
  * BEHAVIOR:
  * The overlay stays open while browsing. When the cursor (or gaze point)
@@ -97,6 +97,14 @@ let lastExtractedRegionKey = '';      // De-dup key for special page extractions
 let pdfTrackingOverlay = null;        // Transparent overlay for PDF mouse tracking
 let lastScrollTime = 0;               // Timestamp of last scroll event
 
+// Chatbot panel state
+let chatbotExpanded = false;          // Whether chatbot panel is expanded
+let chatbotPanelWidth = 400;          // Current chatbot panel width in pixels
+let chatMessages = [];                // Chat message history
+let recentCaptures = [];              // Recent context captures (last 5)
+let isSendingMessage = false;        // Whether a message is being sent
+let isMinimized = false;              // Whether overlay panel is minimized (resized)
+
 // ============================================================================
 // UTILITY: Check if user is typing in an input field
 // ============================================================================
@@ -119,6 +127,70 @@ document.addEventListener('blur', () => { isTyping = false; }, true);
 document.addEventListener('input', () => { isTyping = isUserTyping(); }, true);
 document.addEventListener('keydown', () => { isTyping = isUserTyping(); }, true);
 document.addEventListener('keyup', () => { isTyping = false; }, true);
+
+// Load chatbot state from storage on page load
+chrome.storage.local.get(['chatbotExpanded', 'chatbotPanelWidth', 'user'], (result) => {
+  if (result.chatbotExpanded !== undefined) {
+    chatbotExpanded = result.chatbotExpanded;
+  }
+  if (result.chatbotPanelWidth !== undefined) {
+    chatbotPanelWidth = result.chatbotPanelWidth;
+  }
+  
+  // If chatbot was expanded, restore it after overlay is created
+  if (chatbotExpanded) {
+    setTimeout(() => {
+      if (currentOverlay) {
+        expandChatbotPanel();
+      }
+    }, 500);
+  }
+  
+  // Try to sync user info from React app's localStorage if on the dashboard domain
+  syncUserInfoFromReactApp();
+});
+
+/**
+ * Attempts to sync user info from React app's localStorage
+ * This works if the extension content script runs on the React app domain
+ */
+function syncUserInfoFromReactApp() {
+  try {
+    // Try to read from React app's Zustand persisted storage
+    const authStorage = localStorage.getItem('auth-storage');
+    if (authStorage) {
+      try {
+        const authData = JSON.parse(authStorage);
+        if (authData.state?.user && authData.state?.token) {
+          // Sync to extension storage
+          chrome.storage.local.set({
+            user: authData.state.user,
+            auth_token: authData.state.token
+          }, () => {
+            console.log('[ContextGrabber] User info synced from React app');
+            // Update UI if overlay exists
+            if (currentOverlay) {
+              loadUserInfo();
+            }
+          });
+        }
+      } catch (e) {
+        console.warn('[ContextGrabber] Failed to parse auth storage:', e);
+      }
+    }
+  } catch (e) {
+    // localStorage might not be accessible (cross-origin)
+    console.log('[ContextGrabber] Could not access localStorage:', e.message);
+  }
+}
+
+// Periodically sync user info (in case user logs in on React app)
+setInterval(() => {
+  syncUserInfoFromReactApp();
+  if (currentOverlay) {
+    loadUserInfo();
+  }
+}, 5000); // Check every 5 seconds
 
 // ============================================================================
 // CORE: Get gaze point from API
@@ -197,7 +269,36 @@ document.addEventListener('mousemove', (event) => {
 document.addEventListener('scroll', () => {
   dwellAnchor = null;
   lastScrollTime = Date.now();
+  
+  // Record scroll as confusion trigger
+  if (extensionEnabled) {
+    chrome.runtime.sendMessage({
+      type: 'RECORD_TRIGGER',
+      data: {
+        triggerType: 'scroll',
+        location: { x: currentMousePos.x, y: currentMousePos.y },
+        text: window.getSelection().toString().trim() || document.elementFromPoint(currentMousePos.x, currentMousePos.y)?.textContent?.substring(0, 200) || ''
+      }
+    }).catch(() => {}); // Ignore errors
+  }
 }, { passive: true, capture: true });
+
+// Track click events as confusion triggers
+document.addEventListener('click', (e) => {
+  if (extensionEnabled && !isHoveringOverlay) {
+    const clickedElement = e.target;
+    const text = clickedElement.textContent?.substring(0, 200) || '';
+    
+    chrome.runtime.sendMessage({
+      type: 'RECORD_TRIGGER',
+      data: {
+        triggerType: 'click',
+        location: { x: e.clientX, y: e.clientY },
+        text: text
+      }
+    }).catch(() => {}); // Ignore errors
+  }
+}, { passive: true });
 
 window.addEventListener('scroll', () => {
   dwellAnchor = null;
@@ -1545,18 +1646,63 @@ function createPersistentOverlay() {
   overlay.innerHTML = `
     <div class="cg-overlay-content">
       <div class="cg-overlay-header">
-        <span class="cg-title">Context Grabber</span>
-        <span class="cg-status" id="cg-status">Watching...</span>
-        <button class="cg-toggle-btn" id="cg-toggle-btn" aria-label="Toggle extension" title="Toggle on/off (Ctrl+Shift+G)">&#9654;</button>
-        <button class="cg-minimize-btn" aria-label="Minimize">&#8212;</button>
-        <button class="cg-dock-btn" id="cg-dock-btn" aria-label="Dock to corner" title="Dock to corner">&#8690;</button>
+        <div class="cg-header-row-1">
+          <div class="cg-title-container">
+            <img src="${chrome.runtime.getURL('logo.png')}" alt="ThirdEye Logo" class="cg-logo" />
+            <span class="cg-title">ThirdEye</span>
+          </div>
+          <span class="cg-status" id="cg-status">Watching...</span>
+          <div class="cg-user-info" id="cg-user-info" style="display:none;">
+            <button class="cg-user-profile-btn" id="cg-user-profile-btn" title="Open Profile">
+              <img class="cg-user-avatar" id="cg-user-avatar" src="" alt="User" />
+              <span class="cg-user-name" id="cg-user-name"></span>
+            </button>
+          </div>
+        </div>
+        <div class="cg-header-row-2">
+          <div class="cg-header-buttons">
+            <button class="cg-btn-text-icon" id="cg-close-session-btn" title="Close Session and Save to Notebook">
+              <svg class="cg-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="15" y1="9" x2="9" y2="15"></line>
+                <line x1="9" y1="9" x2="15" y2="15"></line>
+              </svg>
+              <span class="cg-btn-text">Close Session</span>
+            </button>
+            <button class="cg-toggle-btn" id="cg-toggle-btn" aria-label="Toggle extension" title="Toggle on/off (Ctrl+Shift+G)">&#9654;</button>
+            <button class="cg-btn-text-icon" id="cg-chat-btn" aria-label="Expand to Chat" title="Expand to Chat">
+              <svg class="cg-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+              </svg>
+              <span class="cg-btn-text">Chat</span>
+            </button>
+            <button class="cg-minimize-btn" aria-label="Resize panel" title="Resize panel">&#8212;</button>
+            <button class="cg-dock-btn" id="cg-dock-btn" aria-label="Dock to corner" title="Dock to corner">&#8690;</button>
+          </div>
+        </div>
       </div>
       <div class="cg-body" id="cg-body">
         <div class="cg-section"><p class="cg-hint">Hover over content for ${DWELL_TIME_MS / 1000}s to search.<br><em>Ctrl+Shift+G to toggle, or click &#9654;</em></p></div>
       </div>
+      <div class="cg-quick-chat-container" id="cg-quick-chat-container" style="display:none;">
+        <div class="cg-quick-chat-input-wrapper">
+          <button class="cg-chat-expand-btn" id="cg-chat-expand-btn" title="Expand chat input">
+            <svg class="cg-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="18 15 12 9 6 15"></polyline>
+            </svg>
+          </button>
+          <textarea 
+            id="cg-quick-chat-input" 
+            class="cg-quick-chat-input" 
+            placeholder="Ask a question about the content..."
+            rows="1"
+          ></textarea>
+          <button id="cg-quick-chat-send" class="cg-quick-chat-send-btn">➤</button>
+        </div>
+      </div>
     </div>
-    <div class="cg-docked-icon" id="cg-docked-icon" style="display:none" title="Expand Context Grabber">
-      <span class="cg-docked-eye">👁</span>
+    <div class="cg-docked-icon" id="cg-docked-icon" style="display:none" title="Expand ThirdEye">
+      <img src="${chrome.runtime.getURL('logo.png')}" alt="ThirdEye" class="cg-docked-logo" />
     </div>
   `;
 
@@ -1564,6 +1710,12 @@ function createPersistentOverlay() {
   currentOverlay = overlay;
   overlayVisible = true;
   console.log('[ContextGrabber] Overlay appended to body, visible:', overlayVisible);
+  
+  // Load user info after overlay is created
+  setTimeout(() => {
+    syncUserInfoFromReactApp();
+    loadUserInfo();
+  }, 100);
 
   // Toggle button: enable/disable extension
   const toggleBtn = overlay.querySelector('#cg-toggle-btn');
@@ -1573,15 +1725,115 @@ function createPersistentOverlay() {
   });
   updateToggleButton(); // Set initial state
 
-  // Minimize/restore toggle
+  // Minimize/restore toggle - minimize height instead of width
   const minimizeBtn = overlay.querySelector('.cg-minimize-btn');
   const body = overlay.querySelector('#cg-body');
+  const quickChatContainer = overlay.querySelector('#cg-quick-chat-container');
+  const NORMAL_MAX_HEIGHT = '80vh';
+  
+  // Restore minimize state if it was set
+  if (isMinimized) {
+    overlay.style.maxHeight = 'auto';
+    overlay.style.height = 'auto';
+    if (body) body.style.display = 'none';
+    if (quickChatContainer) quickChatContainer.style.display = 'none';
+    minimizeBtn.innerHTML = '&#9744;';
+    minimizeBtn.setAttribute('title', 'Expand panel');
+  } else {
+    overlay.style.maxHeight = NORMAL_MAX_HEIGHT;
+    overlay.style.height = 'auto';
+    if (body) body.style.display = 'block';
+    minimizeBtn.innerHTML = '&#8212;';
+    minimizeBtn.setAttribute('title', 'Minimize panel');
+  }
+  
   minimizeBtn.addEventListener('click', () => {
-    const isMinimized = body.style.display === 'none';
-    body.style.display = isMinimized ? 'block' : 'none';
-    minimizeBtn.innerHTML = isMinimized ? '&#8212;' : '&#9744;';
-    overlayVisible = isMinimized;
+    // If chatbot is expanded, collapse it first (but don't reset minimize state)
+    const wasChatbotExpanded = chatbotExpanded;
+    if (chatbotExpanded) {
+      // Temporarily save minimize state
+      const savedMinimized = isMinimized;
+      collapseChatbotPanel();
+      // Restore minimize state since collapseChatbotPanel resets it
+      isMinimized = savedMinimized;
+    }
+    
+    // Toggle minimize state
+    isMinimized = !isMinimized;
+    
+    if (isMinimized) {
+      // Minimize: hide body and chat, show only header
+      overlay.style.maxHeight = 'auto';
+      overlay.style.height = 'auto';
+      if (body) body.style.display = 'none';
+      if (quickChatContainer) quickChatContainer.style.display = 'none';
+      minimizeBtn.innerHTML = '&#9744;'; // Square icon (expand)
+      minimizeBtn.setAttribute('title', 'Expand panel');
+    } else {
+      // Restore: show content and restore original size
+      overlay.style.maxHeight = NORMAL_MAX_HEIGHT;
+      overlay.style.height = 'auto';
+      if (body) body.style.display = 'block';
+      // Quick chat will show/hide based on its own logic
+      minimizeBtn.innerHTML = '&#8212;'; // Horizontal line (minimize)
+      minimizeBtn.setAttribute('title', 'Minimize panel');
+    }
   });
+
+  // Load user info and display Google account
+  loadUserInfo();
+  
+  // User profile button - link to webpage
+  const userProfileBtn = overlay.querySelector('#cg-user-profile-btn');
+  if (userProfileBtn) {
+    userProfileBtn.addEventListener('click', () => {
+      openPersonalDashboard();
+    });
+  }
+  
+  // Close Session button
+  const closeSessionBtn = overlay.querySelector('#cg-close-session-btn');
+  closeSessionBtn.addEventListener('click', () => {
+    closeSessionAndSave();
+  });
+  
+  // Chat button: expand overlay height to show chat
+  const chatBtn = overlay.querySelector('#cg-chat-btn');
+  chatBtn.addEventListener('click', () => {
+    toggleChatbotPanel();
+  });
+  
+  // Quick chat input (bottom bar)
+  const quickChatInput = overlay.querySelector('#cg-quick-chat-input');
+  const quickChatSend = overlay.querySelector('#cg-quick-chat-send');
+  const chatExpandBtn = overlay.querySelector('#cg-chat-expand-btn');
+  let chatInputExpanded = false;
+  
+  if (quickChatInput && quickChatSend) {
+    quickChatSend.addEventListener('click', () => sendQuickChatMessage());
+    quickChatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendQuickChatMessage();
+      }
+    });
+  }
+  
+  // Chat expand button
+  if (chatExpandBtn && quickChatInput) {
+    chatExpandBtn.addEventListener('click', () => {
+      chatInputExpanded = !chatInputExpanded;
+      if (chatInputExpanded) {
+        quickChatInput.style.height = '120px';
+        quickChatInput.rows = 5;
+        chatExpandBtn.querySelector('svg').style.transform = 'rotate(180deg)';
+      } else {
+        quickChatInput.style.height = 'auto';
+        quickChatInput.rows = 1;
+        chatExpandBtn.querySelector('svg').style.transform = 'rotate(0deg)';
+      }
+    });
+  }
 
   // Dock/undock toggle
   const dockBtn = overlay.querySelector('#cg-dock-btn');
@@ -1635,6 +1887,43 @@ function setOverlayStatus(text) {
 }
 
 /**
+ * Shows an error message in the overlay with dark theme styling
+ * @param {string} title - Error title
+ * @param {string} message - Error message
+ */
+function showErrorOverlay(title, message) {
+  if (!currentOverlay) createPersistentOverlay();
+  const html = `
+    <div class="cg-error">
+      <div class="cg-error-title">${escapeHtml(title)}</div>
+      <p class="cg-error-message">${escapeHtml(message)}</p>
+    </div>
+    <div class="cg-section">
+      <p class="cg-hint">You can still use text-based search by hovering over content.</p>
+    </div>
+  `;
+  updateOverlayContent(html);
+  setOverlayStatus('Error');
+}
+
+/**
+ * Shows an info message in the overlay with dark theme styling
+ * @param {string} title - Info title
+ * @param {string} message - Info message
+ */
+function showInfoOverlay(title, message) {
+  if (!currentOverlay) createPersistentOverlay();
+  const html = `
+    <div class="cg-info">
+      <div class="cg-info-title">${escapeHtml(title)}</div>
+      <p class="cg-info-message">${escapeHtml(message)}</p>
+    </div>
+  `;
+  updateOverlayContent(html);
+  setOverlayStatus('Info');
+}
+
+/**
  * Shows analysis results from the analysis API in the overlay
  */
 function showOverlay(result) {
@@ -1660,8 +1949,85 @@ function showOverlay(result) {
     html += '</ul></div>';
   }
 
+  // Add "Save to Notebook" button
+  html += `
+    <div class="cg-section">
+      <button class="cg-save-notebook-btn" id="cg-save-notebook-btn">
+        📝 Save to Notebook
+      </button>
+    </div>
+  `;
+
   updateOverlayContent(html);
   setOverlayStatus('Analysis ready');
+  
+  // Wire up save button
+  setTimeout(() => {
+    const saveBtn = currentOverlay?.querySelector('#cg-save-notebook-btn');
+    if (saveBtn) {
+      saveBtn.addEventListener('click', () => saveToNotebook(result));
+    }
+  }, 100);
+}
+
+/**
+ * Saves current context to notebook
+ */
+async function saveToNotebook(analysisResult) {
+  chrome.runtime.sendMessage({ type: 'GET_SESSION_ID' }, async (response) => {
+    const sessionId = response?.sessionId;
+    if (!sessionId) {
+      alert('No active session. Please enable the extension first.');
+      return;
+    }
+    
+    const lastCapture = recentCaptures[recentCaptures.length - 1];
+    const content = `
+# ${document.title || 'Untitled'}
+
+## Summary
+${analysisResult.summary || 'No summary available'}
+
+## Context
+${lastCapture ? escapeHtml(lastCapture.text) : 'No context captured'}
+
+## Confusion Points
+${analysisResult.confusion_points?.map(p => `- ${p}`).join('\n') || 'None'}
+
+## Source
+URL: ${window.location.href}
+Captured: ${new Date().toISOString()}
+    `.trim();
+    
+    chrome.runtime.sendMessage({
+      type: 'CREATE_NOTEBOOK_ENTRY',
+      data: {
+        sessionId: sessionId,
+        title: `${document.title || 'Untitled'} - ${new Date().toLocaleDateString()}`,
+        content: content,
+        context: {
+          url: window.location.href,
+          text: lastCapture?.text || '',
+          searchQuery: analysisResult.image_queries?.[0] || ''
+        }
+      }
+    }, (response) => {
+      if (response?.success) {
+        setOverlayStatus('Saved to notebook!');
+        const saveBtn = currentOverlay?.querySelector('#cg-save-notebook-btn');
+        if (saveBtn) {
+          saveBtn.textContent = '✓ Saved!';
+          saveBtn.disabled = true;
+          setTimeout(() => {
+            saveBtn.textContent = '📝 Save to Notebook';
+            saveBtn.disabled = false;
+          }, 2000);
+        }
+      } else {
+        alert('Failed to save to notebook: ' + (response?.error || 'Unknown error'));
+      }
+    });
+  });
 }
 
 /**
@@ -1676,51 +2042,51 @@ function getOverlayStyles() {
       right: 16px;
       width: 380px;
       max-height: 80vh;
-      background: white;
-      border: 2px solid #4CAF50;
+      background: hsl(0, 0%, 12.5%); /* #201f20 - matches frontend background */
+      border: 1px solid hsl(0, 0%, 18%); /* matches frontend border */
       border-radius: 8px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
       z-index: 2147483647;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      overflow-y: auto;
+      overflow: hidden;
       pointer-events: auto;
+      font-feature-settings: "rlig" 1, "calt" 1;
+      display: flex;
+      flex-direction: column;
+      transition: max-height 0.3s ease, height 0.3s ease;
     }
 
     .cg-overlay-content {
       padding: 16px;
-      color: #333;
+      padding-bottom: 80px; /* Space for chat input at bottom */
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
       font-size: 14px;
       line-height: 1.5;
-    }
-
-    .cg-close-btn {
-      position: absolute;
-      top: 8px;
-      right: 8px;
-      background: none;
-      border: none;
-      font-size: 20px;
-      cursor: pointer;
-      color: #999;
-      padding: 0;
-      width: 24px;
-      height: 24px;
+      position: relative;
+      min-height: 100%;
       display: flex;
-      align-items: center;
-      justify-content: center;
-      border-radius: 4px;
-      transition: all 0.2s;
+      flex-direction: column;
+      flex: 1;
+      overflow: hidden;
+      word-wrap: break-word;
+      word-break: break-word;
     }
 
-    .cg-close-btn:hover {
-      background: #f0f0f0;
-      color: #333;
+    .cg-body {
+      flex: 1;
+      overflow-y: auto;
+      overflow-x: hidden;
+      min-height: 0;
+      margin: 0;
+      padding: 0;
+      word-wrap: break-word;
+      word-break: break-word;
     }
 
     .cg-section {
       margin-bottom: 16px;
       padding-bottom: 12px;
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid hsl(0, 0%, 18%); /* matches frontend border */
     }
 
     .cg-section:last-child {
@@ -1732,7 +2098,7 @@ function getOverlayStyles() {
     .cg-section strong {
       display: block;
       margin-bottom: 8px;
-      color: #4CAF50;
+      color: hsl(0, 0%, 43.1%); /* matches frontend primary */
       font-size: 13px;
       text-transform: uppercase;
       letter-spacing: 0.5px;
@@ -1741,6 +2107,12 @@ function getOverlayStyles() {
     .cg-section p {
       margin: 0;
       padding: 0;
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
+    }
+
+    /* General paragraph styling for overlay */
+    #context-grabber-overlay p {
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
     }
 
     .cg-section ul {
@@ -1752,6 +2124,7 @@ function getOverlayStyles() {
     .cg-section li {
       margin: 4px 0;
       padding: 0;
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
     }
 
     /* Prevent text selection while maintaining readability */
@@ -1759,44 +2132,73 @@ function getOverlayStyles() {
       user-select: text;
     }
 
-    /* Scrollbar styling */
+    /* Scrollbar styling - dark theme */
     #context-grabber-overlay::-webkit-scrollbar {
       width: 6px;
     }
 
     #context-grabber-overlay::-webkit-scrollbar-track {
-      background: #f1f1f1;
+      background: hsl(0, 0%, 14.9%); /* matches frontend secondary */
       border-radius: 3px;
     }
 
     #context-grabber-overlay::-webkit-scrollbar-thumb {
-      background: #ccc;
+      background: hsl(0, 0%, 18%); /* matches frontend muted */
       border-radius: 3px;
     }
 
     #context-grabber-overlay::-webkit-scrollbar-thumb:hover {
-      background: #999;
+      background: hsl(0, 0%, 25%);
     }
 
-    /* Overlay header bar */
+    /* Overlay header bar - 2 rows */
     .cg-overlay-header {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-bottom: 10px;
+      margin-bottom: 10px;
+      border-bottom: 1px solid hsl(0, 0%, 18%); /* matches frontend border */
+    }
+
+    .cg-header-row-1 {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding-bottom: 10px;
-      margin-bottom: 10px;
-      border-bottom: 1px solid #eee;
+      width: 100%;
+    }
+
+    .cg-header-row-2 {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      width: 100%;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .cg-title-container {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .cg-logo {
+      width: 24px;
+      height: 24px;
+      object-fit: contain;
+      flex-shrink: 0;
     }
 
     .cg-title {
       font-weight: 700;
       font-size: 14px;
-      color: #333;
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
     }
 
     .cg-status {
       font-size: 11px;
-      color: #999;
+      color: hsl(0, 0%, 63.9%); /* matches frontend muted-foreground */
       flex: 1;
       text-align: right;
       margin-right: 8px;
@@ -1807,7 +2209,7 @@ function getOverlayStyles() {
       border: none;
       font-size: 18px;
       cursor: pointer;
-      color: #999;
+      color: hsl(0, 0%, 63.9%); /* matches frontend muted-foreground */
       padding: 0;
       width: 24px;
       height: 24px;
@@ -1819,16 +2221,16 @@ function getOverlayStyles() {
     }
 
     .cg-minimize-btn:hover {
-      background: #f0f0f0;
-      color: #333;
+      background: hsl(0, 0%, 18%); /* matches frontend muted */
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
     }
 
     .cg-toggle-btn {
-      background: #4CAF50;
+      background: hsl(0, 0%, 43.1%); /* matches frontend primary */
       border: none;
       font-size: 12px;
       cursor: pointer;
-      color: white;
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
       padding: 0;
       width: 24px;
       height: 24px;
@@ -1841,15 +2243,15 @@ function getOverlayStyles() {
     }
 
     .cg-toggle-btn:hover {
-      background: #388E3C;
+      background: hsl(0, 0%, 50%);
     }
 
     .cg-toggle-btn.cg-toggle-paused {
-      background: #FF9800;
+      background: hsl(0, 62.8%, 30.6%); /* matches frontend destructive */
     }
 
     .cg-toggle-btn.cg-toggle-paused:hover {
-      background: #F57C00;
+      background: hsl(0, 62.8%, 35%);
     }
 
     .cg-dock-btn {
@@ -1857,7 +2259,7 @@ function getOverlayStyles() {
       border: none;
       font-size: 14px;
       cursor: pointer;
-      color: #999;
+      color: hsl(0, 0%, 63.9%); /* matches frontend muted-foreground */
       padding: 0;
       width: 24px;
       height: 24px;
@@ -1869,32 +2271,33 @@ function getOverlayStyles() {
     }
 
     .cg-dock-btn:hover {
-      background: #f0f0f0;
-      color: #333;
+      background: hsl(0, 0%, 18%); /* matches frontend muted */
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
     }
 
     /* Docked (compact) mode - small floating icon */
     .cg-docked-icon {
       width: 40px;
       height: 40px;
-      background: linear-gradient(135deg, #4CAF50, #2E7D32);
+      background: linear-gradient(135deg, hsl(0, 0%, 43.1%), hsl(0, 0%, 35%)); /* matches frontend primary gradient */
       border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
       cursor: pointer;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
       transition: all 0.2s;
     }
 
     .cg-docked-icon:hover {
       transform: scale(1.1);
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
     }
 
-    .cg-docked-eye {
-      font-size: 20px;
-      line-height: 1;
+    .cg-docked-logo {
+      width: 24px;
+      height: 24px;
+      object-fit: contain;
     }
 
     /* When docked, shrink the overlay container */
@@ -1908,12 +2311,12 @@ function getOverlayStyles() {
     }
 
     .cg-hint {
-      color: #999;
+      color: hsl(0, 0%, 63.9%); /* matches frontend muted-foreground */
       font-style: italic;
     }
 
     .cg-loading {
-      color: #4CAF50;
+      color: hsl(0, 0%, 43.1%); /* matches frontend primary */
       font-style: italic;
       padding: 8px 0;
     }
@@ -1922,7 +2325,7 @@ function getOverlayStyles() {
     .cg-result-item {
       margin-bottom: 14px;
       padding-bottom: 12px;
-      border-bottom: 1px solid #f0f0f0;
+      border-bottom: 1px solid hsl(0, 0%, 18%); /* matches frontend border */
     }
 
     .cg-result-item:last-child {
@@ -1932,7 +2335,7 @@ function getOverlayStyles() {
     }
 
     .cg-result-title {
-      color: #1a0dab;
+      color: hsl(0, 0%, 70%); /* lighter gray for links */
       text-decoration: none;
       font-size: 15px;
       font-weight: 500;
@@ -1942,25 +2345,26 @@ function getOverlayStyles() {
     }
 
     .cg-result-title:hover {
+      color: hsl(0, 0%, 43.1%); /* matches frontend primary */
       text-decoration: underline;
     }
 
     .cg-result-url {
-      color: #006621;
+      color: hsl(0, 0%, 63.9%); /* matches frontend muted-foreground */
       font-size: 12px;
       margin-bottom: 4px;
       word-break: break-all;
     }
 
     .cg-result-snippet {
-      color: #545454;
+      color: hsl(0, 0%, 80%); /* slightly lighter than foreground for readability */
       font-size: 13px;
       line-height: 1.4;
     }
 
     /* Snapshot preview */
     .cg-snapshot-wrap {
-      border: 1px solid #ddd;
+      border: 1px solid hsl(0, 0%, 18%); /* matches frontend border */
       border-radius: 4px;
       overflow: hidden;
       max-height: 200px;
@@ -1968,14 +2372,16 @@ function getOverlayStyles() {
 
     .cg-snapshot-img {
       width: 100%;
+      max-width: 100%;
       height: auto;
       display: block;
+      object-fit: contain;
     }
 
     /* Tab bar */
     .cg-tab-bar {
       display: flex;
-      border-bottom: 2px solid #eee;
+      border-bottom: 1px solid hsl(0, 0%, 18%); /* matches frontend border */
       margin-bottom: 12px;
     }
 
@@ -1986,19 +2392,19 @@ function getOverlayStyles() {
       cursor: pointer;
       font-size: 13px;
       font-weight: 600;
-      color: #888;
+      color: hsl(0, 0%, 63.9%); /* matches frontend muted-foreground */
       border-bottom: 2px solid transparent;
       margin-bottom: -2px;
       transition: all 0.2s;
     }
 
     .cg-tab:hover {
-      color: #333;
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
     }
 
     .cg-tab-active {
-      color: #4CAF50;
-      border-bottom-color: #4CAF50;
+      color: hsl(0, 0%, 43.1%); /* matches frontend primary */
+      border-bottom-color: hsl(0, 0%, 43.1%); /* matches frontend primary */
     }
 
     /* Image grid */
@@ -2009,21 +2415,24 @@ function getOverlayStyles() {
     }
 
     .cg-image-card {
-      border: 1px solid #eee;
+      border: 1px solid hsl(0, 0%, 18%); /* matches frontend border */
       border-radius: 4px;
       overflow: hidden;
       text-decoration: none;
       display: flex;
       flex-direction: column;
       transition: box-shadow 0.2s;
+      background: hsl(0, 0%, 14.9%); /* matches frontend secondary */
     }
 
     .cg-image-card:hover {
-      box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+      border-color: hsl(0, 0%, 25%);
     }
 
     .cg-image-card img {
       width: 100%;
+      max-width: 100%;
       height: 100px;
       object-fit: cover;
       display: block;
@@ -2031,11 +2440,534 @@ function getOverlayStyles() {
 
     .cg-image-label {
       font-size: 11px;
-      color: #555;
+      color: hsl(0, 0%, 63.9%); /* matches frontend muted-foreground */
       padding: 4px 6px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+    }
+
+    /* Tab panel styling */
+    .cg-tab-panel {
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
+    }
+
+    /* Chatbot panel styles */
+    .cg-chat-btn {
+      /* Uses .cg-btn-text-icon styles */
+    }
+
+    /* Expanded chatbot panel - expands height, keeps width */
+    #context-grabber-overlay.cg-chatbot-expanded {
+      width: 380px !important;
+      max-height: 90vh !important;
+      height: auto !important;
+      top: 16px !important;
+      right: 16px !important;
+      bottom: auto !important;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #context-grabber-overlay.cg-chatbot-expanded .cg-overlay-content {
+      padding-bottom: 16px; /* Normal padding when expanded */
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    
+    #context-grabber-overlay.cg-chatbot-expanded .cg-body {
+      flex: 1;
+      overflow-y: auto;
+      min-height: 0;
+    }
+
+    /* Hide quick chat container when chatbot is expanded */
+    #context-grabber-overlay.cg-chatbot-expanded .cg-quick-chat-container {
+      display: none !important;
+    }
+
+    .cg-chat-context-section {
+      padding: 12px;
+      border-bottom: 1px solid hsl(0, 0%, 18%);
+      background: hsl(0, 0%, 14.9%);
+      max-height: 150px;
+      overflow-y: auto;
+    }
+
+    .cg-chat-context-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: hsl(0, 0%, 43.1%);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+
+    .cg-chat-context-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .cg-chat-context-item {
+      padding: 8px;
+      background: hsl(0, 0%, 12.5%);
+      border: 1px solid hsl(0, 0%, 18%);
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .cg-chat-context-item:hover {
+      background: hsl(0, 0%, 18%);
+      border-color: hsl(0, 0%, 25%);
+    }
+
+    .cg-chat-context-text {
+      font-size: 12px;
+      color: hsl(0, 0%, 80%);
+      line-height: 1.4;
+      margin-bottom: 4px;
+    }
+
+    .cg-chat-context-time {
+      font-size: 10px;
+      color: hsl(0, 0%, 63.9%);
+    }
+
+    .cg-chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .cg-chat-empty {
+      text-align: center;
+      color: hsl(0, 0%, 63.9%);
+      font-style: italic;
+      padding: 40px 20px;
+    }
+
+    .cg-chat-message {
+      display: flex;
+      flex-direction: column;
+      max-width: 85%;
+      animation: fadeIn 0.3s ease-in;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .cg-chat-message-user {
+      align-self: flex-end;
+    }
+
+    .cg-chat-message-assistant {
+      align-self: flex-start;
+    }
+
+    .cg-chat-message-content {
+      padding: 10px 14px;
+      border-radius: 12px;
+      font-size: 14px;
+      line-height: 1.5;
+      word-wrap: break-word;
+    }
+
+    .cg-chat-message-user .cg-chat-message-content {
+      background: hsl(0, 0%, 43.1%);
+      color: hsl(0, 0%, 98%);
+      border-bottom-right-radius: 4px;
+    }
+
+    .cg-chat-message-assistant .cg-chat-message-content {
+      background: hsl(0, 0%, 18%);
+      color: hsl(0, 0%, 98%);
+      border-bottom-left-radius: 4px;
+    }
+
+    .cg-chat-message-content code {
+      background: hsl(0, 0%, 14.9%);
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+    }
+
+    .cg-chat-message-content strong {
+      font-weight: 600;
+    }
+
+    .cg-chat-message-content em {
+      font-style: italic;
+    }
+
+    .cg-chat-message-time {
+      font-size: 10px;
+      color: hsl(0, 0%, 63.9%);
+      margin-top: 4px;
+      padding: 0 4px;
+    }
+
+    .cg-chat-input-container {
+      display: flex;
+      padding: 12px;
+      border-top: 1px solid hsl(0, 0%, 18%);
+      background: hsl(0, 0%, 12.5%);
+      gap: 8px;
+      align-items: flex-end;
+    }
+
+    .cg-chat-input {
+      flex: 1;
+      background: hsl(0, 0%, 14.9%);
+      border: 1px solid hsl(0, 0%, 18%);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: hsl(0, 0%, 98%);
+      font-size: 14px;
+      font-family: inherit;
+      resize: none;
+      max-height: 120px;
+      line-height: 1.5;
+    }
+
+    .cg-chat-input:focus {
+      outline: none;
+      border-color: hsl(0, 0%, 43.1%);
+    }
+
+    .cg-chat-input::placeholder {
+      color: hsl(0, 0%, 63.9%);
+    }
+
+    .cg-chat-send-btn {
+      background: hsl(0, 0%, 43.1%);
+      border: none;
+      border-radius: 8px;
+      width: 40px;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      color: hsl(0, 0%, 98%);
+      font-size: 18px;
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+
+    .cg-chat-send-btn:hover:not(:disabled) {
+      background: hsl(0, 0%, 50%);
+    }
+
+    .cg-chat-send-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .cg-chat-resize-handle {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 4px;
+      cursor: ew-resize;
+      background: transparent;
+      z-index: 10;
+    }
+
+    .cg-chat-resize-handle:hover {
+      background: hsl(0, 0%, 43.1%);
+    }
+
+    /* Save to Notebook button */
+    .cg-save-notebook-btn {
+      width: 100%;
+      padding: 10px 16px;
+      background: hsl(0, 0%, 43.1%);
+      border: none;
+      border-radius: 6px;
+      color: hsl(0, 0%, 98%);
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+      margin-top: 8px;
+    }
+
+    .cg-save-notebook-btn:hover:not(:disabled) {
+      background: hsl(0, 0%, 50%);
+    }
+
+    .cg-save-notebook-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    /* User info display */
+    .cg-user-info {
+      display: flex;
+      align-items: center;
+      margin-left: auto;
+    }
+
+    .cg-user-profile-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      background: hsl(0, 0%, 14.9%);
+      border: none;
+      border-radius: 12px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .cg-user-profile-btn:hover {
+      background: hsl(0, 0%, 18%);
+    }
+
+    .cg-user-avatar {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      object-fit: cover;
+      pointer-events: none;
+    }
+
+    .cg-user-name {
+      color: hsl(0, 0%, 80%);
+      max-width: 120px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      pointer-events: none;
+    }
+
+    /* Header buttons container */
+    .cg-header-buttons {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    /* Text + Icon buttons */
+    .cg-btn-text-icon {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: hsl(0, 0%, 63.9%);
+      padding: 6px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border-radius: 6px;
+      transition: all 0.2s;
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    .cg-btn-text-icon:hover {
+      background: hsl(0, 0%, 18%);
+      color: hsl(0, 0%, 98%);
+    }
+
+    .cg-btn-text-icon:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .cg-btn-icon {
+      width: 16px;
+      height: 16px;
+      flex-shrink: 0;
+    }
+
+    .cg-btn-text {
+      font-size: 13px;
+      line-height: 1;
+    }
+
+    /* Close Session button */
+    .cg-close-session-btn {
+      /* Uses .cg-btn-text-icon styles */
+      color: hsl(0, 62.8%, 50%);
+    }
+
+    .cg-close-session-btn:hover {
+      background: hsl(0, 62.8%, 20%);
+      color: hsl(0, 62.8%, 70%);
+    }
+
+    /* Quick chat input container (bottom bar) - fixed at bottom */
+    .cg-quick-chat-container {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      border-top: 1px solid hsl(0, 0%, 18%);
+      padding: 12px;
+      background: hsl(0, 0%, 12.5%);
+      z-index: 10;
+    }
+
+    .cg-quick-chat-input-wrapper {
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
+    }
+
+    .cg-chat-expand-btn {
+      background: hsl(0, 0%, 14.9%);
+      border: 1px solid hsl(0, 0%, 18%);
+      border-radius: 6px;
+      width: 32px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      color: hsl(0, 0%, 63.9%);
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+
+    .cg-chat-expand-btn:hover {
+      background: hsl(0, 0%, 18%);
+      color: hsl(0, 0%, 98%);
+    }
+
+    .cg-chat-expand-btn svg {
+      width: 14px;
+      height: 14px;
+      transition: transform 0.2s;
+    }
+
+    .cg-quick-chat-input {
+      flex: 1;
+      background: hsl(0, 0%, 14.9%);
+      border: 1px solid hsl(0, 0%, 18%);
+      border-radius: 8px;
+      padding: 8px 12px;
+      color: hsl(0, 0%, 98%);
+      font-size: 13px;
+      font-family: inherit;
+      resize: none;
+      max-height: 80px;
+      line-height: 1.4;
+      min-height: 36px;
+    }
+
+    .cg-quick-chat-input:focus {
+      outline: none;
+      border-color: hsl(0, 0%, 43.1%);
+    }
+
+    .cg-quick-chat-input::placeholder {
+      color: hsl(0, 0%, 63.9%);
+    }
+
+    .cg-quick-chat-send-btn {
+      background: hsl(0, 0%, 43.1%);
+      border: none;
+      border-radius: 8px;
+      width: 36px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      color: hsl(0, 0%, 98%);
+      font-size: 16px;
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+
+    .cg-quick-chat-send-btn:hover:not(:disabled) {
+      background: hsl(0, 0%, 50%);
+    }
+
+    .cg-quick-chat-send-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Results container */
+    .cg-results {
+      color: hsl(0, 0%, 98%); /* matches frontend foreground */
+    }
+
+    /* Error message styling */
+    .cg-error {
+      padding: 12px;
+      background: hsl(0, 62.8%, 20%); /* darker destructive color for background */
+      border: 1px solid hsl(0, 62.8%, 30.6%); /* matches frontend destructive */
+      border-radius: 6px;
+      margin-bottom: 12px;
+    }
+
+    .cg-error-title {
+      font-weight: 600;
+      font-size: 14px;
+      color: hsl(0, 62.8%, 60%); /* lighter destructive for text */
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .cg-error-title::before {
+      content: '⚠';
+      font-size: 16px;
+    }
+
+    .cg-error-message {
+      font-size: 13px;
+      color: hsl(0, 0%, 80%); /* slightly lighter than foreground */
+      line-height: 1.5;
+      margin: 0;
+    }
+
+    /* Info message styling */
+    .cg-info {
+      padding: 12px;
+      background: hsl(0, 0%, 18%); /* matches frontend muted */
+      border: 1px solid hsl(0, 0%, 25%);
+      border-radius: 6px;
+      margin-bottom: 12px;
+    }
+
+    .cg-info-title {
+      font-weight: 600;
+      font-size: 14px;
+      color: hsl(0, 0%, 43.1%); /* matches frontend primary */
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .cg-info-title::before {
+      content: 'ℹ';
+      font-size: 16px;
+    }
+
+    .cg-info-message {
+      font-size: 13px;
+      color: hsl(0, 0%, 80%);
+      line-height: 1.5;
+      margin: 0;
     }
   `;
 }
@@ -2052,6 +2984,1024 @@ function escapeHtml(text) {
     "'": '&#039;'
   };
   return text.replace(/[&<>"']/g, m => map[m]);
+}
+
+// ============================================================================
+// CHATBOT PANEL: Expandable right-side chat interface
+// ============================================================================
+
+/**
+ * Toggles the chatbot panel - expands overlay height to show chat
+ */
+function toggleChatbotPanel() {
+  chatbotExpanded = !chatbotExpanded;
+  
+  if (!currentOverlay) {
+    createPersistentOverlay();
+  }
+  
+  if (chatbotExpanded) {
+    expandChatbotPanel();
+  } else {
+    collapseChatbotPanel();
+  }
+  
+  // Save state to storage
+  chrome.storage.local.set({ chatbotExpanded, chatbotPanelWidth });
+}
+
+/**
+ * Creates the chat popup window element
+ */
+function createChatPopup() {
+  const popup = document.createElement('div');
+  popup.id = 'cg-chat-popup';
+  popup.className = 'cg-chat-popup';
+  
+  const recentContextHTML = recentCaptures.length > 0
+    ? `
+      <div class="cg-chat-context-section">
+        <div class="cg-chat-context-title">Recent Context</div>
+        <div class="cg-chat-context-list">
+          ${recentCaptures.slice(0, 5).map((capture, idx) => `
+            <div class="cg-chat-context-item" data-capture-idx="${idx}">
+              <div class="cg-chat-context-text">${escapeHtml(capture.text.substring(0, 100))}${capture.text.length > 100 ? '...' : ''}</div>
+              <div class="cg-chat-context-time">${new Date(capture.timestamp).toLocaleTimeString()}</div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `
+    : '';
+  
+  popup.innerHTML = `
+    <div class="cg-chat-popup-header">
+      <span class="cg-chat-popup-title">Chat</span>
+      <button class="cg-chat-popup-close" id="cg-chat-popup-close" aria-label="Close chat">×</button>
+    </div>
+    ${recentContextHTML}
+    <div class="cg-chat-messages" id="cg-chat-messages">
+      <div class="cg-chat-empty">Start a conversation! Ask questions about the content you're viewing.</div>
+    </div>
+    <div class="cg-chat-input-container">
+      <textarea 
+        id="cg-chat-input" 
+        class="cg-chat-input" 
+        placeholder="Ask a question about the content..."
+        rows="2"
+      ></textarea>
+      <button id="cg-chat-send" class="cg-chat-send-btn">➤</button>
+    </div>
+  `;
+  
+  // Add close button handler
+  const closeBtn = popup.querySelector('#cg-chat-popup-close');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      chatbotExpanded = false;
+      popup.style.display = 'none';
+      chrome.storage.local.set({ chatbotExpanded });
+    });
+  }
+  
+  // Add styles if not already added
+  if (!document.getElementById('cg-chat-popup-styles')) {
+    const style = document.createElement('style');
+    style.id = 'cg-chat-popup-styles';
+    style.textContent = `
+      .cg-chat-popup {
+        position: fixed;
+        bottom: 100px;
+        right: 20px;
+        width: 400px;
+        max-height: 600px;
+        background: hsl(0, 0%, 12.5%);
+        border: 1px solid hsl(0, 0%, 18%);
+        border-radius: 12px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+        z-index: 2147483646;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        animation: slideUp 0.3s ease;
+      }
+      
+      @keyframes slideUp {
+        from {
+          opacity: 0;
+          transform: translateY(20px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+      
+      .cg-chat-popup-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 16px;
+        border-bottom: 1px solid hsl(0, 0%, 18%);
+        background: hsl(0, 0%, 14.9%);
+      }
+      
+      .cg-chat-popup-title {
+        font-weight: 600;
+        font-size: 14px;
+        color: hsl(0, 0%, 98%);
+      }
+      
+      .cg-chat-popup-close {
+        background: none;
+        border: none;
+        color: hsl(0, 0%, 63.9%);
+        font-size: 24px;
+        cursor: pointer;
+        padding: 0;
+        width: 24px;
+        height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 4px;
+        transition: all 0.2s;
+        line-height: 1;
+      }
+      
+      .cg-chat-popup-close:hover {
+        background: hsl(0, 0%, 18%);
+        color: hsl(0, 0%, 98%);
+      }
+      
+      .cg-chat-popup .cg-chat-messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 16px;
+        min-height: 200px;
+        max-height: 400px;
+      }
+      
+      .cg-chat-popup .cg-chat-input-container {
+        border-top: 1px solid hsl(0, 0%, 18%);
+        padding: 12px;
+        background: hsl(0, 0%, 12.5%);
+      }
+    `;
+    document.head.appendChild(style);
+  }
+  
+  return popup;
+}
+
+/**
+ * Expands the overlay height to show chatbot interface (keeps width at 380px)
+ */
+function expandChatbotPanel() {
+  if (!currentOverlay) return;
+  
+  currentOverlay.classList.add('cg-chatbot-expanded');
+  // Keep width at 380px, expand height
+  currentOverlay.style.width = '380px';
+  currentOverlay.style.maxHeight = '90vh';
+  currentOverlay.style.height = 'auto';
+  // Keep position
+  currentOverlay.style.top = '16px';
+  currentOverlay.style.right = '16px';
+  currentOverlay.style.bottom = 'auto';
+  
+  // Hide quick chat container when expanded (it's replaced by chatbot panel's input)
+  hideQuickChatInput();
+  
+  // Replace body content with chatbot interface
+  const body = currentOverlay.querySelector('#cg-body');
+  if (body) {
+    body.innerHTML = getChatbotPanelHTML();
+    initializeChatbotPanel();
+  }
+  
+  // Load chat history
+  loadChatHistory();
+}
+
+/**
+ * Collapses the chatbot panel back to compact overlay
+ */
+function collapseChatbotPanel() {
+  if (!currentOverlay) return;
+  
+  currentOverlay.classList.remove('cg-chatbot-expanded');
+  currentOverlay.style.width = '380px';
+  currentOverlay.style.top = '16px';
+  currentOverlay.style.bottom = 'auto';
+  currentOverlay.style.right = '16px';
+  currentOverlay.style.maxHeight = '80vh';
+  currentOverlay.style.height = 'auto';
+  
+  // Reset minimize button state
+  const minimizeBtn = currentOverlay.querySelector('.cg-minimize-btn');
+  if (minimizeBtn) {
+    isMinimized = false;
+    minimizeBtn.innerHTML = '&#8212;';
+    minimizeBtn.setAttribute('title', 'Minimize panel');
+  }
+  
+  // Restore original content
+  const body = currentOverlay.querySelector('#cg-body');
+  if (body) {
+    body.style.display = 'block';
+    body.innerHTML = `<div class="cg-section"><p class="cg-hint">Hover over content for ${DWELL_TIME_MS / 1000}s to search.<br><em>Ctrl+Shift+G to toggle, or click &#9654;</em></p></div>`;
+  }
+  
+  // Hide quick chat container when collapsed (unless there are recent captures)
+  // Quick chat will show again when next inquiry is triggered
+  hideQuickChatInput();
+}
+
+/**
+ * Gets the HTML for the chatbot panel interface
+ */
+function getChatbotPanelHTML() {
+  const recentContextHTML = recentCaptures.length > 0
+    ? `
+      <div class="cg-chat-context-section">
+        <div class="cg-chat-context-title">Recent Context</div>
+        <div class="cg-chat-context-list">
+          ${recentCaptures.slice(0, 5).map((capture, idx) => `
+            <div class="cg-chat-context-item" data-capture-idx="${idx}">
+              <div class="cg-chat-context-text">${escapeHtml(capture.text.substring(0, 100))}${capture.text.length > 100 ? '...' : ''}</div>
+              <div class="cg-chat-context-time">${new Date(capture.timestamp).toLocaleTimeString()}</div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `
+    : '';
+  
+  return `
+    ${recentContextHTML}
+    <div class="cg-chat-messages" id="cg-chat-messages">
+      ${chatMessages.length === 0 
+        ? '<div class="cg-chat-empty">Start a conversation! Ask questions about the content you\'re viewing.</div>'
+        : chatMessages.map(msg => getChatMessageHTML(msg)).join('')
+      }
+    </div>
+    <div class="cg-chat-input-container">
+      <textarea 
+        id="cg-chat-input" 
+        class="cg-chat-input" 
+        placeholder="Ask a question about the content..."
+        rows="2"
+      ></textarea>
+      <button id="cg-chat-send" class="cg-chat-send-btn" ${isSendingMessage ? 'disabled' : ''}>
+        ${isSendingMessage ? '⏳' : '➤'}
+      </button>
+    </div>
+  `;
+}
+
+/**
+ * Gets HTML for a single chat message
+ */
+function getChatMessageHTML(message) {
+  const isUser = message.role === 'user';
+  const timestamp = new Date(message.timestamp).toLocaleTimeString();
+  
+  return `
+    <div class="cg-chat-message ${isUser ? 'cg-chat-message-user' : 'cg-chat-message-assistant'}">
+      <div class="cg-chat-message-content">${formatMarkdown(message.content)}</div>
+      <div class="cg-chat-message-time">${timestamp}</div>
+    </div>
+  `;
+}
+
+/**
+ * Simple markdown formatting (basic support)
+ */
+function formatMarkdown(text) {
+  // Escape HTML first
+  let html = escapeHtml(text);
+  
+  // Bold: **text**
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  
+  // Italic: *text*
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  
+  // Code: `code`
+  html = html.replace(/`(.+?)`/g, '<code>$1</code>');
+  
+  // Line breaks
+  html = html.replace(/\n/g, '<br>');
+  
+  return html;
+}
+
+/**
+ * Initializes the chatbot panel event handlers
+ */
+function initializeChatbotPanel() {
+  const sendBtn = document.getElementById('cg-chat-send');
+  const input = document.getElementById('cg-chat-input');
+  const messagesContainer = document.getElementById('cg-chat-messages');
+  
+  // Send message on button click
+  if (sendBtn) {
+    // Remove old listeners by cloning and replacing
+    const newSendBtn = sendBtn.cloneNode(true);
+    sendBtn.parentNode.replaceChild(newSendBtn, sendBtn);
+    newSendBtn.addEventListener('click', () => sendChatMessage());
+  }
+  
+  // Send message on Enter (Shift+Enter for new line)
+  if (input) {
+    // Remove old listeners by cloning and replacing
+    const newInput = input.cloneNode(true);
+    input.parentNode.replaceChild(newInput, input);
+    newInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+  }
+  
+  // Context item click handlers
+  const contextItems = document.querySelectorAll('.cg-chat-context-item');
+  contextItems.forEach(item => {
+    item.addEventListener('click', () => {
+      const idx = parseInt(item.dataset.captureIdx);
+      if (idx >= 0 && idx < recentCaptures.length && input) {
+        const capture = recentCaptures[idx];
+        const chatInput = document.getElementById('cg-chat-input');
+        if (chatInput) {
+          chatInput.value = `Tell me more about: "${capture.text.substring(0, 50)}..."`;
+          chatInput.focus();
+        }
+      }
+    });
+  });
+  
+  // Scroll to bottom
+  if (messagesContainer) {
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  }
+}
+
+/**
+ * Sends a chat message to the backend (from expanded chatbot panel)
+ */
+async function sendChatMessage() {
+  const input = document.getElementById('cg-chat-input');
+  if (!input || isSendingMessage) return;
+  
+  const messageText = input.value.trim();
+  if (!messageText) return;
+  
+  await sendChatMessageFromText(messageText);
+}
+
+/**
+ * Updates the chat messages display
+ */
+function updateChatMessages() {
+  const messagesContainer = document.getElementById('cg-chat-messages');
+  if (!messagesContainer) return;
+  
+  if (chatMessages.length === 0) {
+    messagesContainer.innerHTML = '<div class="cg-chat-empty">Start a conversation! Ask questions about the content you\'re viewing.</div>';
+  } else {
+    messagesContainer.innerHTML = chatMessages.map(msg => getChatMessageHTML(msg)).join('');
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  }
+}
+
+/**
+ * Loads chat history from backend
+ */
+function loadChatHistory() {
+  chrome.runtime.sendMessage({ type: 'GET_SESSION_ID' }, (response) => {
+    const sessionId = response?.sessionId;
+    if (!sessionId) return;
+    
+    chrome.runtime.sendMessage({
+      type: 'GET_CHAT_HISTORY',
+      data: { limit: 50 }
+    }, (response) => {
+      if (response?.success && response?.history?.messages) {
+        chatMessages = response.history.messages;
+        updateChatMessages();
+      }
+    });
+  });
+}
+
+/**
+ * Records a context capture for chatbot context
+ */
+function recordContextCapture(text, location) {
+  recentCaptures.push({
+    text: text.substring(0, 500), // Limit length
+    timestamp: new Date().toISOString(),
+    location: location
+  });
+  
+  // Keep only last 5 captures
+  if (recentCaptures.length > 5) {
+    recentCaptures.shift();
+  }
+  
+  // Show quick chat input when inquiry is triggered
+  showQuickChatInput();
+  
+  // Update context section if chatbot is expanded
+  if (chatbotExpanded && currentOverlay) {
+    const contextSection = currentOverlay.querySelector('.cg-chat-context-section');
+    if (contextSection) {
+      const body = currentOverlay.querySelector('#cg-body');
+      if (body) {
+        body.innerHTML = getChatbotPanelHTML();
+        initializeChatbotPanel();
+      }
+    }
+  }
+}
+
+/**
+ * Shows the quick chat input bar at the bottom
+ */
+function showQuickChatInput() {
+  if (!currentOverlay) return;
+  const quickChatContainer = currentOverlay.querySelector('#cg-quick-chat-container');
+  const overlayContent = currentOverlay.querySelector('.cg-overlay-content');
+  if (quickChatContainer) {
+    quickChatContainer.style.display = 'block';
+  }
+  if (overlayContent) {
+    overlayContent.style.paddingBottom = '80px';
+  }
+}
+
+/**
+ * Hides the quick chat input bar
+ */
+function hideQuickChatInput() {
+  if (!currentOverlay) return;
+  const quickChatContainer = currentOverlay.querySelector('#cg-quick-chat-container');
+  const overlayContent = currentOverlay.querySelector('.cg-overlay-content');
+  if (quickChatContainer) {
+    quickChatContainer.style.display = 'none';
+  }
+  if (overlayContent) {
+    overlayContent.style.paddingBottom = '16px';
+  }
+}
+
+/**
+ * Sends a message from the quick chat input
+ */
+async function sendQuickChatMessage() {
+  const input = document.getElementById('cg-quick-chat-input');
+  const sendBtn = document.getElementById('cg-quick-chat-send');
+  
+  if (!input || !sendBtn || isSendingMessage) return;
+  
+  const messageText = input.value.trim();
+  if (!messageText) return;
+  
+  // Expand chatbot panel and send message
+  if (!chatbotExpanded) {
+    chatbotExpanded = true;
+    expandChatbotPanel();
+    // Wait a bit for panel to expand before sending
+    setTimeout(() => {
+      sendChatMessageFromText(messageText);
+    }, 100);
+  } else {
+    // Already expanded, just send the message
+    await sendChatMessageFromText(messageText);
+  }
+  
+  // Clear input
+  input.value = '';
+}
+
+/**
+ * Sends a chat message from text (used by both quick chat and expanded panel)
+ */
+async function sendChatMessageFromText(messageText) {
+  const input = chatbotExpanded 
+    ? document.getElementById('cg-chat-input')
+    : document.getElementById('cg-quick-chat-input');
+  const sendBtn = chatbotExpanded
+    ? document.getElementById('cg-chat-send')
+    : document.getElementById('cg-quick-chat-send');
+  const messagesContainer = chatbotExpanded
+    ? document.getElementById('cg-chat-messages')
+    : null;
+  
+  if (isSendingMessage) return;
+  
+  // Add user message to UI immediately
+  const userMessage = {
+    role: 'user',
+    content: messageText,
+    timestamp: new Date().toISOString()
+  };
+  chatMessages.push(userMessage);
+  
+  // Make sure chat popup is shown
+  if (!chatbotExpanded) {
+    toggleChatPopup();
+    // Wait for popup to be created before updating messages
+    setTimeout(() => {
+      updateChatMessages();
+    }, 150);
+  } else {
+    updateChatMessages();
+  }
+  
+  if (input) input.value = '';
+  isSendingMessage = true;
+  if (sendBtn) {
+    sendBtn.disabled = true;
+    sendBtn.textContent = '⏳';
+  }
+  
+  // Get session ID and context
+  chrome.runtime.sendMessage({ type: 'GET_SESSION_ID' }, async (response) => {
+    const sessionId = response?.sessionId || null;
+    
+    const context = {
+      url: window.location.href,
+      documentTitle: document.title,
+      recentCaptures: recentCaptures.slice(0, 5).map(c => ({
+        text: c.text,
+        timestamp: c.timestamp,
+        location: c.location
+      })),
+      selectedText: window.getSelection().toString().trim() || undefined
+    };
+    
+    // Send message to backend
+    chrome.runtime.sendMessage({
+      type: 'SEND_CHAT_MESSAGE',
+      data: {
+        message: messageText,
+        context: context
+      }
+    }, (response) => {
+      isSendingMessage = false;
+      if (sendBtn) {
+        sendBtn.disabled = false;
+        sendBtn.textContent = '➤';
+      }
+      
+      if (response?.success && response?.response) {
+        // Add assistant response
+        const assistantMessage = {
+          role: 'assistant',
+          content: response.response.response || response.response,
+          timestamp: response.response.timestamp || new Date().toISOString()
+        };
+        chatMessages.push(assistantMessage);
+        updateChatMessages();
+      } else {
+        // Show error
+        const errorMessage = {
+          role: 'assistant',
+          content: 'Sorry, I couldn\'t process your message. Please try again.',
+          timestamp: new Date().toISOString()
+        };
+        chatMessages.push(errorMessage);
+        updateChatMessages();
+      }
+    });
+  });
+}
+
+/**
+ * Loads user info from storage and displays Google account
+ */
+function loadUserInfo() {
+  chrome.storage.local.get(['user', 'auth_token'], (result) => {
+    if (result.user && currentOverlay) {
+      const userInfo = currentOverlay.querySelector('#cg-user-info');
+      const userAvatar = currentOverlay.querySelector('#cg-user-avatar');
+      const userName = currentOverlay.querySelector('#cg-user-name');
+      
+      if (userInfo && userAvatar && userName) {
+        userInfo.style.display = 'flex';
+        if (result.user.picture) {
+          userAvatar.src = result.user.picture;
+        }
+        userName.textContent = result.user.name || result.user.email || 'User';
+        userAvatar.title = result.user.email || '';
+      }
+    }
+  });
+}
+
+/**
+ * Opens personal dashboard
+ */
+function openPersonalDashboard() {
+  chrome.storage.local.get(['api_base_url'], (result) => {
+    const apiBase = result.api_base_url || 'http://localhost:8000';
+    const dashboardUrl = `${apiBase.replace('/api', '')}/personal`;
+    chrome.tabs.create({ url: dashboardUrl });
+  });
+}
+
+/**
+ * Closes the current session, creates notebook entry, and disables extension
+ */
+async function closeSessionAndSave() {
+  chrome.runtime.sendMessage({ type: 'GET_SESSION_ID' }, async (response) => {
+    const sessionId = response?.sessionId;
+    if (!sessionId) {
+      alert('No active session to close.');
+      return;
+    }
+    
+    // Show loading state
+    setOverlayStatus('Closing session...');
+    const closeBtn = currentOverlay?.querySelector('#cg-close-session-btn');
+    if (closeBtn) {
+      closeBtn.disabled = true;
+      closeBtn.querySelector('.cg-btn-text').textContent = 'Closing...';
+    }
+    
+    // Fetch session start time from backend if available
+    chrome.runtime.sendMessage({
+      type: 'GET_SESSION_INFO',
+      data: { sessionId: sessionId }
+    }, (sessionInfoResponse) => {
+      const startTime = sessionInfoResponse?.startTime || new Date(Date.now() - 3600000).toISOString(); // Default to 1 hour ago if not available
+      
+      // Collect all session data for notebook
+      const sessionData = {
+        sessionId: sessionId,
+        url: window.location.href,
+        documentTitle: document.title,
+        startTime: startTime,
+        endTime: new Date().toISOString(),
+        chatMessages: chatMessages,
+        contextCaptures: recentCaptures,
+        confusionTriggers: [], // Will be fetched from backend if needed
+        analysisResults: [] // Will be collected if available
+      };
+      
+      // Create notebook entry with all session data
+      const notebookContent = generateSessionNotebookContent(sessionData);
+      
+      chrome.runtime.sendMessage({
+        type: 'CREATE_NOTEBOOK_ENTRY',
+        data: {
+          sessionId: sessionId,
+          title: `Session: ${document.title || 'Untitled'} - ${new Date().toLocaleDateString()}`,
+          content: notebookContent,
+          context: {
+            url: window.location.href,
+            sessionData: sessionData
+          }
+        }
+      }, async (notebookResponse) => {
+        if (notebookResponse?.success) {
+          // Stop the session on backend
+          chrome.runtime.sendMessage({
+            type: 'STOP_SESSION',
+            data: { sessionId: sessionId }
+          }, (stopResponse) => {
+            // Disable extension completely
+            extensionEnabled = false;
+            
+            // Hide overlay
+            if (currentOverlay) {
+              currentOverlay.style.display = 'none';
+            }
+            
+            // Clear session data
+            chrome.storage.local.remove(['currentSessionId']);
+            chatMessages = [];
+            recentCaptures = [];
+            
+            // Update toggle button to show paused state
+            updateToggleButton();
+            
+            // Notify background about state change
+            chrome.runtime.sendMessage({ 
+              type: 'EXTENSION_STATE_CHANGED', 
+              enabled: false 
+            }).catch(() => {}); // Ignore if background not ready
+            
+            // Update UI
+            setOverlayStatus('Session closed');
+            if (closeBtn) {
+              closeBtn.disabled = false;
+              closeBtn.querySelector('.cg-btn-text').textContent = 'Close Session';
+            }
+            
+            // Show success message (if overlay is shown again)
+            updateOverlayContent(`
+              <div class="cg-section">
+                <p style="color: hsl(0, 0%, 43.1%); font-weight: 600;">Session Closed</p>
+                <p>Your session has been saved to your notebook.</p>
+                <p class="cg-hint">Click the play button to start a new session.</p>
+              </div>
+            `);
+          });
+        } else {
+          alert('Failed to save session to notebook: ' + (notebookResponse?.error || 'Unknown error'));
+          if (closeBtn) {
+            closeBtn.disabled = false;
+            closeBtn.querySelector('.cg-btn-text').textContent = 'Close Session';
+          }
+          setOverlayStatus('Error saving session');
+        }
+      });
+    });
+    
+    // Create notebook entry with all session data
+    // NOTE: User will specify exact content in next prompt
+    const notebookContent = generateSessionNotebookContent(sessionData);
+    
+    chrome.runtime.sendMessage({
+      type: 'CREATE_NOTEBOOK_ENTRY',
+      data: {
+        sessionId: sessionId,
+        title: `Session: ${document.title || 'Untitled'} - ${new Date().toLocaleDateString()}`,
+        content: notebookContent,
+        context: {
+          url: window.location.href,
+          sessionData: sessionData
+        }
+      }
+    }, async (notebookResponse) => {
+      if (notebookResponse?.success) {
+        // Stop the session on backend
+        chrome.runtime.sendMessage({
+          type: 'STOP_SESSION',
+          data: { sessionId: sessionId }
+        }, (stopResponse) => {
+          // Disable extension completely
+          extensionEnabled = false;
+          
+          // Hide overlay
+          if (currentOverlay) {
+            currentOverlay.style.display = 'none';
+          }
+          
+          // Clear session data
+          chrome.storage.local.remove(['currentSessionId']);
+          chatMessages = [];
+          recentCaptures = [];
+          
+          // Update toggle button to show paused state
+          updateToggleButton();
+          
+          // Notify background about state change
+          chrome.runtime.sendMessage({ 
+            type: 'EXTENSION_STATE_CHANGED', 
+            enabled: false 
+          }).catch(() => {}); // Ignore if background not ready
+          
+          // Update UI
+          setOverlayStatus('Session closed');
+          if (closeBtn) {
+            closeBtn.disabled = false;
+            closeBtn.querySelector('.cg-btn-text').textContent = 'Close Session';
+          }
+          
+          // Show success message
+          updateOverlayContent(`
+            <div class="cg-section">
+              <p style="color: hsl(0, 0%, 43.1%); font-weight: 600;">Session Closed</p>
+              <p>Your session has been saved to your notebook.</p>
+              <p class="cg-hint">Click the play button to start a new session.</p>
+            </div>
+          `);
+        });
+      } else {
+        alert('Failed to save session to notebook: ' + (notebookResponse?.error || 'Unknown error'));
+        if (closeBtn) {
+          closeBtn.disabled = false;
+          closeBtn.querySelector('.cg-btn-text').textContent = 'Close Session';
+        }
+        setOverlayStatus('Error saving session');
+      }
+    });
+  });
+}
+
+/**
+ * Generates notebook content from session data
+ * Format matches the structured inquiry-response format shown in the UI
+ */
+function generateSessionNotebookContent(sessionData) {
+  const sessionDate = new Date(sessionData.endTime);
+  const formattedDate = sessionDate.toLocaleDateString('en-US', { 
+    month: 'short', 
+    day: 'numeric', 
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  });
+  
+  let content = `# ${sessionData.documentTitle || 'Learning Session'}\n\n`;
+  content += `**Session Date:** ${formattedDate}\n`;
+  content += `**Source URL:** ${sessionData.url}\n\n`;
+  content += `---\n\n`;
+  
+  // Process chat messages as inquiry-response pairs
+  if (sessionData.chatMessages && sessionData.chatMessages.length > 0) {
+    // Group messages into inquiry-response pairs
+    for (let i = 0; i < sessionData.chatMessages.length; i += 2) {
+      const userMessage = sessionData.chatMessages[i];
+      const assistantMessage = sessionData.chatMessages[i + 1];
+      
+      if (userMessage && userMessage.role === 'user') {
+        const inquiryTime = new Date(userMessage.timestamp).toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true
+        });
+        
+        content += `## Inquiry ${Math.floor(i / 2) + 1}\n\n`;
+        content += `**${inquiryTime}**\n\n`;
+        content += `### Question\n\n`;
+        content += `${userMessage.content}\n\n`;
+        
+        // Add context/documentation references if available
+        if (sessionData.contextCaptures && sessionData.contextCaptures.length > 0) {
+          const relevantCapture = sessionData.contextCaptures.find(
+            c => new Date(c.timestamp) <= new Date(userMessage.timestamp)
+          ) || sessionData.contextCaptures[sessionData.contextCaptures.length - 1];
+          
+          if (relevantCapture) {
+            content += `### Information Retrieval\n\n`;
+            content += `**Context Source:** ${sessionData.documentTitle || 'Current Page'}\n`;
+            content += `*Reading relevant content from the page.*\n\n`;
+            content += `> ${relevantCapture.text.substring(0, 300)}${relevantCapture.text.length > 300 ? '...' : ''}\n\n`;
+          }
+        }
+        
+        // Process assistant response
+        if (assistantMessage && assistantMessage.role === 'assistant') {
+          const responseContent = assistantMessage.content;
+          
+          // Extract structured information from response
+          const structuredResponse = parseStructuredResponse(responseContent);
+          
+          content += `### Agent Action\n\n`;
+          content += `${structuredResponse.agentAction || 'Analyzed the inquiry and provided relevant information.'}\n\n`;
+          
+          content += `### Response\n\n`;
+          content += `${structuredResponse.intro || 'Found relevant information:'}\n\n`;
+          
+          // Key Concepts
+          if (structuredResponse.keyConcepts && structuredResponse.keyConcepts.length > 0) {
+            content += `#### Key Concepts\n\n`;
+            structuredResponse.keyConcepts.forEach(concept => {
+              content += `- ${concept}\n`;
+            });
+            content += `\n`;
+          }
+          
+          // Recommendations
+          if (structuredResponse.recommendations && structuredResponse.recommendations.length > 0) {
+            content += `#### Recommendations\n\n`;
+            structuredResponse.recommendations.forEach(rec => {
+              content += `- ${rec}\n`;
+            });
+            content += `\n`;
+          }
+          
+          // Links
+          if (structuredResponse.links && structuredResponse.links.length > 0) {
+            content += `#### Links for Further Inquiry\n\n`;
+            structuredResponse.links.forEach(link => {
+              content += `- **[${link.title}](${link.url})**\n`;
+              if (link.description) {
+                content += `  ${link.description}\n`;
+              }
+            });
+            content += `\n`;
+          }
+          
+          // If no structured data found, include full response
+          if (!structuredResponse.keyConcepts && !structuredResponse.recommendations && !structuredResponse.links) {
+            content += `${responseContent}\n\n`;
+          }
+        }
+        
+        content += `---\n\n`;
+      }
+    }
+  }
+  
+  // Add session summary if there were context captures
+  if (sessionData.contextCaptures && sessionData.contextCaptures.length > 0) {
+    content += `## Session Summary\n\n`;
+    content += `**Total Context Captures:** ${sessionData.contextCaptures.length}\n`;
+    content += `**Total Inquiries:** ${Math.floor((sessionData.chatMessages?.length || 0) / 2)}\n`;
+    content += `**Session Duration:** ${calculateSessionDuration(sessionData)}\n\n`;
+  }
+  
+  return content;
+}
+
+/**
+ * Parses assistant response to extract structured information
+ * Looks for key concepts, recommendations, and links
+ */
+function parseStructuredResponse(responseText) {
+  const result = {
+    agentAction: null,
+    intro: null,
+    keyConcepts: [],
+    recommendations: [],
+    links: []
+  };
+  
+  // Try to extract key concepts (lines starting with bullet points or dashes)
+  const conceptPattern = /(?:key concepts?|concepts?)[:\-]?\s*\n([\s\S]*?)(?:\n\n|\n(?:recommendations?|links?|$))/i;
+  const conceptMatch = responseText.match(conceptPattern);
+  if (conceptMatch) {
+    const conceptLines = conceptMatch[1].split('\n')
+      .map(line => line.replace(/^[\s\-*•]\s*/, '').trim())
+      .filter(line => line.length > 0);
+    result.keyConcepts = conceptLines;
+  }
+  
+  // Try to extract recommendations
+  const recPattern = /(?:recommendations?|suggestions?)[:\-]?\s*\n([\s\S]*?)(?:\n\n|\n(?:links?|$))/i;
+  const recMatch = responseText.match(recPattern);
+  if (recMatch) {
+    const recLines = recMatch[1].split('\n')
+      .map(line => line.replace(/^[\s\-*•]\s*/, '').trim())
+      .filter(line => line.length > 0);
+    result.recommendations = recLines;
+  }
+  
+  // Extract links (markdown format or URLs)
+  const linkPattern = /\[([^\]]+)\]\(([^)]+)\)/g;
+  let linkMatch;
+  while ((linkMatch = linkPattern.exec(responseText)) !== null) {
+    result.links.push({
+      title: linkMatch[1],
+      url: linkMatch[2],
+      description: null
+    });
+  }
+  
+  // Extract URLs directly
+  const urlPattern = /https?:\/\/[^\s\)]+/g;
+  let urlMatch;
+  while ((urlMatch = urlPattern.exec(responseText)) !== null) {
+    const url = urlMatch[0];
+    // Check if already added as markdown link
+    if (!result.links.some(l => l.url === url)) {
+      result.links.push({
+        title: url,
+        url: url,
+        description: null
+      });
+    }
+  }
+  
+  // Extract intro text (first paragraph before structured sections)
+  const introMatch = responseText.match(/^([^#\n]+(?:\n[^#\n]+)*)/);
+  if (introMatch) {
+    result.intro = introMatch[1].trim();
+  }
+  
+  return result;
+}
+
+/**
+ * Calculates session duration
+ */
+function calculateSessionDuration(sessionData) {
+  if (!sessionData.startTime || !sessionData.endTime) {
+    return 'Unknown';
+  }
+  
+  const start = new Date(sessionData.startTime);
+  const end = new Date(sessionData.endTime);
+  const diffMs = end - start;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMins / 60);
+  const mins = diffMins % 60;
+  
+  if (diffHours > 0) {
+    return `${diffHours}h ${mins}m`;
+  }
+  return `${diffMins}m`;
 }
 
 // ============================================================================
@@ -2091,7 +4041,7 @@ function toggleExtension() {
 }
 
 /**
- * Shows the overlay if it was minimized.
+ * Shows the overlay if it doesn't exist.
  * Creates the overlay if it doesn't exist.
  */
 function showOverlayIfHidden() {
@@ -2100,13 +4050,8 @@ function showOverlayIfHidden() {
   }
   if (!currentOverlay) return; // Still failed to create
   
-  const body = currentOverlay.querySelector('#cg-body');
-  const minimizeBtn = currentOverlay.querySelector('.cg-minimize-btn');
-  if (body && body.style.display === 'none') {
-    body.style.display = 'block';
-    if (minimizeBtn) minimizeBtn.innerHTML = '&#8212;';
-    overlayVisible = true;
-  }
+  // Ensure overlay is visible (no longer hiding content, just resizing)
+  overlayVisible = true;
 }
 
 /**
@@ -2405,8 +4350,10 @@ async function sendImageToBackend(imageDataUrl) {
   } catch (err) {
     if (err.name === 'AbortError') {
       console.warn('[ContextGrabber] Backend image analysis timed out');
+    } else if (err.message && err.message.includes('Failed to fetch')) {
+      console.warn('[ContextGrabber] Backend image analysis failed: Failed to fetch - backend may be offline or CORS issue');
     } else {
-      console.warn('[ContextGrabber] Backend image analysis failed:', err.message);
+      console.warn('[ContextGrabber] Backend image analysis failed:', err.message || err.toString());
     }
     return null;
   }
@@ -2453,6 +4400,21 @@ async function triggerSearchFromPoint(x, y) {
   console.log('[ContextGrabber] Dwell triggered at', x, y, '— text length:', text.length);
   setOverlayStatus('Capturing...');
   updateOverlayContent('<p class="cg-loading">Capturing area and searching...</p>');
+  
+  // Record context capture for chatbot
+  if (text && text.trim().length > 10) {
+    recordContextCapture(text, { x, y });
+    
+    // Also record as confusion trigger
+    chrome.runtime.sendMessage({
+      type: 'RECORD_TRIGGER',
+      data: {
+        triggerType: 'hover',
+        location: { x, y },
+        text: text.substring(0, 500)
+      }
+    }).catch(() => {}); // Ignore errors
+  }
 
   // --- SCREENSHOT API PRIORITY MODE ---
   if (SCREENSHOT_PRIORITY === 'api-only' || SCREENSHOT_PRIORITY === 'api-first') {
@@ -2463,6 +4425,23 @@ async function triggerSearchFromPoint(x, y) {
     } catch (err) {
       console.warn('[ContextGrabber] Snapshot capture failed:', err);
       lastSnapshotDataUrl = null;
+      
+      // Check if it's a permission error
+      const errorMsg = err.message || err.toString();
+      if (errorMsg.includes('activeTab') || errorMsg.includes('not been invoked') || 
+          errorMsg.includes('permission') || errorMsg.includes('Permission')) {
+        // Show warning but continue with text-based search
+        if (SCREENSHOT_PRIORITY === 'api-only') {
+          showErrorOverlay('Permission Required', 
+            'Please click the ThirdEye extension icon in your browser toolbar first to enable screenshot capture. ' +
+            'This grants the extension permission to capture screenshots.');
+          return; // Only return early in api-only mode
+        } else {
+          // In api-first mode, show info and continue with Google search
+          console.warn('[ContextGrabber] Screenshot permission not available, using text-based search');
+          // Don't show error overlay - just log and continue
+        }
+      }
     }
 
     // 2) Send to backend image analysis API
@@ -2471,6 +4450,15 @@ async function triggerSearchFromPoint(x, y) {
       console.log('[ContextGrabber] Sending snapshot to backend analysis...');
       setOverlayStatus('Analyzing screenshot...');
       backendResults = await sendImageToBackend(lastSnapshotDataUrl);
+      
+      // If backend failed, show helpful message (only for api-only mode)
+      if (!backendResults && SCREENSHOT_PRIORITY === 'api-only') {
+        const backendUrl = ANALYZE_API_URL || 'configured endpoint';
+        showErrorOverlay('Backend Unavailable', 
+          'The analysis backend is not responding. Please check if the backend server is running at ' + backendUrl + 
+          '. Falling back to text-based search.');
+        // Don't return - let it fall through to Google search
+      }
     }
 
     // 3) If backend returned results, display them
@@ -2486,19 +4474,23 @@ async function triggerSearchFromPoint(x, y) {
     // 4) If api-only mode and no results, show message and stop
     if (SCREENSHOT_PRIORITY === 'api-only') {
       if (!lastSnapshotDataUrl) {
-        updateOverlayContent('<p class="cg-hint">Screenshot capture failed.</p>');
+        showErrorOverlay('Capture Failed', 
+          'Unable to capture screenshot. Make sure you\'ve clicked the extension icon to grant permissions.');
+      } else if (!backendResults || backendResults.length === 0) {
+        showErrorOverlay('No Results', 
+          'The backend API did not return any results. Falling back to text-based search.');
+        // Fall through to Google search as fallback
       } else {
-        updateOverlayContent('<p class="cg-hint">No results from API. Screenshot sent.</p>');
+        setOverlayStatus('API complete');
+        // Still show the snapshot if captured
+        if (lastSnapshotDataUrl) {
+          showSearchResultsOverlay({
+            query: text.substring(0, 60) + '...',
+            results: backendResults || []
+          });
+        }
+        return;
       }
-      setOverlayStatus('API complete');
-      // Still show the snapshot if captured
-      if (lastSnapshotDataUrl) {
-        showSearchResultsOverlay({
-          query: text.substring(0, 60) + '...',
-          results: []
-        });
-      }
-      return;
     }
     // Otherwise fall through to Google search (api-first mode)
   }
@@ -2662,9 +4654,13 @@ async function captureAreaSnapshot(x, y) {
       },
       (response) => {
         if (chrome.runtime.lastError) {
-          return reject(chrome.runtime.lastError);
+          return reject(new Error(chrome.runtime.lastError.message));
         }
         if (!response || !response.dataUrl) {
+          // If there's an error message from background, include it
+          if (response && response.error) {
+            return reject(new Error(response.error));
+          }
           return resolve(null);
         }
 

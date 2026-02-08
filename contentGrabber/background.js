@@ -18,6 +18,12 @@
 // ============================================================================
 
 /**
+ * API Base URL - configurable, defaults to localhost
+ * Can be overridden via chrome.storage.local['api_base_url']
+ */
+const DEFAULT_API_BASE_URL = 'http://localhost:8000';
+
+/**
  * Analysis API endpoint
  * POST request with { url, text } body
  */
@@ -28,6 +34,74 @@ const REQUEST_TIMEOUT = 5000;
 
 /** Max words to use from extracted text as a Google search query */
 const MAX_SEARCH_QUERY_WORDS = 12;
+
+// ============================================================================
+// AUTHENTICATION HELPERS
+// ============================================================================
+
+/**
+ * Gets the authentication token from chrome.storage.local
+ * Token is synced from React app's localStorage
+ * @returns {Promise<string|null>} JWT token or null if not found
+ */
+async function getAuthToken() {
+  try {
+    const result = await chrome.storage.local.get(['auth_token']);
+    return result.auth_token || null;
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting auth token:', error);
+    return null;
+  }
+}
+
+/**
+ * Gets the API base URL from storage or uses default
+ * @returns {Promise<string>} API base URL
+ */
+async function getApiBaseUrl() {
+  try {
+    const result = await chrome.storage.local.get(['api_base_url']);
+    return result.api_base_url || DEFAULT_API_BASE_URL;
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting API base URL:', error);
+    return DEFAULT_API_BASE_URL;
+  }
+}
+
+/**
+ * Makes an authenticated API request
+ * @param {string} endpoint - API endpoint (relative to base URL)
+ * @param {Object} options - Fetch options
+ * @returns {Promise<Response>} Fetch response
+ */
+async function authenticatedFetch(endpoint, options = {}) {
+  const apiBase = await getApiBaseUrl();
+  const token = await getAuthToken();
+  
+  const url = endpoint.startsWith('http') ? endpoint : `${apiBase}${endpoint}`;
+  
+  const headers = {
+    'Content-Type': 'application/json',
+    ...options.headers
+  };
+  
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  
+  const response = await fetch(url, {
+    ...options,
+    headers
+  });
+  
+  // Handle 401 Unauthorized - token expired
+  if (response.status === 401) {
+    console.warn('[ContextGrabber] Authentication failed, token may be expired');
+    // Could trigger re-authentication flow here
+  }
+  
+  return response;
+}
 
 // ============================================================================
 // EXTENSION ICON CLICK → Toggle extension on/off
@@ -74,6 +148,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'EXTENSION_STATE_CHANGED') {
     if (sender.tab && sender.tab.id) {
       updateBadgeForTab(sender.tab.id, message.enabled);
+      
+      // Start or stop session based on enabled state
+      if (message.enabled && sender.tab.url) {
+        startSession({
+          url: sender.tab.url,
+          documentTitle: sender.tab.title || 'Unknown',
+          documentType: detectDocumentType(sender.tab.url)
+        }).then(session => {
+          if (session) {
+            console.log('[ContextGrabber] Session started:', session.sessionId);
+          }
+        });
+      } else {
+        getCurrentSessionId().then(sessionId => {
+          if (sessionId) {
+            stopSession(sessionId).then(result => {
+              if (result) {
+                console.log('[ContextGrabber] Session stopped:', result.sessionId);
+              }
+            });
+          }
+        });
+      }
     }
     sendResponse({ received: true });
   }
@@ -91,10 +188,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Capture visible tab screenshot and return it
   if (message.type === 'CAPTURE_AREA') {
     captureVisibleTab(sender.tab.id, message.data)
-      .then(dataUrl => sendResponse({ dataUrl }))
+      .then(dataUrl => sendResponse({ dataUrl, error: null }))
       .catch(err => {
         console.error('[ContextGrabber] Capture error:', err);
-        sendResponse({ dataUrl: null });
+        const errorMessage = err.message || err.toString() || 'Unknown error';
+        sendResponse({ dataUrl: null, error: errorMessage });
       });
     return true; // Keep sendResponse channel open for async
   }
@@ -104,7 +202,98 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     searchGoogleImagesAndRespond(message.data, sender.tab.id);
     sendResponse({ received: true });
   }
+
+  // Session management
+  if (message.type === 'START_SESSION') {
+    startSession(message.data)
+      .then(session => sendResponse({ success: !!session, session }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.type === 'STOP_SESSION') {
+    stopSession(message.data.sessionId)
+      .then(result => sendResponse({ success: !!result, result }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.type === 'GET_SESSION_ID') {
+    getCurrentSessionId()
+      .then(sessionId => sendResponse({ sessionId }))
+      .catch(err => sendResponse({ sessionId: null, error: err.message }));
+    return true;
+  }
+
+  // Confusion trigger recording
+  if (message.type === 'RECORD_TRIGGER') {
+    getCurrentSessionId()
+      .then(sessionId => {
+        if (sessionId) {
+          return recordConfusionTrigger(sessionId, message.data);
+        }
+        return false;
+      })
+      .then(success => sendResponse({ success }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // Notebook entry creation
+  if (message.type === 'CREATE_NOTEBOOK_ENTRY') {
+    createNotebookEntry(message.data)
+      .then(entry => sendResponse({ success: !!entry, entry }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // Chatbot messages
+  if (message.type === 'SEND_CHAT_MESSAGE') {
+    getCurrentSessionId()
+      .then(sessionId => {
+        return sendChatMessage({
+          message: message.data.message,
+          sessionId: sessionId,
+          context: message.data.context
+        });
+      })
+      .then(response => sendResponse({ success: !!response, response }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.type === 'GET_CHAT_HISTORY') {
+    getCurrentSessionId()
+      .then(sessionId => getChatHistory(sessionId, message.data?.limit))
+      .then(history => sendResponse({ success: !!history, history }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // Get session info (start time, etc.)
+  if (message.type === 'GET_SESSION_INFO') {
+    // For now, return basic info. Backend can provide more details later
+    sendResponse({ 
+      success: true, 
+      startTime: new Date(Date.now() - 3600000).toISOString() // Default to 1 hour ago
+    });
+    return true;
+  }
 });
+
+/**
+ * Detects document type from URL
+ * @param {string} url - Page URL
+ * @returns {string} Document type
+ */
+function detectDocumentType(url) {
+  if (!url) return 'other';
+  if (url.includes('docs.google.com')) return 'google-doc';
+  if (url.includes('github.com')) return 'github';
+  if (url.includes('notion.so')) return 'notion';
+  if (url.includes('atlassian.net') || url.includes('confluence')) return 'confluence';
+  return 'other';
+}
 
 // ============================================================================
 // GOOGLE SEARCH: Scrape results for context
@@ -755,22 +944,26 @@ async function analyzeContent(data, tabId) {
  * - Transform response to match expected output
  * - Add authentication if needed
  * 
- * @param {Object} data - { url, text }
+ * @param {Object} data - { url, text, sessionId? }
  * @returns {Promise<Object>} Analysis result
  */
 async function callAnalysisAPI(data) {
   try {
+    const sessionId = await getCurrentSessionId();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-    const response = await fetch(ANALYZE_API_URL, {
+    // Use new API endpoint if available, fallback to old one
+    const endpoint = '/api/personal/analyze';
+    const apiBase = await getApiBaseUrl();
+    const url = `${apiBase}${endpoint}`;
+
+    const response = await authenticatedFetch(endpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
       body: JSON.stringify({
         url: data.url,
-        text: data.text
+        text: data.text,
+        sessionId: sessionId
       }),
       signal: controller.signal
     });
@@ -779,7 +972,8 @@ async function callAnalysisAPI(data) {
 
     if (!response.ok) {
       console.error('[ContextGrabber] Analysis API returned status:', response.status);
-      return getPlaceholderResponse(data);
+      // Fallback to old endpoint if new one fails
+      return await tryOldAnalysisAPI(data);
     }
 
     const result = await response.json();
@@ -799,7 +993,42 @@ async function callAnalysisAPI(data) {
       console.warn('[ContextGrabber] Analysis API error:', error.message);
     }
 
-    // Return placeholder response when API is unavailable
+    // Try old endpoint as fallback
+    return await tryOldAnalysisAPI(data);
+  }
+}
+
+/**
+ * Fallback to old analysis API endpoint
+ * @param {Object} data - { url, text }
+ * @returns {Promise<Object>} Analysis result
+ */
+async function tryOldAnalysisAPI(data) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+    const response = await fetch(ANALYZE_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        url: data.url,
+        text: data.text
+      }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      return getPlaceholderResponse(data);
+    }
+
+    const result = await response.json();
+    return result;
+  } catch (error) {
     return getPlaceholderResponse(data);
   }
 }
@@ -829,6 +1058,256 @@ function getPlaceholderResponse(data) {
     ]
   };
 }
+
+// ============================================================================
+// SESSION MANAGEMENT
+// ============================================================================
+
+/**
+ * Starts a new learning session
+ * @param {Object} data - Session data
+ * @param {string} data.url - Page URL
+ * @param {string} data.documentTitle - Document title
+ * @param {string} data.documentType - Document type (google-doc, github, notion, confluence, other)
+ * @returns {Promise<Object|null>} Session object with sessionId or null on error
+ */
+async function startSession(data) {
+  try {
+    const response = await authenticatedFetch('/api/extension/session/start', {
+      method: 'POST',
+      body: JSON.stringify({
+        url: data.url,
+        documentTitle: data.documentTitle || document.title || 'Unknown',
+        documentType: data.documentType || 'other'
+      })
+    });
+    
+    if (!response.ok) {
+      console.error('[ContextGrabber] Failed to start session:', response.status);
+      return null;
+    }
+    
+    const result = await response.json();
+    
+    // Store sessionId in storage
+    if (result.sessionId) {
+      await chrome.storage.local.set({ currentSessionId: result.sessionId });
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('[ContextGrabber] Error starting session:', error);
+    return null;
+  }
+}
+
+/**
+ * Stops the current session
+ * @param {string} sessionId - Session ID to stop
+ * @returns {Promise<Object|null>} Stop result or null on error
+ */
+async function stopSession(sessionId) {
+  if (!sessionId) return null;
+  
+  try {
+    const response = await authenticatedFetch(`/api/extension/session/${sessionId}/stop`, {
+      method: 'POST'
+    });
+    
+    if (!response.ok) {
+      console.error('[ContextGrabber] Failed to stop session:', response.status);
+      return null;
+    }
+    
+    const result = await response.json();
+    
+    // Clear sessionId from storage
+    await chrome.storage.local.remove(['currentSessionId']);
+    
+    return result;
+  } catch (error) {
+    console.error('[ContextGrabber] Error stopping session:', error);
+    return null;
+  }
+}
+
+/**
+ * Gets the current session ID from storage
+ * @returns {Promise<string|null>} Current session ID or null
+ */
+async function getCurrentSessionId() {
+  try {
+    const result = await chrome.storage.local.get(['currentSessionId']);
+    return result.currentSessionId || null;
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting session ID:', error);
+    return null;
+  }
+}
+
+/**
+ * Records a confusion trigger
+ * @param {string} sessionId - Session ID
+ * @param {Object} trigger - Trigger data
+ * @param {string} trigger.triggerType - Type: 'scroll' | 'hover' | 'click'
+ * @param {Object} trigger.location - Location { x, y }
+ * @param {string} trigger.text - Extracted text
+ * @returns {Promise<boolean>} Success status
+ */
+async function recordConfusionTrigger(sessionId, trigger) {
+  if (!sessionId) return false;
+  
+  try {
+    const response = await authenticatedFetch(`/api/personal/sessions/${sessionId}/triggers`, {
+      method: 'POST',
+      body: JSON.stringify({
+        triggerType: trigger.triggerType,
+        location: trigger.location,
+        text: trigger.text,
+        timestamp: new Date().toISOString()
+      })
+    });
+    
+    return response.ok;
+  } catch (error) {
+    console.error('[ContextGrabber] Error recording trigger:', error);
+    return false;
+  }
+}
+
+/**
+ * Creates a notebook entry
+ * @param {Object} entry - Entry data
+ * @param {string} entry.sessionId - Session ID
+ * @param {string} entry.title - Entry title
+ * @param {string} entry.content - Entry content (markdown)
+ * @param {Object} entry.context - Context data
+ * @returns {Promise<Object|null>} Created entry or null on error
+ */
+async function createNotebookEntry(entry) {
+  try {
+    const response = await authenticatedFetch('/api/personal/notebook-entries', {
+      method: 'POST',
+      body: JSON.stringify({
+        sessionId: entry.sessionId,
+        title: entry.title,
+        content: entry.content,
+        context: entry.context
+      })
+    });
+    
+    if (!response.ok) {
+      console.error('[ContextGrabber] Failed to create notebook entry:', response.status);
+      return null;
+    }
+    
+    return await response.json();
+  } catch (error) {
+    console.error('[ContextGrabber] Error creating notebook entry:', error);
+    return null;
+  }
+}
+
+// ============================================================================
+// CHATBOT API CONNECTIONS
+// ============================================================================
+
+/**
+ * Sends a chat message to the chatbot API
+ * @param {Object} data - Chat data
+ * @param {string} data.message - User message
+ * @param {string} data.sessionId - Session ID
+ * @param {Object} data.context - Context data
+ * @returns {Promise<Object|null>} Chat response or null on error
+ */
+async function sendChatMessage(data) {
+  try {
+    const response = await authenticatedFetch('/api/extension/chat', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: data.message,
+        sessionId: data.sessionId,
+        context: data.context
+      })
+    });
+    
+    if (!response.ok) {
+      console.error('[ContextGrabber] Chat API error:', response.status);
+      return null;
+    }
+    
+    return await response.json();
+  } catch (error) {
+    console.error('[ContextGrabber] Error sending chat message:', error);
+    return null;
+  }
+}
+
+/**
+ * Gets chat history for a session
+ * @param {string} sessionId - Session ID
+ * @param {number} limit - Number of messages to retrieve
+ * @returns {Promise<Object|null>} Chat history or null on error
+ */
+async function getChatHistory(sessionId, limit = 50) {
+  if (!sessionId) return null;
+  
+  try {
+    const response = await authenticatedFetch(`/api/extension/chat/history?sessionId=${sessionId}&limit=${limit}`, {
+      method: 'GET'
+    });
+    
+    if (!response.ok) {
+      console.error('[ContextGrabber] Failed to get chat history:', response.status);
+      return null;
+    }
+    
+    return await response.json();
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting chat history:', error);
+    return null;
+  }
+}
+
+// ============================================================================
+// SERVICE WORKER LIFECYCLE
+// ============================================================================
+
+// ============================================================================
+// USER INFO SYNC: Sync user info from React app localStorage
+// ============================================================================
+
+/**
+ * Syncs user info from React app's localStorage to extension storage
+ * This allows the extension to display Google account info
+ */
+async function syncUserInfo() {
+  // Try to get user info from storage (set by React app via message)
+  // The React app should send user info when user logs in
+  chrome.storage.local.get(['user', 'auth_token'], (result) => {
+    if (result.user) {
+      console.log('[ContextGrabber] User info synced:', result.user.email);
+    }
+  });
+}
+
+// Listen for user info updates from content scripts or React app
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'SYNC_USER_INFO') {
+    // Store user info from React app
+    chrome.storage.local.set({
+      user: message.user,
+      auth_token: message.token
+    }, () => {
+      console.log('[ContextGrabber] User info stored:', message.user?.email);
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+});
+
+// Sync user info on startup
+syncUserInfo();
 
 // ============================================================================
 // SERVICE WORKER LIFECYCLE

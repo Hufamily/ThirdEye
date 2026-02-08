@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "Gaze Context Grabber",
+  "name": "ThirdEye",
   "version": "1.0.0",
   "description": "Chrome extension that uses gaze tracking to extract and analyze page context with click fallback",
   
   "permissions": [
     "activeTab",
     "scripting",
-    "tabs"
+    "tabs",
+    "storage"
   ],
   
   "host_permissions": [
@@ -15,7 +16,7 @@
   ],
   
   "action": {
-    "default_title": "Toggle Context Grabber (Ctrl+Shift+G)"
+    "default_title": "Toggle ThirdEye (Ctrl+Shift+G)"
   },
 
   "background": {
@@ -27,6 +28,13 @@
       "matches": ["http://*/*", "https://*/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
+    }
+  ],
+  
+  "web_accessible_resources": [
+    {
+      "resources": ["logo.png"],
+      "matches": ["<all_urls>"]
     }
   ]
 }
