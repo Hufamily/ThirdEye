@@ -40,10 +40,12 @@ pygame.mouse.set_visible(False)  # Hide mouse cursor
 parser = argparse.ArgumentParser()
 parser.add_argument("--api", action="store_true", help="Start Flask API in background (GET /gaze)")
 parser.add_argument("--api-port", type=int, default=5000, help="Port for API (default: 5000)")
+parser.add_argument("--no-api", action="store_true", help="Do not start API (assume it is running elsewhere, e.g. gaze_server.py)")
+parser.add_argument("--api-url", type=str, default="", help="POST gaze data to URL (e.g. http://127.0.0.1:8000) when --no-api")
 args = parser.parse_args()
 
-# Start API in background thread if requested
-if args.api:
+# Start API in background thread if requested (unless --no-api)
+if args.api and not args.no_api:
     import threading
     from api import app
     def run_api():
@@ -104,12 +106,27 @@ while running:
         # Clamp to screen bounds
         gaze_x = max(0, min(screen_width, gaze_x))
         gaze_y = max(0, min(screen_height, gaze_y))
-        # Push to API for /gaze endpoint (if api module is used)
-        try:
-            from api.app import set_gaze
-            set_gaze(float(gaze_x), float(gaze_y), confidence=1.0)
-        except ImportError:
-            pass
+        # Push to API for /gaze endpoint
+        if args.api_url:
+            try:
+                import urllib.request
+                import json
+                url = args.api_url.rstrip("/") + "/gaze"
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps({"x": float(gaze_x), "y": float(gaze_y), "confidence": 1.0}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=0.1)
+            except Exception:
+                pass
+        else:
+            try:
+                from api.app import set_gaze
+                set_gaze(float(gaze_x), float(gaze_y), confidence=1.0)
+            except ImportError:
+                pass
     
     # Clear screen with black background
     win.fill((0, 0, 0))

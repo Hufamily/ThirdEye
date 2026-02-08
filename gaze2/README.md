@@ -57,11 +57,29 @@ from api import app
 
 **Endpoints:**
 - `GET /gaze` → `{"x": 960.5, "y": 540.2, "confidence": 0.95}`
+- `POST /gaze` → Receive updates: `{"x": 960.5, "y": 540.2, "confidence": 0.95}`
 - `GET /health` → `{"status": "ok"}`
 
 **Usage:**
 - **Standalone** (mock data): `python run_api.py` — for development without camera
 - **With live gaze**: `python gaze_cursor.py --api` — runs gaze cursor + API; `/gaze` returns real coordinates
+
+## contentGrabber Chrome Extension Integration
+
+Use `gaze_server.py` to run the gaze API on port 8000 (matching the extension):
+
+```bash
+# Full mode: API + gaze tracking (camera, calibration, overlay)
+python gaze_server.py
+
+# API-only mode: Mock data for testing without camera
+python gaze_server.py --api-only
+
+# Custom port
+python gaze_server.py --port 9000
+```
+
+The contentGrabber extension polls `GET http://127.0.0.1:8000/gaze` for dwell-based context grabbing. CORS is enabled for extension requests.
 
 ## Project Structure
 

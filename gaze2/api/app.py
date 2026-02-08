@@ -3,12 +3,46 @@
 Gaze2 Flask API
 Provides a /gaze endpoint that returns gaze coordinates (x, y, confidence).
 Referenceable from the entire gaze2 codebase via: from api import app
+CORS enabled for Chrome extension (contentGrabber) integration.
 """
 
 import random
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
+
+
+@app.after_request
+def add_cors_headers(response):
+    """Allow Chrome extension and localhost to fetch gaze data."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+
+@app.route("/gaze", methods=["OPTIONS"])
+def gaze_options():
+    """Handle CORS preflight for /gaze."""
+    return "", 204
+
+
+@app.route("/gaze", methods=["POST"])
+def gaze_update():
+    """Receive gaze updates from gaze_cursor (e.g. when run as subprocess)."""
+    try:
+        data = request.get_json()
+        if data and "x" in data and "y" in data:
+            set_gaze(
+                float(data["x"]),
+                float(data["y"]),
+                float(data.get("confidence", 1.0)),
+            )
+            return jsonify({"status": "ok"})
+    except Exception:
+        pass
+    return jsonify({"status": "error"}), 400
+
 
 # Shared gaze state - can be updated by gaze_cursor.py or other modules
 _gaze_data = {
