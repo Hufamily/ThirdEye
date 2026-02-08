@@ -72,10 +72,13 @@ from api import app
 - **With live gaze**: `python gaze_cursor.py --api` — runs gaze cursor + API; `/gaze` returns real coordinates
 - **With live gaze + OS cursor**: `python gaze_cursor.py --api --control-cursor`
 
+**Chrome extension integration:** When run with `--api`, gaze_cursor also starts a WebSocket server at `ws://127.0.0.1:8765` that streams gaze coordinates at ~60 FPS. The ThirdEye Chrome extension connects to this stream for real-time red overlay and gaze-centered screenshot capture.
+
 ## Project Structure
 
 - `gaze_cursor.py` - Main application script
 - `api/` - Flask API with `/gaze` endpoint
+- `gaze_websocket_server.py` - WebSocket server for real-time gaze streaming
 - `run_api.py` - Start the API server
 - `GazeFollower/` - Gaze tracking library (based on [GazeFollower](https://github.com/GanchengZhu/GazeFollower))
 
