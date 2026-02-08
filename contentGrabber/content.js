@@ -26,7 +26,7 @@ const GAZE_API_URL = 'http://127.0.0.1:8000/gaze';
 const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 
 /** Enable/disable gaze tracking (set to false to use cursor-only mode) */
-const ENABLE_GAZE_MODE = false;
+const ENABLE_GAZE_MODE = true;
 
 /** Gaze tracking poll interval in milliseconds */
 const GAZE_POLL_INTERVAL = 300;
@@ -4010,7 +4010,7 @@ function calculateSessionDuration(sessionData) {
 
 /**
  * Toggles the extension on or off.
- * Updates the overlay status and resets dwell state.
+ * When disabled, completely hides the overlay from the screen.
  */
 function toggleExtension() {
   extensionEnabled = !extensionEnabled;
@@ -4023,11 +4023,18 @@ function toggleExtension() {
   
   if (extensionEnabled) {
     console.log('[ContextGrabber] Extension ENABLED');
+    // Show the overlay
+    if (currentOverlay) {
+      currentOverlay.style.display = 'block';
+    }
     setOverlayStatus('Watching...');
     showOverlayIfHidden();
   } else {
     console.log('[ContextGrabber] Extension DISABLED');
-    setOverlayStatus('Paused (click ▶ to resume)');
+    // Completely hide the overlay
+    if (currentOverlay) {
+      currentOverlay.style.display = 'none';
+    }
   }
   
   // Update the toggle button appearance
