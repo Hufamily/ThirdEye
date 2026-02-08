@@ -5,6 +5,8 @@ import path from 'path'
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // Read VITE_* env vars from the repo root .env file
+  envDir: path.resolve(__dirname, '..'),
   server: {
     hmr: {
       overlay: true,

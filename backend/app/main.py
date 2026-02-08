@@ -7,17 +7,23 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Add the backend directory to sys.path so local packages (routes, models, etc.) are importable
+backend_dir = Path(__file__).parent.parent
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
+
 # Load environment variables from root directory
 # Get root directory (two levels up from backend/app/main.py)
-root_dir = Path(__file__).parent.parent.parent
+root_dir = backend_dir.parent
 env_path = root_dir / ".env"
 load_dotenv(env_path)  # Load from root .env
 
 # Import routes
-from routes import auth, personal, enterprise, extension, agents, google_auth, google_docs
+from routes import auth, personal, enterprise, extension, agents, google_auth, google_docs, tts, gaze, analyze
 
 app = FastAPI(
     title="ThirdEye API",
@@ -100,6 +106,9 @@ app.include_router(extension.router, prefix="/api/extension", tags=["extension"]
 app.include_router(agents.router, prefix="/api/agents", tags=["agents"])
 app.include_router(google_auth.router, prefix="/api/google-auth", tags=["google-auth"])
 app.include_router(google_docs.router, prefix="/api/google-docs", tags=["google-docs"])
+app.include_router(tts.router, prefix="/api/tts", tags=["tts"])
+app.include_router(gaze.router, prefix="/api/gaze", tags=["gaze"])
+app.include_router(analyze.router, prefix="/analyze", tags=["analyze"])
 
 if __name__ == "__main__":
     import uvicorn

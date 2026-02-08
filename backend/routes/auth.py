@@ -11,7 +11,7 @@ from google.auth.transport import requests
 from google.oauth2 import id_token
 from app.config import settings
 from utils.auth import create_access_token, verify_token, get_user_id_from_token
-from utils.database import get_db, ensure_warehouse_resumed
+from utils.database import get_db, ensure_warehouse_resumed, qualified_table as qt, safe_variant
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from models.user import User
@@ -75,10 +75,10 @@ async def get_current_user(
     
     # Use raw SQL with fully qualified table name for reliability
     from sqlalchemy import text
-    result = db.execute(text("""
+    result = db.execute(text(f"""
         SELECT USER_ID, GOOGLE_SUB, EMAIL, NAME, PICTURE_URL, ACCOUNT_TYPE, 
                HAS_ENTERPRISE_ACCESS, PERSONA_CARD, CREATED_AT, UPDATED_AT, LAST_LOGIN
-        FROM THIRDEYE_DEV.PUBLIC.USERS
+        FROM {qt("USERS")}
         WHERE USER_ID = :user_id
         LIMIT 1
     """), {"user_id": user_id})
@@ -157,10 +157,10 @@ async def google_login(
         from sqlalchemy import text
         
         # Check if user exists
-        result = db.execute(text("""
+        result = db.execute(text(f"""
             SELECT USER_ID, GOOGLE_SUB, EMAIL, NAME, PICTURE_URL, ACCOUNT_TYPE, 
                    HAS_ENTERPRISE_ACCESS, PERSONA_CARD, CREATED_AT, UPDATED_AT, LAST_LOGIN
-            FROM THIRDEYE_DEV.PUBLIC.USERS
+            FROM {qt("USERS")}
             WHERE GOOGLE_SUB = :google_sub
             LIMIT 1
         """), {"google_sub": google_sub})
@@ -169,8 +169,8 @@ async def google_login(
         if not row:
             # Create new user
             user_id = str(uuid.uuid4())
-            db.execute(text("""
-                INSERT INTO THIRDEYE_DEV.PUBLIC.USERS 
+            db.execute(text(f"""
+                INSERT INTO {qt("USERS")} 
                 (USER_ID, GOOGLE_SUB, EMAIL, NAME, PICTURE_URL, ACCOUNT_TYPE, HAS_ENTERPRISE_ACCESS)
                 VALUES (:user_id, :google_sub, :email, :name, :picture_url, :account_type, :has_enterprise_access)
             """), {
@@ -185,17 +185,17 @@ async def google_login(
             db.commit()
             
             # Fetch the created user
-            result = db.execute(text("""
+            result = db.execute(text(f"""
                 SELECT USER_ID, GOOGLE_SUB, EMAIL, NAME, PICTURE_URL, ACCOUNT_TYPE, 
                        HAS_ENTERPRISE_ACCESS, PERSONA_CARD, CREATED_AT, UPDATED_AT, LAST_LOGIN
-                FROM THIRDEYE_DEV.PUBLIC.USERS
+                FROM {qt("USERS")}
                 WHERE USER_ID = :user_id
             """), {"user_id": user_id})
             row = result.fetchone()
         else:
             # Update existing user
-            db.execute(text("""
-                UPDATE THIRDEYE_DEV.PUBLIC.USERS
+            db.execute(text(f"""
+                UPDATE {qt("USERS")}
                 SET EMAIL = :email,
                     NAME = :name,
                     PICTURE_URL = :picture_url,
@@ -213,10 +213,10 @@ async def google_login(
             db.commit()
             
             # Fetch updated user
-            result = db.execute(text("""
+            result = db.execute(text(f"""
                 SELECT USER_ID, GOOGLE_SUB, EMAIL, NAME, PICTURE_URL, ACCOUNT_TYPE, 
                        HAS_ENTERPRISE_ACCESS, PERSONA_CARD, CREATED_AT, UPDATED_AT, LAST_LOGIN
-                FROM THIRDEYE_DEV.PUBLIC.USERS
+                FROM {qt("USERS")}
                 WHERE GOOGLE_SUB = :google_sub
             """), {"google_sub": google_sub})
             row = result.fetchone()

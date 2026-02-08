@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func, desc, and_
-from utils.database import get_db, ensure_warehouse_resumed, engine
+from utils.database import get_db, ensure_warehouse_resumed, engine, qualified_table as qt, safe_variant
 from routes.auth import get_current_user
 from models.user import User
 from models.document import Document
@@ -90,11 +90,11 @@ async def get_documents(
     """
     await ensure_warehouse_resumed()
     
-    # TODO: Filter by org_id when organization membership is implemented
-    query = """
+    ta = qt("TRACKED_ASSETS")
+    query = f"""
         SELECT ASSET_ID, TITLE, GOOGLE_DOC, CONFUSION_DENSITY, 
                TOTAL_TRIGGERS, USERS_AFFECTED, CREATED_AT
-        FROM THIRDEYE_DEV.PUBLIC.TRACKED_ASSETS
+        FROM {ta}
         WHERE ASSET_TYPE = 'GOOGLE_DOC'
     """
     params = {}
@@ -113,7 +113,7 @@ async def get_documents(
     
     documents = []
     for row in rows:
-        google_doc = row[2] if isinstance(row[2], dict) else {}
+        google_doc = safe_variant(row[2], dict)
         documents.append({
             "id": row[0],
             "title": row[1] or "",
@@ -129,10 +129,11 @@ async def get_documents(
             "usersAffected": int(row[5]) if row[5] else 0
         })
     
-    # Get total count
-    count_result = db.execute(text("""
+    # Get total count — use same TRACKED_ASSETS table, not DOCUMENTS
+    count_result = db.execute(text(f"""
         SELECT COUNT(*) 
-        FROM THIRDEYE_DEV.PUBLIC.DOCUMENTS
+        FROM {ta}
+        WHERE ASSET_TYPE = 'GOOGLE_DOC'
     """))
     total = count_result.fetchone()[0]
     
@@ -154,9 +155,9 @@ async def get_document_content(
     """
     await ensure_warehouse_resumed()
     
-    result = db.execute(text("""
+    result = db.execute(text(f"""
         SELECT DOC_ID, TITLE, CONTENT, GOOGLE_DOC, HOTSPOTS
-        FROM THIRDEYE_DEV.PUBLIC.DOCUMENTS
+        FROM {qt('DOCUMENTS')}
         WHERE DOC_ID = :doc_id
         LIMIT 1
     """), {"doc_id": document_id})
@@ -174,8 +175,8 @@ async def get_document_content(
             }
         )
     
-    google_doc = row[3] if isinstance(row[3], dict) else {}
-    hotspots = row[4] if isinstance(row[4], list) else []
+    google_doc = safe_variant(row[3], dict)
+    hotspots = safe_variant(row[4], list)
     
     return {
         "id": row[0],
@@ -205,38 +206,35 @@ async def get_suggestions(
     """
     await ensure_warehouse_resumed()
     
-    query = """
-        SELECT SUGGESTION_ID, DOC_ID, HOTSPOT_ID, ORIGINAL_TEXT, SUGGESTED_TEXT,
-               CONFIDENCE, REASONING, GOOGLE_DOC_RANGE, STATUS
-        FROM THIRDEYE_DEV.PUBLIC.SUGGESTIONS
+    s_table = qt("SUGGESTIONS")
+    d_table = qt("DOCUMENTS")
+    
+    # JOIN documents to avoid N+1 queries
+    query = f"""
+        SELECT S.SUGGESTION_ID, S.DOC_ID, S.HOTSPOT_ID, S.ORIGINAL_TEXT, S.SUGGESTED_TEXT,
+               S.CONFIDENCE, S.REASONING, S.GOOGLE_DOC_RANGE, S.STATUS,
+               D.TITLE AS DOC_TITLE, D.GOOGLE_DOC AS DOC_GOOGLE_DOC
+        FROM {s_table} S
+        LEFT JOIN {d_table} D ON S.DOC_ID = D.DOC_ID
         WHERE 1=1
     """
     params = {}
     
     if documentId:
-        query += " AND DOC_ID = :doc_id"
+        query += " AND S.DOC_ID = :doc_id"
         params["doc_id"] = documentId
     
-    query += " ORDER BY CREATED_AT DESC LIMIT :limit OFFSET :offset"
+    query += " ORDER BY S.CREATED_AT DESC LIMIT :limit OFFSET :offset"
     params["limit"] = limit
     params["offset"] = offset
     
     result = db.execute(text(query), params)
     rows = result.fetchall()
     
-    # Get document info for each suggestion
     suggestions = []
     for row in rows:
-        doc_result = db.execute(text("""
-            SELECT TITLE, GOOGLE_DOC
-            FROM THIRDEYE_DEV.PUBLIC.DOCUMENTS
-            WHERE DOC_ID = :doc_id
-            LIMIT 1
-        """), {"doc_id": row[1]})
-        doc_row = doc_result.fetchone()
-        
-        google_doc = doc_row[1] if doc_row and isinstance(doc_row[1], dict) else {}
-        google_doc_range = row[7] if isinstance(row[7], dict) else {}
+        google_doc = safe_variant(row[10], dict)  # DOC_GOOGLE_DOC
+        google_doc_range = safe_variant(row[7], dict)
         
         suggestions.append({
             "id": row[0],
@@ -244,7 +242,7 @@ async def get_suggestions(
             "googleDoc": {
                 "fileId": google_doc.get("fileId", ""),
                 "url": google_doc.get("url", ""),
-                "name": google_doc.get("name", doc_row[0] if doc_row else "")
+                "name": google_doc.get("name", row[9] or "")  # DOC_TITLE
             },
             "hotspotId": row[2],
             "originalText": row[3],
@@ -258,7 +256,7 @@ async def get_suggestions(
         })
     
     # Get total count
-    count_query = "SELECT COUNT(*) FROM THIRDEYE_DEV.PUBLIC.SUGGESTIONS WHERE 1=1"
+    count_query = f"SELECT COUNT(*) FROM {s_table} WHERE 1=1"
     count_params = {}
     if documentId:
         count_query += " AND DOC_ID = :doc_id"
@@ -286,11 +284,13 @@ async def get_enterprise_suggestions(
     """
     await ensure_warehouse_resumed()
     
-    result = db.execute(text("""
+    s_table = qt("SUGGESTIONS")
+    d_table = qt("DOCUMENTS")
+    result = db.execute(text(f"""
         SELECT S.SUGGESTION_ID, S.DOC_ID, S.HOTSPOT_ID, S.CONFUSION_TYPE,
                S.CONFIDENCE, S.DIAGNOSIS, S.ACTIONS, D.TITLE
-        FROM THIRDEYE_DEV.PUBLIC.SUGGESTIONS S
-        LEFT JOIN THIRDEYE_DEV.PUBLIC.DOCUMENTS D ON S.DOC_ID = D.DOC_ID
+        FROM {s_table} S
+        LEFT JOIN {d_table} D ON S.DOC_ID = D.DOC_ID
         ORDER BY S.CREATED_AT DESC
         LIMIT :limit OFFSET :offset
     """), {"limit": limit, "offset": offset})
@@ -298,7 +298,7 @@ async def get_enterprise_suggestions(
     
     suggestions = []
     for row in rows:
-        actions = row[6] if isinstance(row[6], list) else []
+        actions = safe_variant(row[6], list)
         suggestions.append({
             "id": row[0],
             "document": row[7] or row[1],  # Use title or doc_id
@@ -310,7 +310,7 @@ async def get_enterprise_suggestions(
         })
     
     # Get total count
-    count_result = db.execute(text("SELECT COUNT(*) FROM THIRDEYE_DEV.PUBLIC.SUGGESTIONS"))
+    count_result = db.execute(text(f"SELECT COUNT(*) FROM {s_table}"))
     total = count_result.fetchone()[0]
     
     return {
@@ -331,18 +331,18 @@ async def get_kpis(
     await ensure_warehouse_resumed()
     
     # Calculate time reclaimed (estimate: 15 min per trigger = 0.25 hours)
-    triggers_result = db.execute(text("""
+    triggers_result = db.execute(text(f"""
         SELECT COUNT(*) 
-        FROM THIRDEYE_DEV.PUBLIC.INTERACTIONS
+        FROM {qt("INTERACTIONS")}
         WHERE READING_STATE = 'READ_ONLY'
     """))
     total_triggers = triggers_result.fetchone()[0] or 0
     time_reclaimed = round(total_triggers * 0.25, 1)
     
     # Get top documents by confusion density
-    top_docs_result = db.execute(text("""
+    top_docs_result = db.execute(text(f"""
         SELECT ASSET_ID, TITLE, CONFUSION_DENSITY, TOTAL_TRIGGERS, USERS_AFFECTED
-        FROM THIRDEYE_DEV.PUBLIC.TRACKED_ASSETS
+        FROM {qt("TRACKED_ASSETS")}
         WHERE ASSET_TYPE = 'GOOGLE_DOC'
           AND CONFUSION_DENSITY IS NOT NULL
         ORDER BY CONFUSION_DENSITY DESC
@@ -397,8 +397,8 @@ async def accept_suggestion(
     """
     await ensure_warehouse_resumed()
     
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.SUGGESTIONS
+    db.execute(text(f"""
+        UPDATE {qt("SUGGESTIONS")}
         SET STATUS = 'accepted',
             UPDATED_AT = CURRENT_TIMESTAMP()
         WHERE SUGGESTION_ID = :suggestion_id
@@ -420,8 +420,8 @@ async def reject_suggestion(
     """
     await ensure_warehouse_resumed()
     
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.SUGGESTIONS
+    db.execute(text(f"""
+        UPDATE {qt("SUGGESTIONS")}
         SET STATUS = 'rejected',
             UPDATED_AT = CURRENT_TIMESTAMP()
         WHERE SUGGESTION_ID = :suggestion_id
@@ -444,8 +444,8 @@ async def apply_suggestion(
     await ensure_warehouse_resumed()
     
     # Update suggestion status
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.SUGGESTIONS
+    db.execute(text(f"""
+        UPDATE {qt("SUGGESTIONS")}
         SET STATUS = 'applied',
             APPLIED_AT = CURRENT_TIMESTAMP(),
             APPLIED_BY = :user_id,
@@ -472,8 +472,8 @@ async def dismiss_suggestion(
     """
     await ensure_warehouse_resumed()
     
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.SUGGESTIONS
+    db.execute(text(f"""
+        UPDATE {qt("SUGGESTIONS")}
         SET STATUS = 'rejected',
             UPDATED_AT = CURRENT_TIMESTAMP()
         WHERE SUGGESTION_ID = :suggestion_id
@@ -572,11 +572,11 @@ async def get_organization(
     await ensure_warehouse_resumed()
     
     # Get user's organization from ORG_MEMBERSHIPS table
-    result = db.execute(text("""
-        SELECT ORG_ID, ORG_NAME, ADMIN_EMAIL, CREATED_AT
-        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+    result = db.execute(text(f"""
+        SELECT ORG_ID, ORG_NAME, ADMIN_EMAIL, CREATED_AT, DRIVE_SOURCES
+        FROM {qt("ORGANIZATIONS")}
         WHERE ORG_ID IN (
-            SELECT ORG_ID FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+            SELECT ORG_ID FROM {qt("ORG_MEMBERSHIPS")}
             WHERE USER_ID = :user_id
         )
         LIMIT 1
@@ -603,10 +603,10 @@ async def get_organization(
     org_id = org_row[0]
     
     # Get members
-    members_result = db.execute(text("""
+    members_result = db.execute(text(f"""
         SELECT U.USER_ID, U.NAME, U.EMAIL, OM.ROLE
-        FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS OM
-        JOIN THIRDEYE_DEV.PUBLIC.USERS U ON OM.USER_ID = U.USER_ID
+        FROM {qt("ORG_MEMBERSHIPS")} OM
+        JOIN {qt("USERS")} U ON OM.USER_ID = U.USER_ID
         WHERE OM.ORG_ID = :org_id
     """), {"org_id": org_id})
     members_rows = members_result.fetchall()
@@ -620,25 +620,25 @@ async def get_organization(
             "role": m_row[3] or "member"
         })
     
-    # Get drive sources (from ORGANIZATIONS table DRIVE_SOURCES column)
-    drive_sources = org_row[3] if isinstance(org_row[3], list) else []
+    # Get drive sources (from ORGANIZATIONS table DRIVE_SOURCES column — index 4)
+    drive_sources = safe_variant(org_row[4], list)
     
     # Calculate metrics
-    metrics_result = db.execute(text("""
+    metrics_result = db.execute(text(f"""
         SELECT 
             COUNT(DISTINCT D.DOC_ID) as documents_processed,
             AVG(D.CONFUSION_DENSITY) as confusion_density,
             COUNT(DISTINCT I.USER_ID) as active_users
-        FROM THIRDEYE_DEV.PUBLIC.DOCUMENTS D
-        LEFT JOIN THIRDEYE_DEV.PUBLIC.INTERACTIONS I ON D.DOC_ID = I.DOC_ID
+        FROM {qt("DOCUMENTS")} D
+        LEFT JOIN {qt("INTERACTIONS")} I ON D.DOC_ID = I.DOC_ID
         WHERE D.ORG_ID = :org_id
     """), {"org_id": org_id})
     metrics_row = metrics_result.fetchone()
     
-    time_saved_result = db.execute(text("""
+    time_saved_result = db.execute(text(f"""
         SELECT COUNT(*) * 0.25
-        FROM THIRDEYE_DEV.PUBLIC.INTERACTIONS I
-        JOIN THIRDEYE_DEV.PUBLIC.DOCUMENTS D ON I.DOC_ID = D.DOC_ID
+        FROM {qt("INTERACTIONS")} I
+        JOIN {qt("DOCUMENTS")} D ON I.DOC_ID = D.DOC_ID
         WHERE D.ORG_ID = :org_id AND I.READING_STATE = 'READ_ONLY'
     """), {"org_id": org_id})
     time_saved = time_saved_result.fetchone()[0] or 0.0
@@ -672,8 +672,8 @@ async def update_organization(
     await ensure_warehouse_resumed()
     
     # Check if user is admin
-    admin_check = db.execute(text("""
-        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    admin_check = db.execute(text(f"""
+        SELECT ROLE FROM {qt("ORG_MEMBERSHIPS")}
         WHERE USER_ID = :user_id AND ROLE = 'admin'
         LIMIT 1
     """), {"user_id": current_user.user_id})
@@ -691,8 +691,8 @@ async def update_organization(
         )
     
     # Get org_id
-    org_result = db.execute(text("""
-        SELECT ORG_ID FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    org_result = db.execute(text(f"""
+        SELECT ORG_ID FROM {qt("ORG_MEMBERSHIPS")}
         WHERE USER_ID = :user_id
         LIMIT 1
     """), {"user_id": current_user.user_id})
@@ -713,8 +713,8 @@ async def update_organization(
     org_id = org_row[0]
     
     # Update organization
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+    db.execute(text(f"""
+        UPDATE {qt("ORGANIZATIONS")}
         SET ORG_NAME = :org_name,
             ADMIN_EMAIL = :admin_email,
             UPDATED_AT = CURRENT_TIMESTAMP()
@@ -746,8 +746,8 @@ async def generate_report(
     suggestion_ids = request.get("suggestionIds", [])
     
     # Get document
-    doc_result = db.execute(text("""
-        SELECT TITLE FROM THIRDEYE_DEV.PUBLIC.TRACKED_ASSETS
+    doc_result = db.execute(text(f"""
+        SELECT TITLE FROM {qt("TRACKED_ASSETS")}
         WHERE ASSET_ID = :doc_id
         LIMIT 1
     """), {"doc_id": document_id})
@@ -771,7 +771,7 @@ async def generate_report(
     
     suggestions_result = db.execute(text(f"""
         SELECT SUGGESTION_ID, ORIGINAL_TEXT, SUGGESTED_TEXT, CONFIDENCE, REASONING, HOTSPOT_ID
-        FROM THIRDEYE_DEV.PUBLIC.SUGGESTIONS
+        FROM {qt("SUGGESTIONS")}
         WHERE SUGGESTION_ID IN ({placeholders})
     """), params)
     suggestions_rows = suggestions_result.fetchall()
@@ -827,9 +827,9 @@ async def _get_user_org_id(user_id: str) -> Optional[str]:
     try:
         await ensure_warehouse_resumed()
         with engine.connect() as conn:
-            query = text("""
+            query = text(f"""
                 SELECT ORG_ID
-                FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+                FROM {qt("ORG_MEMBERSHIPS")}
                 WHERE USER_ID = :user_id
                 LIMIT 1
             """)
@@ -1018,15 +1018,15 @@ async def get_google_drive_sources(
     await ensure_warehouse_resumed()
     
     # Get drive sources from organization
-    result = db.execute(text("""
+    result = db.execute(text(f"""
         SELECT DRIVE_SOURCES
-        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        FROM {qt("ORGANIZATIONS")}
         WHERE ORG_ID = :org_id
         LIMIT 1
     """), {"org_id": org_id})
     row = result.fetchone()
     
-    drive_sources = row[0] if row and isinstance(row[0], list) else []
+    drive_sources = safe_variant(row[0], list) if row else []
     
     return {
         "sources": drive_sources
@@ -1058,8 +1058,8 @@ async def add_google_drive_source(
         )
     
     # Check if user is admin
-    admin_check = db.execute(text("""
-        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    admin_check = db.execute(text(f"""
+        SELECT ROLE FROM {qt("ORG_MEMBERSHIPS")}
         WHERE USER_ID = :user_id AND ROLE = 'admin'
         LIMIT 1
     """), {"user_id": current_user.user_id})
@@ -1079,15 +1079,15 @@ async def add_google_drive_source(
     await ensure_warehouse_resumed()
     
     # Get current drive sources
-    result = db.execute(text("""
+    result = db.execute(text(f"""
         SELECT DRIVE_SOURCES
-        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        FROM {qt("ORGANIZATIONS")}
         WHERE ORG_ID = :org_id
         LIMIT 1
     """), {"org_id": org_id})
     row = result.fetchone()
     
-    drive_sources = row[0] if row and isinstance(row[0], list) else []
+    drive_sources = safe_variant(row[0], list) if row else []
     
     # Add new source
     new_source = {
@@ -1101,8 +1101,8 @@ async def add_google_drive_source(
     drive_sources.append(new_source)
     
     # Update organization
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+    db.execute(text(f"""
+        UPDATE {qt("ORGANIZATIONS")}
         SET DRIVE_SOURCES = :drive_sources,
             UPDATED_AT = CURRENT_TIMESTAMP()
         WHERE ORG_ID = :org_id
@@ -1140,8 +1140,8 @@ async def remove_google_drive_source(
         )
     
     # Check if user is admin
-    admin_check = db.execute(text("""
-        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    admin_check = db.execute(text(f"""
+        SELECT ROLE FROM {qt("ORG_MEMBERSHIPS")}
         WHERE USER_ID = :user_id AND ROLE = 'admin'
         LIMIT 1
     """), {"user_id": current_user.user_id})
@@ -1161,22 +1161,22 @@ async def remove_google_drive_source(
     await ensure_warehouse_resumed()
     
     # Get current drive sources
-    result = db.execute(text("""
+    result = db.execute(text(f"""
         SELECT DRIVE_SOURCES
-        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        FROM {qt("ORGANIZATIONS")}
         WHERE ORG_ID = :org_id
         LIMIT 1
     """), {"org_id": org_id})
     row = result.fetchone()
     
-    drive_sources = row[0] if row and isinstance(row[0], list) else []
+    drive_sources = safe_variant(row[0], list) if row else []
     
     # Remove source
     drive_sources = [s for s in drive_sources if s.get("id") != source_id]
     
     # Update organization
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+    db.execute(text(f"""
+        UPDATE {qt("ORGANIZATIONS")}
         SET DRIVE_SOURCES = :drive_sources,
             UPDATED_AT = CURRENT_TIMESTAMP()
         WHERE ORG_ID = :org_id
@@ -1219,10 +1219,10 @@ async def get_team_members(
     await ensure_warehouse_resumed()
     
     # Get members
-    members_result = db.execute(text("""
+    members_result = db.execute(text(f"""
         SELECT U.USER_ID, U.NAME, U.EMAIL, OM.ROLE, OM.JOINED_AT
-        FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS OM
-        JOIN THIRDEYE_DEV.PUBLIC.USERS U ON OM.USER_ID = U.USER_ID
+        FROM {qt("ORG_MEMBERSHIPS")} OM
+        JOIN {qt("USERS")} U ON OM.USER_ID = U.USER_ID
         WHERE OM.ORG_ID = :org_id
     """), {"org_id": org_id})
     members_rows = members_result.fetchall()
@@ -1267,8 +1267,8 @@ async def add_team_member(
         )
     
     # Check if user is admin
-    admin_check = db.execute(text("""
-        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    admin_check = db.execute(text(f"""
+        SELECT ROLE FROM {qt("ORG_MEMBERSHIPS")}
         WHERE USER_ID = :user_id AND ROLE = 'admin'
         LIMIT 1
     """), {"user_id": current_user.user_id})
@@ -1303,8 +1303,8 @@ async def add_team_member(
         )
     
     # Find user by email
-    user_result = db.execute(text("""
-        SELECT USER_ID FROM THIRDEYE_DEV.PUBLIC.USERS
+    user_result = db.execute(text(f"""
+        SELECT USER_ID FROM {qt("USERS")}
         WHERE EMAIL = :email
         LIMIT 1
     """), {"email": email})
@@ -1325,8 +1325,8 @@ async def add_team_member(
     user_id = user_row[0]
     
     # Check if already a member
-    existing_check = db.execute(text("""
-        SELECT USER_ID FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    existing_check = db.execute(text(f"""
+        SELECT USER_ID FROM {qt("ORG_MEMBERSHIPS")}
         WHERE ORG_ID = :org_id AND USER_ID = :user_id
         LIMIT 1
     """), {"org_id": org_id, "user_id": user_id})
@@ -1344,8 +1344,8 @@ async def add_team_member(
         )
     
     # Add membership
-    db.execute(text("""
-        INSERT INTO THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    db.execute(text(f"""
+        INSERT INTO {qt("ORG_MEMBERSHIPS")}
         (ORG_ID, USER_ID, ROLE, JOINED_AT)
         VALUES (:org_id, :user_id, :role, CURRENT_TIMESTAMP())
     """), {
@@ -1356,8 +1356,8 @@ async def add_team_member(
     db.commit()
     
     # Get user info
-    user_info_result = db.execute(text("""
-        SELECT USER_ID, NAME, EMAIL FROM THIRDEYE_DEV.PUBLIC.USERS
+    user_info_result = db.execute(text(f"""
+        SELECT USER_ID, NAME, EMAIL FROM {qt("USERS")}
         WHERE USER_ID = :user_id
         LIMIT 1
     """), {"user_id": user_id})
@@ -1397,8 +1397,8 @@ async def remove_team_member(
         )
     
     # Check if user is admin
-    admin_check = db.execute(text("""
-        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    admin_check = db.execute(text(f"""
+        SELECT ROLE FROM {qt("ORG_MEMBERSHIPS")}
         WHERE USER_ID = :user_id AND ROLE = 'admin'
         LIMIT 1
     """), {"user_id": current_user.user_id})
@@ -1418,8 +1418,8 @@ async def remove_team_member(
     await ensure_warehouse_resumed()
     
     # Remove membership
-    db.execute(text("""
-        DELETE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    db.execute(text(f"""
+        DELETE FROM {qt("ORG_MEMBERSHIPS")}
         WHERE ORG_ID = :org_id AND USER_ID = :member_id
     """), {
         "org_id": org_id,
@@ -1456,8 +1456,8 @@ async def update_team_member_role(
         )
     
     # Check if user is admin
-    admin_check = db.execute(text("""
-        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    admin_check = db.execute(text(f"""
+        SELECT ROLE FROM {qt("ORG_MEMBERSHIPS")}
         WHERE USER_ID = :user_id AND ROLE = 'admin'
         LIMIT 1
     """), {"user_id": current_user.user_id})
@@ -1490,8 +1490,8 @@ async def update_team_member_role(
         )
     
     # Update role
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    db.execute(text(f"""
+        UPDATE {qt("ORG_MEMBERSHIPS")}
         SET ROLE = :role,
             UPDATED_AT = CURRENT_TIMESTAMP()
         WHERE ORG_ID = :org_id AND USER_ID = :member_id
@@ -1542,15 +1542,15 @@ async def get_enterprise_settings(
     await ensure_warehouse_resumed()
     
     # Get settings from organization metadata
-    result = db.execute(text("""
+    result = db.execute(text(f"""
         SELECT SETTINGS
-        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        FROM {qt("ORGANIZATIONS")}
         WHERE ORG_ID = :org_id
         LIMIT 1
     """), {"org_id": org_id})
     row = result.fetchone()
     
-    settings = row[0] if row and isinstance(row[0], dict) else {}
+    settings = safe_variant(row[0], dict) if row else {}
     
     return EnterpriseSettings(
         classificationRules=settings.get("classificationRules", []),
@@ -1587,8 +1587,8 @@ async def update_enterprise_settings(
         )
     
     # Check if user is admin
-    admin_check = db.execute(text("""
-        SELECT ROLE FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+    admin_check = db.execute(text(f"""
+        SELECT ROLE FROM {qt("ORG_MEMBERSHIPS")}
         WHERE USER_ID = :user_id AND ROLE = 'admin'
         LIMIT 1
     """), {"user_id": current_user.user_id})
@@ -1608,8 +1608,8 @@ async def update_enterprise_settings(
     await ensure_warehouse_resumed()
     
     # Update settings
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+    db.execute(text(f"""
+        UPDATE {qt("ORGANIZATIONS")}
         SET SETTINGS = :settings,
             UPDATED_AT = CURRENT_TIMESTAMP()
         WHERE ORG_ID = :org_id
@@ -1654,9 +1654,9 @@ async def export_organization_data(
     await ensure_warehouse_resumed()
     
     # Get organization data
-    org_result = db.execute(text("""
+    org_result = db.execute(text(f"""
         SELECT ORG_ID, ORG_NAME, ADMIN_EMAIL, CREATED_AT, DRIVE_SOURCES, SETTINGS
-        FROM THIRDEYE_DEV.PUBLIC.ORGANIZATIONS
+        FROM {qt("ORGANIZATIONS")}
         WHERE ORG_ID = :org_id
         LIMIT 1
     """), {"org_id": org_id})
@@ -1675,10 +1675,10 @@ async def export_organization_data(
         )
     
     # Get members
-    members_result = db.execute(text("""
+    members_result = db.execute(text(f"""
         SELECT U.USER_ID, U.NAME, U.EMAIL, OM.ROLE, OM.JOINED_AT
-        FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS OM
-        JOIN THIRDEYE_DEV.PUBLIC.USERS U ON OM.USER_ID = U.USER_ID
+        FROM {qt("ORG_MEMBERSHIPS")} OM
+        JOIN {qt("USERS")} U ON OM.USER_ID = U.USER_ID
         WHERE OM.ORG_ID = :org_id
     """), {"org_id": org_id})
     members_rows = members_result.fetchall()
@@ -1700,8 +1700,8 @@ async def export_organization_data(
             "name": org_row[1] or "",
             "adminEmail": org_row[2] or "",
             "createdAt": org_row[3].isoformat() if org_row[3] else None,
-            "driveSources": org_row[4] if isinstance(org_row[4], list) else [],
-            "settings": org_row[5] if isinstance(org_row[5], dict) else {}
+            "driveSources": safe_variant(org_row[4], list),
+            "settings": safe_variant(org_row[5], dict)
         },
         "members": members,
         "exportedAt": datetime.now().isoformat(),

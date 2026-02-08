@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional, List
 from .base_agent import BaseAgent
 from services.gemini_client import GeminiClient
 from services.google_drive_client import GoogleDriveClient
-from utils.database import engine, ensure_warehouse_resumed
+from utils.database import engine, ensure_warehouse_resumed, qualified_table as qt
 from sqlalchemy import text
 import json
 import uuid
@@ -117,7 +117,7 @@ class PersonaArchitect(BaseAgent):
             with engine.connect() as conn:
                 # Query DOCUMENTS table for user's documents
                 # Note: This assumes documents are linked via ORG_ID -> ORG_MEMBERSHIPS -> USER_ID
-                result = conn.execute(text("""
+                result = conn.execute(text(f"""
                     SELECT 
                         D.DOC_ID,
                         D.TITLE,
@@ -125,8 +125,8 @@ class PersonaArchitect(BaseAgent):
                         D.CREATED_AT,
                         D.UPDATED_AT,
                         D.CONFUSION_DENSITY
-                    FROM THIRDEYE_DEV.PUBLIC.DOCUMENTS D
-                    JOIN THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS OM ON D.ORG_ID = OM.ORG_ID
+                    FROM {qt("DOCUMENTS")} D
+                    JOIN {qt("ORG_MEMBERSHIPS")} OM ON D.ORG_ID = OM.ORG_ID
                     WHERE OM.USER_ID = :user_id
                     ORDER BY D.UPDATED_AT DESC
                     LIMIT 50
@@ -233,13 +233,13 @@ class PersonaArchitect(BaseAgent):
             with engine.connect() as conn:
                 # Query SESSIONS for search-related data
                 # Note: Search queries might be stored in session metadata or NOTEBOOK_ENTRIES
-                result = conn.execute(text("""
+                result = conn.execute(text(f"""
                     SELECT 
                         S.SESSION_ID,
                         S.TITLE,
                         S.CREATED_AT,
                         S.METADATA
-                    FROM THIRDEYE_DEV.PUBLIC.SESSIONS S
+                    FROM {qt("SESSIONS")} S
                     WHERE S.USER_ID = :user_id
                     ORDER BY S.CREATED_AT DESC
                     LIMIT 100
@@ -267,14 +267,14 @@ class PersonaArchitect(BaseAgent):
         
         try:
             with engine.connect() as conn:
-                result = conn.execute(text("""
+                result = conn.execute(text(f"""
                     SELECT 
                         S.SESSION_ID,
                         S.TITLE,
                         S.CREATED_AT,
                         S.DURATION_SECONDS,
                         S.METADATA
-                    FROM THIRDEYE_DEV.PUBLIC.SESSIONS S
+                    FROM {qt("SESSIONS")} S
                     WHERE S.USER_ID = :user_id
                     ORDER BY S.CREATED_AT DESC
                     LIMIT 100
@@ -304,9 +304,9 @@ class PersonaArchitect(BaseAgent):
         try:
             with engine.connect() as conn:
                 # Get sessions with history data from metadata
-                result = conn.execute(text("""
+                result = conn.execute(text(f"""
                     SELECT SESSION_ID, METADATA, STARTED_AT
-                    FROM THIRDEYE_DEV.PUBLIC.SESSIONS
+                    FROM {qt("SESSIONS")}
                     WHERE USER_ID = :user_id
                       AND STARTED_AT >= DATEADD(day, -:days_back, CURRENT_TIMESTAMP())
                       AND METADATA IS NOT NULL
@@ -604,16 +604,16 @@ Return a JSON object with this structure:
             
             with engine.connect() as conn:
                 # Mark previous persona cards as not current
-                update_old = text("""
-                    UPDATE THIRDEYE_DEV.PUBLIC.PERSONA_CARDS
+                update_old = text(f"""
+                    UPDATE {qt("PERSONA_CARDS")}
                     SET IS_CURRENT = FALSE
                     WHERE USER_ID = :user_id
                 """)
                 conn.execute(update_old, {"user_id": user_id})
                 
                 # Insert new persona card
-                insert_query = text("""
-                    INSERT INTO THIRDEYE_DEV.PUBLIC.PERSONA_CARDS (
+                insert_query = text(f"""
+                    INSERT INTO {qt("PERSONA_CARDS")} (
                         PERSONA_ID, USER_ID, PERSONA_CARD, CREATED_AT, UPDATED_AT, IS_CURRENT
                     ) VALUES (
                         :persona_id, :user_id, PARSE_JSON(:persona_card_json), 

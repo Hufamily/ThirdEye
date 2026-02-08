@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional, List
 from .base_agent import BaseAgent
 from services.k2think_client import K2ThinkClient
 from services.gemini_client import GeminiClient
-from utils.database import engine, ensure_warehouse_resumed
+from utils.database import engine, ensure_warehouse_resumed, qualified_table as qt
 from sqlalchemy import text
 import json
 import re
@@ -155,18 +155,7 @@ Output JSON:
   "key_points": ["key concept 1", "key concept 2", "key concept 3"]
 }}"""
         
-        if self.k2think:
-            try:
-                result = await self.k2think.reason(
-                    query=prompt,
-                    max_steps=3,
-                    temperature=0.4
-                )
-                return self._parse_explanation_result(result, "instant")
-            except Exception as e:
-                print(f"K2-Think instant HUD failed: {e}, trying Gemini fallback")
-        
-        # Try Gemini fallback
+        # Gemini Flash is primary — fast and cheap for generation tasks
         if self.gemini:
             try:
                 gemini_result = await self.gemini.analyze(
@@ -190,7 +179,19 @@ Output JSON:
                     "key_points": parsed.get("key_points", [])
                 }
             except Exception as e:
-                print(f"Gemini instant HUD fallback failed: {e}")
+                print(f"Gemini instant HUD failed: {e}, trying K2-Think fallback")
+        
+        # K2-Think fallback (slower, deep reasoning — overkill for generation but works)
+        if self.k2think:
+            try:
+                result = await self.k2think.reason(
+                    query=prompt,
+                    max_steps=3,
+                    temperature=0.4
+                )
+                return self._parse_explanation_result(result, "instant")
+            except Exception as e:
+                print(f"K2-Think instant HUD fallback failed: {e}")
         
         # Final fallback
         return self._fallback_instant_hud(hypothesis, content, learning_style)
@@ -238,21 +239,7 @@ Output JSON:
   "examples": ["example 1", "example 2", "example 3"]
 }}"""
         
-        if self.k2think:
-            try:
-                result = await self.k2think.generate_explanation(
-                    concept=hypothesis.get("hypothesis", ""),
-                    gap_analysis=json.dumps(hypothesis),
-                    user_context={
-                        "learning_style": learning_style,
-                        "expertise_level": expertise_level
-                    }
-                )
-                return self._parse_explanation_result(result, "deep")
-            except Exception as e:
-                print(f"K2-Think deep dive failed: {e}, trying Gemini fallback")
-        
-        # Try Gemini fallback
+        # Gemini Flash is primary — fast and cheap for generation tasks
         if self.gemini:
             try:
                 gemini_result = await self.gemini.analyze(
@@ -276,7 +263,22 @@ Output JSON:
                     "examples": parsed.get("examples", [])
                 }
             except Exception as e:
-                print(f"Gemini deep dive fallback failed: {e}")
+                print(f"Gemini deep dive failed: {e}, trying K2-Think fallback")
+        
+        # K2-Think fallback (slower, deep reasoning — overkill for generation but works)
+        if self.k2think:
+            try:
+                result = await self.k2think.generate_explanation(
+                    concept=hypothesis.get("hypothesis", ""),
+                    gap_analysis=json.dumps(hypothesis),
+                    user_context={
+                        "learning_style": learning_style,
+                        "expertise_level": expertise_level
+                    }
+                )
+                return self._parse_explanation_result(result, "deep")
+            except Exception as e:
+                print(f"K2-Think deep dive fallback failed: {e}")
         
         # Final fallback
         return self._fallback_deep_dive(hypothesis, content, learning_style)
@@ -516,8 +518,8 @@ Output JSON:
             explanation_id = str(uuid.uuid4())
             
             with engine.connect() as conn:
-                insert_query = text("""
-                    INSERT INTO THIRDEYE_DEV.PUBLIC.EXPLANATIONS (
+                insert_query = text(f"""
+                    INSERT INTO {qt("EXPLANATIONS")} (
                         EXPLANATION_ID, USER_ID, SESSION_ID, ANCHOR_ID, DOC_ID,
                         HYPOTHESIS_ID, EXPLANATION_DATA, CREATED_AT
                     ) VALUES (

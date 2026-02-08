@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional
 from pydantic import BaseModel
 from routes.auth import get_current_user
 from models.user import User
-from utils.database import get_db, ensure_warehouse_resumed
+from utils.database import get_db, ensure_warehouse_resumed, qualified_table as qt
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import json
@@ -53,8 +53,8 @@ async def store_access_token(
         
         # Store in user metadata (or create separate TOKENS table)
         from sqlalchemy import text
-        db.execute(text("""
-            UPDATE THIRDEYE_DEV.PUBLIC.USERS
+        db.execute(text(f"""
+            UPDATE {qt("USERS")}
             SET UPDATED_AT = CURRENT_TIMESTAMP()
             WHERE USER_ID = :user_id
         """), {"user_id": current_user.user_id})

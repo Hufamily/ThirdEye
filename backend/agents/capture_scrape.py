@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional, List
 from .base_agent import BaseAgent
 from services.google_drive_client import GoogleDriveClient
 from services.vision_client import VisionClient
-from utils.database import engine, ensure_warehouse_resumed
+from utils.database import engine, ensure_warehouse_resumed, qualified_table as qt
 from sqlalchemy import text
 import json
 import uuid
@@ -559,8 +559,8 @@ class CaptureScrape(BaseAgent):
             anchor_id = capture_result.get("metadata", {}).get("anchor_id")
             
             with engine.connect() as conn:
-                insert_query = text("""
-                    INSERT INTO THIRDEYE_DEV.PUBLIC.INTERACTIONS (
+                insert_query = text(f"""
+                    INSERT INTO {qt("INTERACTIONS")} (
                         INTERACTION_ID, USER_ID, SESSION_ID, DOC_ID, ANCHOR_ID,
                         INTERACTION_TYPE, CONTENT, METADATA, CREATED_AT
                     ) VALUES (

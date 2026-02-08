@@ -19,6 +19,7 @@ class Organization(Base):
     org_name = Column("ORG_NAME", String(255), nullable=False)
     admin_email = Column("ADMIN_EMAIL", String(255), nullable=False)
     admin_user_id = Column("ADMIN_USER_ID", String(36), ForeignKey("PUBLIC.USERS.USER_ID"))
+    drive_sources = Column("DRIVE_SOURCES", VARIANT)  # JSON array of Google Drive sources
     settings = Column("SETTINGS", VARIANT)  # JSON: classification_rules, privacy_policies, notification_settings
     created_at = Column("CREATED_AT", TIMESTAMP_NTZ, server_default=func.current_timestamp())
     updated_at = Column("UPDATED_AT", TIMESTAMP_NTZ, server_default=func.current_timestamp(), onupdate=func.current_timestamp())

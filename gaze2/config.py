@@ -23,7 +23,7 @@ API_PORT = int(os.getenv("GAZE_API_PORT", "5000"))
 API_DEBUG = os.getenv("GAZE_API_DEBUG", "false").lower() == "true"
 
 # Gaze Tracker Configuration
-Y_OFFSET_CORRECTION = float(os.getenv("GAZE_Y_OFFSET", "0"))
+Y_OFFSET_CORRECTION = float(os.getenv("GAZE_Y_OFFSET", "50"))
 Y_SCALE = float(os.getenv("GAZE_Y_SCALE", "1.0"))
 CALIBRATION_REQUIRED = os.getenv("GAZE_CALIBRATION_REQUIRED", "true").lower() == "true"
 PREVIEW_REQUIRED = os.getenv("GAZE_PREVIEW_REQUIRED", "true").lower() == "true"

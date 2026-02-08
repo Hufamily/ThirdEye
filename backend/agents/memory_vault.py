@@ -6,7 +6,7 @@ Logs interactions for spaced repetition and habit tracking
 
 from typing import Dict, Any, Optional, List
 from .base_agent import BaseAgent
-from utils.database import engine, ensure_warehouse_resumed
+from utils.database import engine, ensure_warehouse_resumed, qualified_table as qt
 from sqlalchemy import text
 from datetime import datetime, timedelta
 import json
@@ -107,8 +107,8 @@ class MemoryVault(BaseAgent):
             await ensure_warehouse_resumed()
             with engine.connect() as conn:
                 # Insert interaction
-                insert_query = text("""
-                    INSERT INTO THIRDEYE_DEV.PUBLIC.INTERACTIONS (
+                insert_query = text(f"""
+                    INSERT INTO {qt("INTERACTIONS")} (
                         USER_ID, SESSION_ID, DOC_ID, ANCHOR_ID, CONTENT,
                         GAP_HYPOTHESIS, EXPLANATION_GIVEN, USER_FEEDBACK,
                         READING_STATE, DWELL_TIME, CONCEPTS, CREATED_AT
@@ -200,9 +200,9 @@ class MemoryVault(BaseAgent):
             await ensure_warehouse_resumed()
             with engine.connect() as conn:
                 # Get interaction count
-                count_query = text("""
+                count_query = text(f"""
                     SELECT COUNT(*) as count
-                    FROM THIRDEYE_DEV.PUBLIC.INTERACTIONS
+                    FROM {qt("INTERACTIONS")}
                     WHERE USER_ID = :user_id
                     AND (:session_id IS NULL OR SESSION_ID = :session_id)
                 """)
@@ -212,9 +212,9 @@ class MemoryVault(BaseAgent):
                 interaction_count = row[0] if row else 0
                 
                 # Get concepts learned
-                concepts_query = text("""
+                concepts_query = text(f"""
                     SELECT DISTINCT CONCEPTS
-                    FROM THIRDEYE_DEV.PUBLIC.INTERACTIONS
+                    FROM {qt("INTERACTIONS")}
                     WHERE USER_ID = :user_id
                     AND CONCEPTS IS NOT NULL
                 """)
@@ -253,12 +253,12 @@ class MemoryVault(BaseAgent):
             await ensure_warehouse_resumed()
             with engine.connect() as conn:
                 # Get sessions in last 30 days
-                sessions_query = text("""
+                sessions_query = text(f"""
                     SELECT 
                         COUNT(DISTINCT SESSION_ID) as session_count,
                         AVG(DWELL_TIME) as avg_dwell_time,
                         COUNT(*) as total_interactions
-                    FROM THIRDEYE_DEV.PUBLIC.INTERACTIONS
+                    FROM {qt("INTERACTIONS")}
                     WHERE USER_ID = :user_id
                     AND CREATED_AT >= DATEADD(day, -30, CURRENT_TIMESTAMP())
                 """)

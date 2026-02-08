@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # Gemini API (for LLM operations)
     gemini_api_key: Optional[str] = None
     
+    # ElevenLabs TTS
+    elevenlabs_api_key: Optional[str] = None
+    elevenlabs_voice_id: Optional[str] = None
+    
     # Server Configuration
     api_host: str = "0.0.0.0"
     api_port: int = 8000

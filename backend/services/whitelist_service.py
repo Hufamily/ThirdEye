@@ -4,7 +4,7 @@ Manages enterprise document whitelisting based on folder paths
 """
 
 from typing import List, Optional, Dict, Any
-from utils.database import engine, ensure_warehouse_resumed
+from utils.database import engine, ensure_warehouse_resumed, qualified_table as qt
 from sqlalchemy import text
 from services.google_drive_client import GoogleDriveClient
 import uuid
@@ -29,7 +29,7 @@ class WhitelistService:
         try:
             await ensure_warehouse_resumed()
             with engine.connect() as conn:
-                query = text("""
+                query = text(f"""
                     SELECT 
                         FOLDER_ID,
                         ORG_ID,
@@ -39,7 +39,7 @@ class WhitelistService:
                         CREATED_AT,
                         UPDATED_AT,
                         IS_ACTIVE
-                    FROM THIRDEYE_DEV.PUBLIC.WHITELISTED_FOLDERS
+                    FROM {qt("WHITELISTED_FOLDERS")}
                     WHERE ORG_ID = :org_id
                     AND IS_ACTIVE = TRUE
                     ORDER BY FOLDER_PATH
@@ -193,9 +193,9 @@ class WhitelistService:
         try:
             await ensure_warehouse_resumed()
             with engine.connect() as conn:
-                query = text("""
+                query = text(f"""
                     SELECT FOLDER_PATH
-                    FROM THIRDEYE_DEV.PUBLIC.DOCUMENTS
+                    FROM {qt("DOCUMENTS")}
                     WHERE DOC_ID = :doc_id
                     AND FOLDER_PATH IS NOT NULL
                 """)
@@ -215,8 +215,8 @@ class WhitelistService:
             await ensure_warehouse_resumed()
             with engine.connect() as conn:
                 # Check if document exists
-                check_query = text("""
-                    SELECT DOC_ID FROM THIRDEYE_DEV.PUBLIC.DOCUMENTS
+                check_query = text(f"""
+                    SELECT DOC_ID FROM {qt("DOCUMENTS")}
                     WHERE DOC_ID = :doc_id
                 """)
                 
@@ -225,8 +225,8 @@ class WhitelistService:
                 
                 if exists:
                     # Update existing document
-                    update_query = text("""
-                        UPDATE THIRDEYE_DEV.PUBLIC.DOCUMENTS
+                    update_query = text(f"""
+                        UPDATE {qt("DOCUMENTS")}
                         SET FOLDER_PATH = :folder_path,
                             UPDATED_AT = CURRENT_TIMESTAMP()
                         WHERE DOC_ID = :doc_id
@@ -237,8 +237,8 @@ class WhitelistService:
                     })
                 else:
                     # Insert new document record (minimal)
-                    insert_query = text("""
-                        INSERT INTO THIRDEYE_DEV.PUBLIC.DOCUMENTS (
+                    insert_query = text(f"""
+                        INSERT INTO {qt("DOCUMENTS")} (
                             DOC_ID, FOLDER_PATH, CREATED_AT, UPDATED_AT
                         ) VALUES (
                             :doc_id, :folder_path, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
@@ -281,8 +281,8 @@ class WhitelistService:
                 # Normalize folder path (ensure starts with /)
                 normalized_path = folder_path if folder_path.startswith("/") else f"/{folder_path}"
                 
-                insert_query = text("""
-                    INSERT INTO THIRDEYE_DEV.PUBLIC.WHITELISTED_FOLDERS (
+                insert_query = text(f"""
+                    INSERT INTO {qt("WHITELISTED_FOLDERS")} (
                         FOLDER_ID, ORG_ID, FOLDER_PATH, FOLDER_ID_GOOGLE,
                         CREATED_BY, CREATED_AT, UPDATED_AT, IS_ACTIVE
                     ) VALUES (
@@ -331,8 +331,8 @@ class WhitelistService:
         try:
             await ensure_warehouse_resumed()
             with engine.connect() as conn:
-                update_query = text("""
-                    UPDATE THIRDEYE_DEV.PUBLIC.WHITELISTED_FOLDERS
+                update_query = text(f"""
+                    UPDATE {qt("WHITELISTED_FOLDERS")}
                     SET IS_ACTIVE = FALSE,
                         UPDATED_AT = CURRENT_TIMESTAMP()
                     WHERE FOLDER_ID = :folder_id

@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, and_, or_, text
-from utils.database import get_db, ensure_warehouse_resumed
+from utils.database import get_db, ensure_warehouse_resumed, qualified_table as qt, safe_variant
 from utils.auth import get_user_id_from_token
 from routes.auth import get_current_user
 from models.user import User
@@ -883,8 +883,8 @@ async def update_persona_settings(
     await ensure_warehouse_resumed()
     
     # Update persona_card in user record
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.USERS
+    db.execute(text(f"""
+        UPDATE {qt("USERS")}
         SET PERSONA_CARD = :persona_card,
             UPDATED_AT = CURRENT_TIMESTAMP()
         WHERE USER_ID = :user_id

@@ -19,14 +19,21 @@ console.log('[ContextGrabber] Script starting to load...');
 // CONFIGURATION - MODIFY THESE FOR YOUR SETUP
 // ============================================================================
 
-/** Gaze tracking API endpoint (GET request) - fallback when WebSocket not connected. gaze2 runs on 5000. */
-const GAZE_API_URL = 'http://127.0.0.1:5000/gaze';
+/** Gaze tracking API endpoint (GET request) - served by the unified backend on 8000. */
+const GAZE_API_URL = 'http://127.0.0.1:8000/api/gaze';
 
 /** Analysis API endpoint (POST request) */
 const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 
 /** Enable/disable gaze tracking (set to false to use cursor-only mode) */
 const ENABLE_GAZE_MODE = true;
+
+/**
+ * Tracking mode — loaded from chrome.storage.local at startup.
+ * Values: 'cursor' | 'gaze' | 'gaze+cursor'
+ * Default: 'gaze+cursor' (gaze preferred, mouse fallback)
+ */
+let trackingMode = 'gaze+cursor';
 
 /** Gaze tracking poll interval in milliseconds */
 const GAZE_POLL_INTERVAL = 200;
@@ -1770,15 +1777,7 @@ function resolveTargetFromPoint(x, y) {
 // ============================================================================
 
 /**
- * Creates and displays the overlay with analysis results
- * 
- * @param {Object} result - Analysis result from backend
- * @param {string} result.summary - Summary text
- * @param {string[]} result.confusion_points - List of confusion points
- * @param {string[]} result.image_queries - List of image queries
- */
-/**
- * Creates the persistent overlay (called once on page load)
+ * Creates the persistent overlay (called once on page load).
  * The overlay stays open and its content is updated in-place.
  */
 function createPersistentOverlay() {
@@ -1824,6 +1823,9 @@ function createPersistentOverlay() {
               <span class="cg-btn-text">Close Session</span>
             </button>
             <button class="cg-toggle-btn" id="cg-toggle-btn" aria-label="Toggle extension" title="Toggle on/off (Ctrl+Shift+G)">&#9654;</button>
+            <button class="cg-mode-btn" id="cg-mode-btn" aria-label="Switch tracking mode" title="Switch tracking mode">
+              <span class="cg-mode-label" id="cg-mode-label">C</span>
+            </button>
             <button class="cg-btn-text-icon" id="cg-chat-btn" aria-label="Expand to Chat" title="Expand to Chat">
               <svg class="cg-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
@@ -1878,6 +1880,13 @@ function createPersistentOverlay() {
     updateToggleButton();
   });
   updateToggleButton(); // Set initial state
+
+  // Mode button: cycle cursor / gaze+cursor / gaze
+  const modeBtn = overlay.querySelector('#cg-mode-btn');
+  if (modeBtn) {
+    modeBtn.addEventListener('click', () => cycleTrackingMode());
+    updateModeIndicator(); // Set initial label
+  }
 
   // Minimize/restore toggle - minimize height instead of width
   const minimizeBtn = overlay.querySelector('.cg-minimize-btn');
@@ -2043,11 +2052,6 @@ function updateOverlayContent(html) {
       overlayContent.style.display = 'block';
     }
   }
-  // #region agent log
-  const debugUpdateContent = {location:'content.js:1872',message:'updateOverlayContent called',data:{hasOverlay:!!currentOverlay,hasBody:!!body,hasOverlayContent:!!overlayContent,htmlLength:html?.length||0,bodyDisplay:body?.style?.display,overlayDisplay:currentOverlay?.style?.display},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
-  console.log('[DEBUG]', JSON.stringify(debugUpdateContent));
-  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugUpdateContent)}).catch(()=>{});
-  // #endregion
 }
 
 /**
@@ -2427,6 +2431,41 @@ function getOverlayStyles() {
 
     .cg-toggle-btn.cg-toggle-paused:hover {
       background: hsl(0, 62.8%, 35%);
+    }
+
+    .cg-mode-btn {
+      background: hsl(0, 0%, 18%);
+      border: 1px solid hsl(0, 0%, 30%);
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      color: hsl(0, 0%, 90%);
+      padding: 0;
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      transition: all 0.2s;
+      margin-right: 4px;
+      letter-spacing: -0.5px;
+    }
+    .cg-mode-btn:hover {
+      background: hsl(0, 0%, 25%);
+      border-color: hsl(0, 0%, 40%);
+    }
+    .cg-mode-btn[data-mode="cursor"] {
+      border-color: hsl(200, 70%, 45%);
+      color: hsl(200, 80%, 65%);
+    }
+    .cg-mode-btn[data-mode="gaze"] {
+      border-color: hsl(130, 60%, 40%);
+      color: hsl(130, 70%, 60%);
+    }
+    .cg-mode-btn[data-mode="gaze+cursor"] {
+      border-color: hsl(45, 70%, 50%);
+      color: hsl(45, 80%, 65%);
     }
 
     .cg-dock-btn {
@@ -3709,7 +3748,8 @@ async function sendChatMessageFromText(messageText) {
   
   // Make sure chat popup is shown
   if (!chatbotExpanded) {
-    toggleChatPopup();
+    chatbotExpanded = true;
+    expandChatbotPanel();
     // Wait for popup to be created before updating messages
     setTimeout(() => {
       updateChatMessages();
@@ -3917,76 +3957,6 @@ async function closeSessionAndSave() {
           setOverlayStatus('Error saving session');
         }
       });
-    });
-    
-    // Create notebook entry with all session data
-    // NOTE: User will specify exact content in next prompt
-    const notebookContent = generateSessionNotebookContent(sessionData);
-    
-    chrome.runtime.sendMessage({
-      type: 'CREATE_NOTEBOOK_ENTRY',
-      data: {
-        sessionId: sessionId,
-        title: `Session: ${document.title || 'Untitled'} - ${new Date().toLocaleDateString()}`,
-        content: notebookContent,
-        context: {
-          url: window.location.href,
-          sessionData: sessionData
-        }
-      }
-    }, async (notebookResponse) => {
-      if (notebookResponse?.success) {
-        // Stop the session on backend
-        chrome.runtime.sendMessage({
-          type: 'STOP_SESSION',
-          data: { sessionId: sessionId }
-        }, (stopResponse) => {
-          // Disable extension completely
-          extensionEnabled = false;
-          
-          // Hide overlay
-          if (currentOverlay) {
-            currentOverlay.style.display = 'none';
-          }
-          
-          // Clear session data
-          chrome.storage.local.remove(['currentSessionId']);
-          chatMessages = [];
-          recentCaptures = [];
-          
-          // Update toggle button to show paused state
-          updateToggleButton();
-          
-          // Notify background about state change
-          chrome.runtime.sendMessage({ 
-            type: 'EXTENSION_STATE_CHANGED', 
-            enabled: false 
-          }).catch(() => {}); // Ignore if background not ready
-          
-          // Update UI
-          setOverlayStatus('Session closed');
-          if (closeBtn) {
-            closeBtn.disabled = false;
-            closeBtn.querySelector('.cg-btn-text').textContent = 'Close Session';
-          }
-          
-          // Show success message
-          updateOverlayContent(`
-            <div class="cg-section">
-              <p style="color: hsl(0, 0%, 43.1%); font-weight: 600;">Session Closed</p>
-              <p>Your session has been saved to your notebook.</p>
-              <p class="cg-hint">Click the play button to start a new session.</p>
-            </div>
-          `);
-        });
-      } else {
-        alert('Failed to save session to notebook: ' + (notebookResponse?.error || 'Unknown error'));
-        if (closeBtn) {
-          closeBtn.disabled = false;
-          closeBtn.querySelector('.cg-btn-text').textContent = 'Close Session';
-        }
-        setOverlayStatus('Error saving session');
-      }
     });
   });
 }
@@ -4280,6 +4250,36 @@ function updateToggleButton() {
       toggleBtn.classList.add('cg-toggle-paused');
     }
   }
+  updateModeIndicator();
+}
+
+/**
+ * Updates the tracking-mode button label and colour in the overlay header.
+ * Labels: C = cursor, G = gaze, G+C = gaze+cursor
+ */
+function updateModeIndicator() {
+  if (!currentOverlay) return;
+  const btn = currentOverlay.querySelector('#cg-mode-btn');
+  if (!btn) return;
+  const labels = { 'cursor': 'C', 'gaze': 'G', 'gaze+cursor': 'G+C' };
+  const titles = {
+    'cursor': 'Tracking: Cursor only (click to switch)',
+    'gaze': 'Tracking: Gaze only (click to switch)',
+    'gaze+cursor': 'Tracking: Gaze + Cursor fallback (click to switch)'
+  };
+  btn.dataset.mode = trackingMode;
+  btn.querySelector('#cg-mode-label').textContent = labels[trackingMode] || 'C';
+  btn.title = titles[trackingMode] || titles['cursor'];
+}
+
+/**
+ * Cycles through tracking modes: cursor → gaze+cursor → gaze → cursor …
+ */
+function cycleTrackingMode() {
+  const order = ['cursor', 'gaze+cursor', 'gaze'];
+  const idx = order.indexOf(trackingMode);
+  const next = order[(idx + 1) % order.length];
+  chrome.storage.local.set({ tracking_mode: next }); // triggers onChanged listener
 }
 
 // Keyboard shortcut to toggle extension: Ctrl+Shift+G (or Cmd+Shift+G on Mac)
@@ -4339,6 +4339,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'SHOW_AGENT_RESULTS') {
     showAgentResultsOverlay(message.data.orchestrationResult, message.data.relevantWebpages || []);
     sendResponse({ success: true });
+  }
+
   // Real-time gaze updates from WebSocket or HTTP poll (gaze2 stream)
   if (message.type === 'GAZE_UPDATE') {
     const raw = message.data;
@@ -4445,19 +4447,13 @@ function handleGrabContext() {
 // ============================================================================
 
 /**
- * Displays Google search results in the overlay
- * 
+ * Updates the persistent overlay with Google search results.
+ * Includes snapshot preview and tabs for Web / Images.
+ *
  * @param {Object} data - Search result data
  * @param {string} data.query - The search query used
  * @param {Array} data.results - Array of {title, url, snippet}
  * @param {string} data.sourceUrl - The page URL where context was grabbed
- */
-/**
- * Updates the persistent overlay with Google search results
- */
-/**
- * Updates the persistent overlay with Google search results.
- * Includes snapshot preview and tabs for Web / Images.
  */
 function showSearchResultsOverlay(data) {
   let html = '';
@@ -4647,11 +4643,6 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   const agent3 = agents['3.0'] || agents['gap_hypothesis'] || {};
   const agent4 = agents['4.0'] || agents['explanation_composer'] || {};
   
-  // #region agent log
-  const debugAgentData = {location:'content.js:4405',message:'agent data extracted',data:{agent2Keys:Object.keys(agent2),agent3Keys:Object.keys(agent3),agent4Keys:Object.keys(agent4),hasContentType:!!agent2.content_type,hasConcepts:!!(agent2.concepts?.length),hasCandidates:!!(agent3.candidates?.length),hasInstantHud:!!agent4.instant_hud,hasDeepDive:!!agent4.deep_dive,agent2Sample:JSON.stringify(agent2).substring(0,200),agent3Sample:JSON.stringify(agent3).substring(0,200),agent4Sample:JSON.stringify(agent4).substring(0,200)},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
-  console.log('[DEBUG]', JSON.stringify(debugAgentData));
-  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugAgentData)}).catch(()=>{});
-  // #endregion
   
   // Get winning hypothesis
   let winningHypothesis = null;
@@ -4661,15 +4652,13 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
     winningHypothesis = agent3.candidates[0];
   }
   
-  // #region agent log
-  const debugShowOverlay = {location:'content.js:4399',message:'showAgentResultsOverlay called',data:{hasResult:!!orchestrationResult,hasData:!!orchestrationResult?.data,hasAgents:!!(orchestrationResult?.data?.agents),agentKeys:orchestrationResult?.data?.agents?Object.keys(orchestrationResult.data.agents):[],webpageCount:relevantWebpages?.length||0,hasWinningHypothesis:!!winningHypothesis},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
-  console.log('[DEBUG]', JSON.stringify(debugShowOverlay));
-  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugShowOverlay)}).catch(()=>{});
-  // #endregion
   
   let html = '';
   
-  // Snapshot preview removed per user request - no longer showing snapshot UI
+  // Snapshot preview
+  if (lastSnapshotDataUrl) {
+    html += `<div class="cg-section"><strong>Snapshot</strong><div class="cg-snapshot-wrap"><img src="${lastSnapshotDataUrl}" class="cg-snapshot-img" alt="Area snapshot" /></div></div>`;
+  }
   
   // Tab bar: Summary | Explanation | Resources
   html += '<div class="cg-tab-bar">';
@@ -4775,6 +4764,20 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
     html += '</div>';
   }
   
+  // ── Read Aloud (TTS) button ──
+  {
+    // Gather text that would be spoken
+    const hudText = agent4.instant_hud ? (agent4.instant_hud.summary || agent4.instant_hud.body || '') : '';
+    const diveText = agent4.deep_dive ? (agent4.deep_dive.explanation || agent4.deep_dive.full_explanation || '') : '';
+    const spokenText = (hudText + ' ' + diveText).trim();
+    if (spokenText) {
+      html += `<div style="margin-top:10px;text-align:right;">`;
+      html += `<button id="cg-tts-btn" data-tts-text="${escapeHtml(spokenText)}" `;
+      html += `style="background:hsl(210,80%,50%);color:#fff;border:none;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;gap:6px;">`;
+      html += `<span style="font-size:16px;">&#128266;</span> Read Aloud</button></div>`;
+    }
+  }
+  
   html += '</div>';
   
   // Resources Tab
@@ -4796,21 +4799,11 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   }
   html += '</div>';
   
-  // #region agent log
-  const debugBeforeUpdate = {location:'content.js:4522',message:'about to update overlay content',data:{htmlLength:html.length,hasCurrentOverlay:!!currentOverlay},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
-  console.log('[DEBUG]', JSON.stringify(debugBeforeUpdate));
-  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugBeforeUpdate)}).catch(()=>{});
-  // #endregion
   
   updateOverlayContent(html);
   setOverlayStatus('Analysis complete');
   activeTab = 'summary';
   
-  // #region agent log
-  const debugAfterUpdate = {location:'content.js:4525',message:'overlay content updated',data:{hasCurrentOverlay:!!currentOverlay,overlayVisible:currentOverlay?.style?.display!=='none'},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
-  console.log('[DEBUG]', JSON.stringify(debugAfterUpdate));
-  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugAfterUpdate)}).catch(()=>{});
-  // #endregion
   
   // Wire up tab switching
   const tabs = currentOverlay.querySelectorAll('.cg-tab');
@@ -4826,6 +4819,69 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
       activeTab = panelId;
     });
   });
+  
+  // Wire up Read Aloud (TTS) button
+  const ttsBtn = currentOverlay.querySelector('#cg-tts-btn');
+  if (ttsBtn) {
+    ttsBtn.addEventListener('click', async () => {
+      const text = ttsBtn.getAttribute('data-tts-text');
+      if (!text) return;
+      
+      // Toggle: if already playing, stop
+      if (ttsBtn.dataset.playing === 'true') {
+        if (window._thirdeyeTTSAudio) {
+          window._thirdeyeTTSAudio.pause();
+          window._thirdeyeTTSAudio = null;
+        }
+        ttsBtn.innerHTML = '<span style="font-size:16px;">&#128266;</span> Read Aloud';
+        ttsBtn.dataset.playing = 'false';
+        return;
+      }
+      
+      ttsBtn.innerHTML = '<span style="font-size:16px;">&#9203;</span> Loading\u2026';
+      ttsBtn.dataset.playing = 'true';
+      
+      try {
+        const storageData = await new Promise((resolve) => {
+          chrome.storage.local.get(['api_base_url', 'auth_token'], (result) => {
+            resolve({
+              apiBase: result.api_base_url || 'http://localhost:8000',
+              authToken: result.auth_token || null
+            });
+          });
+        });
+        
+        const headers = { 'Content-Type': 'application/json' };
+        if (storageData.authToken) headers['Authorization'] = `Bearer ${storageData.authToken}`;
+        
+        const resp = await fetch(`${storageData.apiBase}/api/tts`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ text })
+        });
+        if (!resp.ok) throw new Error(`TTS API ${resp.status}`);
+        
+        const blob = await resp.blob();
+        const audioUrl = URL.createObjectURL(blob);
+        const audio = new Audio(audioUrl);
+        window._thirdeyeTTSAudio = audio;
+        
+        ttsBtn.innerHTML = '<span style="font-size:16px;">&#9209;</span> Stop';
+        
+        audio.onended = () => {
+          ttsBtn.innerHTML = '<span style="font-size:16px;">&#128266;</span> Read Aloud';
+          ttsBtn.dataset.playing = 'false';
+          URL.revokeObjectURL(audioUrl);
+          window._thirdeyeTTSAudio = null;
+        };
+        audio.play();
+      } catch (err) {
+        console.error('[ThirdEye] TTS error:', err);
+        ttsBtn.innerHTML = '<span style="font-size:16px;">&#128266;</span> Read Aloud';
+        ttsBtn.dataset.playing = 'false';
+      }
+    });
+  }
 }
 
 // ============================================================================
@@ -4840,14 +4896,6 @@ function distance(a, b) {
 }
 
 /**
- * Sends the context image snapshot to the backend analysis API.
- * Backend receives image and returns analysis results (e.g., OCR, visual search, etc.).
- * Expects backend to return: { success: boolean, results?: [{title, url, snippet}] }
- *
- * @param {string} imageDataUrl - Data URL of the snapshot image
- * @returns {Promise<Array|null>} - Array of results or null on error/timeout
- */
-/**
  * Send screenshot to Agent 1.0 (Capture & Scrape) API
  * @param {string} imageDataUrl - Screenshot as data URL
  * @param {string} url - Current page URL
@@ -4856,11 +4904,6 @@ function distance(a, b) {
  * @returns {Promise<Object|null>} Agent 1.0 response or null
  */
 async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtraction) {
-  // #region agent log
-  const debugEntry = {location:'content.js:4569',message:'sendScreenshotToAgent10 entry',data:{hasImage:!!imageDataUrl,url:url?.substring(0,50),textLen:textExtraction?.length||0},timestamp:Date.now(),runId:'run1',hypothesisId:'A,B,C,D,E,F'};
-  console.log('[DEBUG]', JSON.stringify(debugEntry));
-  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugEntry)}).catch(()=>{});
-  // #endregion
   if (!imageDataUrl) return null;
   
   try {
@@ -4875,11 +4918,6 @@ async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtract
         });
       });
     });
-    // #region agent log
-    const debugStorage = {location:'content.js:4584',message:'storage data retrieved',data:{apiBase:storageData.apiBase,hasAuth:!!storageData.authToken,hasUserId:!!storageData.userId,hasSessionId:!!storageData.sessionId},timestamp:Date.now(),runId:'run1',hypothesisId:'F'};
-    console.log('[DEBUG]', JSON.stringify(debugStorage));
-    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugStorage)}).catch(()=>{});
-    // #endregion
     
     // First, call Agent 1.0 to capture content
     const agent10Url = `${storageData.apiBase}/api/agents/capture-scrape`;
@@ -4916,36 +4954,16 @@ async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtract
     });
     
     clearTimeout(timeoutId1);
-    // #region agent log
-    const debugCaptureResp = {location:'content.js:4619',message:'capture response received',data:{status:captureResponse.status,ok:captureResponse.ok,url:agent10Url.substring(0,60)},timestamp:Date.now(),runId:'run1',hypothesisId:'B'};
-    console.log('[DEBUG]', JSON.stringify(debugCaptureResp));
-    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCaptureResp)}).catch(()=>{});
-    // #endregion
     
     if (!captureResponse.ok) {
       console.warn('[ContextGrabber] Agent 1.0 returned status:', captureResponse.status);
-      // #region agent log
-      const debugCaptureFail = {location:'content.js:4623',message:'capture endpoint failed',data:{status:captureResponse.status},timestamp:Date.now(),runId:'run1',hypothesisId:'B'};
-      console.log('[DEBUG]', JSON.stringify(debugCaptureFail));
-      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCaptureFail)}).catch(()=>{});
-      // #endregion
       return null;
     }
     
     const captureResult = await captureResponse.json();
-    // #region agent log
-    const debugCaptureResult = {location:'content.js:4628',message:'capture result parsed',data:{success:captureResult.success,hasData:!!captureResult.data,error:captureResult.error},timestamp:Date.now(),runId:'run1',hypothesisId:'B'};
-    console.log('[DEBUG]', JSON.stringify(debugCaptureResult));
-    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCaptureResult)}).catch(()=>{});
-    // #endregion
     
     if (!captureResult.success || !captureResult.data) {
       console.warn('[ContextGrabber] Agent 1.0 failed:', captureResult.error);
-      // #region agent log
-      const debugCaptureInvalid = {location:'content.js:4630',message:'capture result invalid returning partial',data:{success:captureResult.success,hasData:!!captureResult.data},timestamp:Date.now(),runId:'run1',hypothesisId:'B'};
-      console.log('[DEBUG]', JSON.stringify(debugCaptureInvalid));
-      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCaptureInvalid)}).catch(()=>{});
-      // #endregion
       // Return with success=false so caller knows capture failed
       return {
         success: false,
@@ -4977,19 +4995,9 @@ async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtract
     });
     
     clearTimeout(timeoutId2);
-    // #region agent log
-    const debugOrchResp = {location:'content.js:4652',message:'orchestration response received',data:{status:orchestrateResponse.status,ok:orchestrateResponse.ok,url:orchestrateUrl.substring(0,60)},timestamp:Date.now(),runId:'run1',hypothesisId:'C'};
-    console.log('[DEBUG]', JSON.stringify(debugOrchResp));
-    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugOrchResp)}).catch(()=>{});
-    // #endregion
     
     if (!orchestrateResponse.ok) {
       console.warn('[ContextGrabber] Orchestration returned status:', orchestrateResponse.status);
-      // #region agent log
-      const debugOrchFail = {location:'content.js:4657',message:'orchestration endpoint failed returning capture only',data:{status:orchestrateResponse.status},timestamp:Date.now(),runId:'run1',hypothesisId:'C'};
-      console.log('[DEBUG]', JSON.stringify(debugOrchFail));
-      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugOrchFail)}).catch(()=>{});
-      // #endregion
       // Return result with success=false when orchestration fails, so caller knows it failed
       return {
         success: false,
@@ -5002,19 +5010,9 @@ async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtract
     }
     
     const orchestrateResult = await orchestrateResponse.json();
-    // #region agent log
-    const debugOrchResult = {location:'content.js:4662',message:'orchestration result parsed',data:{success:orchestrateResult.success,hasData:!!orchestrateResult.data,hasAgents:!!(orchestrateResult.data?.agents),agentKeys:orchestrateResult.data?.agents?Object.keys(orchestrateResult.data.agents):[],error:orchestrateResult.error},timestamp:Date.now(),runId:'run1',hypothesisId:'D,E'};
-    console.log('[DEBUG]', JSON.stringify(debugOrchResult));
-    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugOrchResult)}).catch(()=>{});
-    // #endregion
     
     // Check if orchestration actually succeeded
     if (!orchestrateResult.success || !orchestrateResult.data) {
-      // #region agent log
-      const debugOrchFailed = {location:'content.js:4708',message:'orchestration result has success=false',data:{success:orchestrateResult.success,hasData:!!orchestrateResult.data,error:orchestrateResult.error},timestamp:Date.now(),runId:'run1',hypothesisId:'D'};
-      console.log('[DEBUG]', JSON.stringify(debugOrchFailed));
-      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugOrchFailed)}).catch(()=>{});
-      // #endregion
       return {
         success: false,
         data: {
@@ -5034,18 +5032,8 @@ async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtract
       },
       error: orchestrateResult.error
     };
-    // #region agent log
-    const debugMerged = {location:'content.js:4670',message:'sendScreenshotToAgent10 returning merged result',data:{success:mergedResult.success,hasOrchestration:!!mergedResult.data.orchestration,hasAgents:!!(mergedResult.data.orchestration?.agents),agentKeys:mergedResult.data.orchestration?.agents?Object.keys(mergedResult.data.orchestration.agents):[]},timestamp:Date.now(),runId:'run1',hypothesisId:'D,E'};
-    console.log('[DEBUG]', JSON.stringify(debugMerged));
-    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugMerged)}).catch(()=>{});
-    // #endregion
     return mergedResult;
   } catch (err) {
-    // #region agent log
-    const debugException = {location:'content.js:4671',message:'sendScreenshotToAgent10 exception caught',data:{name:err.name,message:err.message,isAbort:err.name==='AbortError',isFetchError:err.message?.includes('Failed to fetch')},timestamp:Date.now(),runId:'run1',hypothesisId:'A'};
-    console.log('[DEBUG]', JSON.stringify(debugException));
-    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugException)}).catch(()=>{});
-    // #endregion
     if (err.name === 'AbortError') {
       console.warn('[ContextGrabber] Request timed out');
     } else if (err.message && err.message.includes('Failed to fetch')) {
@@ -5270,202 +5258,134 @@ async function triggerSearchFromPoint(x, y, snapshotSize = SNAPSHOT_SIZE) {
     }).catch(() => {}); // Ignore errors
   }
 
-  // --- AGENT ORCHESTRATION FLOW (Primary Method) ---
-  // Always try to use agents, with or without snapshot
-  let agentFlowCompleted = false;
-  
-  // 1) Try to capture a snapshot of the area around the dwell point
+  // --- BACKEND HEALTH CHECK ---
+  // Quick probe routed through the background script (which can fetch localhost
+  // without CORS/CSP restrictions that block content-script fetches).
+  const HEALTH_CHECK_TIMEOUT_MS = 1500;
+  let backendAvailable = false;
   try {
-    const snapshot = await captureAreaSnapshot(x, y);
+    const hcResult = await new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        { type: 'BACKEND_HEALTH_CHECK', timeoutMs: HEALTH_CHECK_TIMEOUT_MS },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            resolve({ available: false });
+          } else {
+            resolve(response || { available: false });
+          }
+        }
+      );
+    });
+    backendAvailable = hcResult.available === true;
+  } catch (_) {
+    backendAvailable = false;
+  }
+
+  if (!backendAvailable) {
+    console.warn('[ContextGrabber] Backend unreachable — skipping agent flow');
+  }
+
+  // --- 1) CAPTURE SNAPSHOT ---
+  try {
+    const snapshot = await captureAreaSnapshot(x, y, snapshotSize);
     lastSnapshotDataUrl = snapshot;
   } catch (err) {
     console.warn('[ContextGrabber] Snapshot capture failed:', err);
     lastSnapshotDataUrl = null;
-    
-    // Check if it's a permission error
+
     const errorMsg = err.message || err.toString();
-    if (errorMsg.includes('activeTab') || errorMsg.includes('not been invoked') || 
+    if (errorMsg.includes('activeTab') || errorMsg.includes('not been invoked') ||
         errorMsg.includes('permission') || errorMsg.includes('Permission')) {
-      console.warn('[ContextGrabber] Screenshot permission not available, will use text-only for agents');
-      // Continue without snapshot - agents can work with text only
-  // --- SCREENSHOT API PRIORITY MODE ---
-  if (SCREENSHOT_PRIORITY === 'api-only' || SCREENSHOT_PRIORITY === 'api-first') {
-    // 1) Capture a snapshot of the area around the dwell point
-    try {
-      const snapshot = await captureAreaSnapshot(x, y, snapshotSize);
-      lastSnapshotDataUrl = snapshot;
-    } catch (err) {
-      console.warn('[ContextGrabber] Snapshot capture failed:', err);
-      lastSnapshotDataUrl = null;
-      
-      // Check if it's a permission error
-      const errorMsg = err.message || err.toString();
-      if (errorMsg.includes('activeTab') || errorMsg.includes('not been invoked') || 
-          errorMsg.includes('permission') || errorMsg.includes('Permission')) {
-        // Show warning but continue with text-based search
-        if (SCREENSHOT_PRIORITY === 'api-only') {
-          showErrorOverlay('Permission Required', 
-            'Please click the ThirdEye extension icon in your browser toolbar first to enable screenshot capture. ' +
-            'This grants the extension permission to capture screenshots.');
-          return; // Only return early in api-only mode
-        } else {
-          // In api-first mode, show info and continue with Google search
-          console.warn('[ContextGrabber] Screenshot permission not available, using text-based search');
-          // Don't show error overlay - just log and continue
-        }
-      }
-    }
-  }
-
-  // 2) Send to Agent 1.0 (Capture & Scrape) API and orchestrate
-  // Try with snapshot if available, or text-only if not
-  try {
-    console.log('[ContextGrabber] Sending to Agent 1.0 API...');
-    setOverlayStatus('Extracting content...');
-    
-    const agent10Result = await sendScreenshotToAgent10(lastSnapshotDataUrl, url, { x, y }, text);
-    // #region agent log
-    const debugResultReceived = {location:'content.js:4922',message:'agent10Result received in triggerSearchFromPoint',data:{isNull:!agent10Result,hasSuccess:!!(agent10Result?.success),success:agent10Result?.success,hasData:!!agent10Result?.data,hasOrchestration:!!(agent10Result?.data?.orchestration),hasAgents:!!(agent10Result?.data?.orchestration?.agents),agentKeys:agent10Result?.data?.orchestration?.agents?Object.keys(agent10Result.data.orchestration.agents):[]},timestamp:Date.now(),runId:'run1',hypothesisId:'A,B,C,D,E'};
-    console.log('[DEBUG]', JSON.stringify(debugResultReceived));
-    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugResultReceived)}).catch(()=>{});
-    // #endregion
-    if (agent10Result && agent10Result.success) {
-      // The structure from sendScreenshotToAgent10 is:
-      // { success: true, data: { capture: {...}, orchestration: { agents: {...} } } }
-      const resultData = agent10Result.data || {};
-      const captureData = resultData.capture || resultData;
-      const orchestrationData = resultData.orchestration;
-      
-      console.log('[ContextGrabber] Agent 1.0 result structure:', {
-        hasCapture: !!captureData,
-        hasOrchestration: !!orchestrationData,
-        dataKeys: Object.keys(resultData),
-        orchestrationKeys: orchestrationData ? Object.keys(orchestrationData) : []
-    // 2) Send to backend image analysis API
-    let backendResults = null;
-    const currentApiUrl = await getAnalyzeApiUrl();
-    if (lastSnapshotDataUrl && currentApiUrl) {
-      console.log('[ContextGrabber] Sending snapshot to backend analysis...');
-      setOverlayStatus('Analyzing screenshot...');
-      backendResults = await sendImageToBackend(lastSnapshotDataUrl);
-      
-      // If backend failed, show helpful message (only for api-only mode)
-      if (!backendResults && SCREENSHOT_PRIORITY === 'api-only') {
-        const backendUrl = currentApiUrl || 'configured endpoint';
-        showErrorOverlay('Backend Unavailable', 
-          'The analysis backend is not responding. Please check if the backend server is running at ' + backendUrl + 
-          '. Falling back to text-based search.');
-        // Don't return - let it fall through to Google search
-      }
-    }
-
-    // 3) If backend returned results, display them
-    if (backendResults && backendResults.length > 0) {
-      console.log('[ContextGrabber] Backend provided', backendResults.length, 'results');
-      showSearchResultsOverlay({
-        query: text.substring(0, 60) + '...',
-        results: backendResults
-      });
-      // #region agent log
-      const debugExtracted = {location:'content.js:4930',message:'extracted orchestration data',data:{hasOrchestration:!!orchestrationData,orchestrationKeys:orchestrationData?Object.keys(orchestrationData):[],hasAgents:!!(orchestrationData?.agents),agentKeys:orchestrationData?.agents?Object.keys(orchestrationData.agents):[]},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
-      console.log('[DEBUG]', JSON.stringify(debugExtracted));
-      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugExtracted)}).catch(()=>{});
-      // #endregion
-      
-      // Use extracted text if better than DOM extraction
-      if (captureData?.extracted_text && captureData.extracted_text.length > text.length) {
-        text = captureData.extracted_text;
-        console.log('[ContextGrabber] Using Agent 1.0 extracted text (better than DOM)');
-      }
-      
-      // Check if orchestration result is available
-      const agents = orchestrationData?.agents || {};
-      // #region agent log
-      const debugAgentsCheck = {location:'content.js:4944',message:'checking agents object',data:{hasAgents:!!agents,agentCount:Object.keys(agents).length,agentKeys:Object.keys(agents),agent2Full:JSON.stringify(agents['2.0']||{}).substring(0,500),agent3Full:JSON.stringify(agents['3.0']||{}).substring(0,500),agent4Full:JSON.stringify(agents['4.0']||{}).substring(0,500),orchestrationDataFull:JSON.stringify(orchestrationData).substring(0,1000)},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
-      console.log('[DEBUG]', JSON.stringify(debugAgentsCheck));
-      console.log('[DEBUG FULL] Orchestration data:', JSON.stringify(orchestrationData, null, 2));
-      console.log('[DEBUG FULL] Agents:', JSON.stringify(agents, null, 2));
-      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugAgentsCheck)}).catch(()=>{});
-      // #endregion
-      
-      if (agents && Object.keys(agents).length > 0) {
-        console.log('[ContextGrabber] Orchestration complete, processing results. Agents:', Object.keys(agents));
-        setOverlayStatus('Processing agent results...');
-        
-        // Extract concepts and hypothesis for web search
-        const agent2 = agents['2.0'] || agents['target_interpreter'] || {};
-        const agent3 = agents['3.0'] || agents['gap_hypothesis'] || {};
-        
-        // Get winning hypothesis
-        let winningHypothesis = null;
-        if (agent3.candidates && agent3.winning_hypothesis) {
-          winningHypothesis = agent3.candidates.find(c => c.id === agent3.winning_hypothesis) || agent3.candidates[0];
-        }
-        
-        // Search for relevant webpages
-        const concepts = agent2.concepts || [];
-        setOverlayStatus('Finding relevant resources...');
-        const relevantWebpages = await searchRelevantWebpages(concepts, winningHypothesis);
-        
-        // Display agent results
-        showAgentResultsOverlay({
-          success: true,
-          data: {
-            agents: agents,
-            capture: captureData
-          }
-        }, relevantWebpages);
-        
-        // Auto-save to notebook
-        await autoSaveToNotebook({
-          success: true,
-          data: {
-            agents: agents,
-            capture: captureData
-          }
-        }, relevantWebpages, text, url);
-        
-        agentFlowCompleted = true;
-        return; // Done with agent flow - don't fall through to Google search
-      } else {
-        console.warn('[ContextGrabber] No orchestration agents found. Full result:', JSON.stringify(agent10Result, null, 2));
-        // #region agent log
-        const debugNoAgents = {location:'content.js:4986',message:'no agents found in orchestration',data:{hasOrchestration:!!orchestrationData,hasAgents:!!(orchestrationData?.agents),agentKeys:orchestrationData?.agents?Object.keys(orchestrationData.agents):[]},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
-        console.log('[DEBUG]', JSON.stringify(debugNoAgents));
-        fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugNoAgents)}).catch(()=>{});
-        // #endregion
-        // Show error instead of falling back to Google search
-        showErrorOverlay('Agent Processing Failed', 
-          'The agent orchestration did not return results. Please check backend logs and ensure agents are running.');
+      if (SCREENSHOT_PRIORITY === 'api-only') {
+        showErrorOverlay('Permission Required',
+          'Please click the ThirdEye extension icon in your browser toolbar first to enable screenshot capture.');
         return;
       }
-    } else {
-      console.warn('[ContextGrabber] Agent 1.0 call failed or returned no success:', agent10Result);
-      // #region agent log
-      const debugCheckFailed = {location:'content.js:4992',message:'agent10Result check failed showing error',data:{isNull:!agent10Result,hasSuccess:!!(agent10Result?.success),success:agent10Result?.success},timestamp:Date.now(),runId:'run1',hypothesisId:'A,B,C,D'};
-      console.log('[DEBUG]', JSON.stringify(debugCheckFailed));
-      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCheckFailed)}).catch(()=>{});
-      // #endregion
-      showErrorOverlay('Agent Processing Failed', 
-        'Failed to process content with agents. Please check backend connection and try again.');
+      console.warn('[ContextGrabber] Screenshot permission not available, continuing with text only');
+    }
+  }
+
+  // --- 2) AGENT ORCHESTRATION (if backend is reachable) ---
+  let agentFlowCompleted = false;
+
+  if (backendAvailable && SCREENSHOT_PRIORITY !== 'google-only') {
+    try {
+      console.log('[ContextGrabber] Sending to Agent 1.0 API...');
+      setOverlayStatus('Extracting content...');
+
+      const agent10Result = await sendScreenshotToAgent10(lastSnapshotDataUrl, url, { x, y }, text);
+
+      if (agent10Result && agent10Result.success) {
+        const resultData = agent10Result.data || {};
+        const captureData = resultData.capture || resultData;
+        const orchestrationData = resultData.orchestration;
+
+        console.log('[ContextGrabber] Agent 1.0 result structure:', {
+          hasCapture: !!captureData,
+          hasOrchestration: !!orchestrationData,
+          dataKeys: Object.keys(resultData),
+          orchestrationKeys: orchestrationData ? Object.keys(orchestrationData) : []
+        });
+
+        // Use extracted text if better than DOM extraction
+        if (captureData?.extracted_text && captureData.extracted_text.length > text.length) {
+          text = captureData.extracted_text;
+          console.log('[ContextGrabber] Using Agent 1.0 extracted text (better than DOM)');
+        }
+
+        const agents = orchestrationData?.agents || {};
+
+        if (agents && Object.keys(agents).length > 0) {
+          console.log('[ContextGrabber] Orchestration complete, processing results. Agents:', Object.keys(agents));
+          setOverlayStatus('Processing agent results...');
+
+          const agent2 = agents['2.0'] || agents['target_interpreter'] || {};
+          const agent3 = agents['3.0'] || agents['gap_hypothesis'] || {};
+
+          let winningHypothesis = null;
+          if (agent3.candidates && agent3.winning_hypothesis) {
+            winningHypothesis = agent3.candidates.find(c => c.id === agent3.winning_hypothesis) || agent3.candidates[0];
+          }
+
+          const concepts = agent2.concepts || [];
+          setOverlayStatus('Finding relevant resources...');
+          const relevantWebpages = await searchRelevantWebpages(concepts, winningHypothesis);
+
+          showAgentResultsOverlay({
+            success: true,
+            data: { agents, capture: captureData }
+          }, relevantWebpages);
+
+          await autoSaveToNotebook({
+            success: true,
+            data: { agents, capture: captureData }
+          }, relevantWebpages, text, url);
+
+          agentFlowCompleted = true;
+        } else {
+          console.warn('[ContextGrabber] No orchestration agents found in result');
+        }
+      } else {
+        console.warn('[ContextGrabber] Agent 1.0 call returned no success:', agent10Result);
+      }
+    } catch (err) {
+      console.error('[ContextGrabber] Agent 1.0 extraction failed:', err.message || err);
+    }
+
+    // In api-only mode, stop here even on failure
+    if (SCREENSHOT_PRIORITY === 'api-only') {
+      if (!agentFlowCompleted) {
+        showErrorOverlay('Agent Processing Failed',
+          'The backend did not return agent results. Please check backend logs.');
+      }
       return;
     }
-  } catch (err) {
-    console.error('[ContextGrabber] Agent 1.0 extraction failed:', err);
-    showErrorOverlay('Agent Processing Error', 
-      `Failed to process with agents: ${err.message || err.toString()}. Please check backend connection.`);
-    return;
   }
-  
-  // If we reach here, agent flow didn't complete - show error
-  if (!agentFlowCompleted) {
-    console.error('[ContextGrabber] Agent flow did not complete');
-    showErrorOverlay('Processing Failed', 
-      'Unable to process content. Please ensure backend is running and try again.');
 
-  // --- GOOGLE SEARCH FALLBACK ---
-  if (SCREENSHOT_PRIORITY !== 'api-only') {
-    console.log('[ContextGrabber] Using Google text search');
+  // --- 3) GOOGLE SEARCH FALLBACK ---
+  // Reached when: backend is down, agents returned nothing (api-first), or google-only mode
+  if (!agentFlowCompleted) {
+    console.log('[ContextGrabber] Falling back to Google text search');
     setOverlayStatus('Searching Google...');
 
     // Capture snapshot if not already done
@@ -5506,7 +5426,6 @@ async function triggerSearchFromPoint(x, y, snapshotSize = SNAPSHOT_SIZE) {
       performClientOCR(lastSnapshotDataUrl).then(ocrText => {
         if (ocrText && ocrText.trim().length > 10) {
           console.log('[ContextGrabber] OCR extracted:', ocrText.substring(0, 80));
-          // Re-search with better text from OCR
           chrome.runtime.sendMessage(
             { type: 'SEARCH_GOOGLE', data: { url, text: ocrText.trim() } },
             () => {
@@ -5717,16 +5636,20 @@ async function dwellDetectionLoop() {
         continue;
       }
 
-      // Get current point: WebSocket gaze first, then HTTP gaze API, then mouse fallback
+      // Get current point based on trackingMode setting
       let point = null;
-      if (lastGazePoint && lastGazePoint.available !== false) {
+
+      const useGaze = trackingMode === 'gaze' || trackingMode === 'gaze+cursor';
+      const useCursor = trackingMode === 'cursor' || trackingMode === 'gaze+cursor';
+
+      if (useGaze && lastGazePoint && lastGazePoint.available !== false) {
         const vp = screenToViewport(lastGazePoint.x, lastGazePoint.y);
         point = { x: Math.round(vp.x), y: Math.round(vp.y) };
       }
-      if (!point && gazeAvailable) {
+      if (!point && useGaze && gazeAvailable) {
         point = await getGazePoint();
       }
-      if (!point) {
+      if (!point && useCursor) {
         // Use smoothed position for stabler dwell detection
         point = { x: Math.round(smoothedMousePos.x), y: Math.round(smoothedMousePos.y) };
       }
@@ -5782,6 +5705,33 @@ async function dwellDetectionLoop() {
 // ============================================================================
 
 function main() {
+  // Load tracking mode from storage before anything else
+  chrome.storage.local.get(['tracking_mode'], (result) => {
+    trackingMode = result.tracking_mode || 'gaze+cursor';
+    gazeAvailable = trackingMode !== 'cursor';
+    console.log('[ContextGrabber] Tracking mode:', trackingMode);
+  });
+
+  // Listen for tracking mode changes at runtime (from options page or overlay toggle)
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.tracking_mode) {
+      trackingMode = changes.tracking_mode.newValue || 'gaze+cursor';
+      gazeAvailable = trackingMode !== 'cursor';
+      console.log('[ContextGrabber] Tracking mode changed to:', trackingMode);
+      updateModeIndicator();
+
+      // Clear gaze state when switching to cursor-only
+      if (trackingMode === 'cursor') {
+        lastGazePoint = null;
+        smoothedGaze = null;
+        settledGaze = null;
+        if (gazeOverlayEl) gazeOverlayEl.style.display = 'none';
+      } else if (gazeOverlayEl) {
+        gazeOverlayEl.style.display = '';
+      }
+    }
+  });
+
   console.log('[ContextGrabber] Extension loaded. Gaze mode:', ENABLE_GAZE_MODE,
     '| Dwell time:', DWELL_TIME_MS + 'ms', '| Radius:', DWELL_RADIUS + 'px');
 

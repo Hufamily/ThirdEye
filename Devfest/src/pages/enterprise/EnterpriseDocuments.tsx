@@ -5,7 +5,6 @@ import { motion } from 'framer-motion'
 import { EmptyState } from '../../components/ui/EmptyState'
 import { Navigation } from '../../components/ui/Navigation'
 import { LoadingSpinner } from '../../components/ui/LoadingSpinner'
-import { FileText as FileTextIcon } from 'lucide-react'
 import { getEnterpriseDocuments } from '../../utils/api'
 
 interface Document {
@@ -129,7 +128,7 @@ export default function EnterpriseDocuments() {
           </div>
         ) : documents.length === 0 ? (
           <EmptyState
-            icon={FileTextIcon}
+            icon={FileText}
             title="No documents yet"
             description="Documents will appear here once they're created and shared."
             action={{

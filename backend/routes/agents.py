@@ -16,7 +16,7 @@ from agents.explanation_composer import ExplanationComposer
 from agents.memory_vault import MemoryVault
 from agents.document_surgeon import DocumentSurgeon
 from services.agent_orchestrator import AgentOrchestrator
-from utils.database import engine, ensure_warehouse_resumed
+from utils.database import engine, ensure_warehouse_resumed, qualified_table as qt
 from sqlalchemy import text
 
 router = APIRouter()
@@ -27,9 +27,9 @@ async def _get_user_org_id(user_id: str) -> Optional[str]:
     try:
         await ensure_warehouse_resumed()
         with engine.connect() as conn:
-            query = text("""
+            query = text(f"""
                 SELECT ORG_ID
-                FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS
+                FROM {qt("ORG_MEMBERSHIPS")}
                 WHERE USER_ID = :user_id
                 LIMIT 1
             """)

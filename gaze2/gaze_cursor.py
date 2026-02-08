@@ -54,14 +54,15 @@ except ModuleNotFoundError:
         "  cd gaze2/GazeFollower && python -m pip install -e ."
     )
 
-# Y-axis correction: Gaze trackers often have a downward bias due to camera position.
-# Positive values move the circle UP (subtract from Y). Adjust as needed for your setup.
-# Typical range: 0-150 pixels. Increase if the circle appears below where you're looking.
-Y_OFFSET_CORRECTION = 50
-
-# Optional: Y scale factor. 1.0 = no change. <1.0 compresses vertical range (reduces error at top/bottom).
-# Try 0.85-0.95 if Y is less accurate at screen edges.
-Y_SCALE = 1.0
+# Import shared config (Y_OFFSET, Y_SCALE, etc.) so there's a single source of truth.
+try:
+    from config import Y_OFFSET_CORRECTION, Y_SCALE
+except ImportError:
+    # Fallback defaults when config.py is not on the path.
+    # Positive values move the circle UP (subtract from Y). Typical range: 0-150 pixels.
+    Y_OFFSET_CORRECTION = 50
+    # Y scale factor. 1.0 = no change. <1.0 compresses vertical range.
+    Y_SCALE = 1.0
 
 # Deadband: gaze must move at least this many pixels from the last reported
 # position before a new position is published.  Eliminates micro-jitter that
@@ -74,8 +75,8 @@ GAZE_DEADBAND_PX = 25
 GAZE_SMOOTH_FACTOR = 0.4
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--api", action="store_true", help="Start Flask API in background (GET /gaze)")
-parser.add_argument("--api-port", type=int, default=5000, help="Port for API (default: 5000)")
+parser.add_argument("--api", action="store_true", help="Push gaze data to the unified FastAPI backend")
+parser.add_argument("--api-port", type=int, default=8000, help="Backend port (default: 8000)")
 parser.add_argument(
     "--control-cursor",
     action="store_true",
@@ -133,21 +134,14 @@ if args.control_cursor:
             f"Details: {e}"
         )
 
-# Start API and WebSocket server in background threads if requested
+# Set up HTTP POST to the unified FastAPI backend when --api is requested.
+_gaze_post_url = None
+_gaze_session = None
 if args.api:
-    import threading
-    from api import app
-    from gaze_websocket_server import start_websocket_thread
-
-    def run_api():
-        app.run(host="0.0.0.0", port=args.api_port, debug=False, use_reloader=False)
-    api_thread = threading.Thread(target=run_api, daemon=True)
-    api_thread.start()
-    print(f"API running at http://127.0.0.1:{args.api_port}/gaze")
-
-    # WebSocket server for real-time gaze streaming (Chrome extension)
-    start_websocket_thread(port=8765, screen_width=screen_width, screen_height=screen_height)
-    print("WebSocket gaze stream at ws://127.0.0.1:8765")
+    import requests as _requests
+    _gaze_session = _requests.Session()
+    _gaze_post_url = f"http://127.0.0.1:{args.api_port}/api/gaze"
+    print(f"Gaze data will be pushed to {_gaze_post_url}")
 
 # Initialize GazeFollower
 print("Initializing GazeFollower...")
@@ -219,13 +213,18 @@ while running:
             last_published_x = smoothed_gaze_x
             last_published_y = smoothed_gaze_y
 
-        # Push to API for /gaze endpoint (if api module is used)
-        try:
-            from api.app import set_gaze
-            set_gaze(float(last_published_x), float(last_published_y), confidence=1.0,
-                     screen_width=screen_width, screen_height=screen_height)
-        except ImportError:
-            pass
+        # Push gaze data to the unified FastAPI backend (if --api is active)
+        if _gaze_post_url and _gaze_session:
+            try:
+                _gaze_session.post(_gaze_post_url, json={
+                    "x": float(last_published_x),
+                    "y": float(last_published_y),
+                    "confidence": 1.0,
+                    "screen_width": screen_width,
+                    "screen_height": screen_height,
+                }, timeout=0.05)
+            except Exception:
+                pass  # Non-blocking — don't stall the 60 FPS loop
         # Move OS cursor if enabled.
         if pyautogui is not None:
             alpha = args.cursor_smoothing

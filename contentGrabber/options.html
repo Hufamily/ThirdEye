@@ -74,11 +74,29 @@
       color: #666;
     }
 
-    input:focus {
+    input:focus, select:focus {
       outline: none;
       border-color: #4CAF50;
       box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.2);
       background: #353535;
+    }
+
+    select {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #444;
+      border-radius: 6px;
+      font-size: 13px;
+      color: #ffffff;
+      background: #333333;
+      cursor: pointer;
+      transition: border-color 0.3s, box-shadow 0.3s;
+      -webkit-appearance: none;
+    }
+
+    select option {
+      background: #333;
+      color: #fff;
     }
 
     .help-text {
@@ -178,6 +196,20 @@
     <div class="info-box">
       <strong>API Configuration</strong><br>
       Enter the URL where ThirdEye should send page content for analysis.
+    </div>
+
+    <div class="form-group">
+      <label for="trackingMode">Tracking Mode:</label>
+      <select id="trackingMode">
+        <option value="cursor">Cursor Only</option>
+        <option value="gaze">Gaze Only</option>
+        <option value="gaze+cursor">Gaze + Cursor Fallback</option>
+      </select>
+      <div class="help-text">
+        <strong>Cursor Only</strong> — dwell detection follows the mouse. No gaze hardware needed.<br>
+        <strong>Gaze Only</strong> — uses eye tracker exclusively. Cursor input is ignored.<br>
+        <strong>Gaze + Cursor Fallback</strong> — prefers gaze; falls back to cursor when gaze is unavailable.
+      </div>
     </div>
 
     <div class="form-group">

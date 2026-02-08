@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from utils.database import get_db, ensure_warehouse_resumed
+from utils.database import get_db, ensure_warehouse_resumed, qualified_table as qt, safe_variant
 from routes.auth import get_current_user
 from models.user import User
 from services.google_drive_client import GoogleDriveClient
@@ -85,7 +85,7 @@ async def get_google_docs_documents(
     query = """
         SELECT ASSET_ID, TITLE, GOOGLE_DOC, CONFUSION_DENSITY, 
                TOTAL_TRIGGERS, USERS_AFFECTED, CREATED_AT
-        FROM THIRDEYE_DEV.PUBLIC.TRACKED_ASSETS
+        FROM {qt("TRACKED_ASSETS")}
         WHERE ASSET_TYPE = 'GOOGLE_DOC'
     """
     params = {}
@@ -107,7 +107,7 @@ async def get_google_docs_documents(
     
     documents = []
     for row in rows:
-        google_doc = row[2] if isinstance(row[2], dict) else {}
+        google_doc = safe_variant(row[2], dict)
         documents.append({
             "id": row[0],
             "title": row[1] or "",
@@ -124,9 +124,9 @@ async def get_google_docs_documents(
         })
     
     # Get total count
-    count_result = db.execute(text("""
+    count_result = db.execute(text(f"""
         SELECT COUNT(*) 
-        FROM THIRDEYE_DEV.PUBLIC.TRACKED_ASSETS
+        FROM {qt("TRACKED_ASSETS")}
         WHERE ASSET_TYPE = 'GOOGLE_DOC'
     """))
     total = count_result.fetchone()[0]
@@ -154,9 +154,9 @@ async def get_suggestions_for_document(
     await ensure_warehouse_resumed()
     
     # Get document content
-    doc_result = db.execute(text("""
+    doc_result = db.execute(text(f"""
         SELECT DOC_ID, TITLE, CONTENT, GOOGLE_DOC, HOTSPOTS
-        FROM THIRDEYE_DEV.PUBLIC.DOCUMENTS
+        FROM {qt("DOCUMENTS")}
         WHERE DOC_ID = :doc_id
         LIMIT 1
     """), {"doc_id": documentId})
@@ -174,8 +174,8 @@ async def get_suggestions_for_document(
             }
         )
     
-    google_doc = doc_row[3] if isinstance(doc_row[3], dict) else {}
-    hotspots = doc_row[4] if isinstance(doc_row[4], list) else []
+    google_doc = safe_variant(doc_row[3], dict)
+    hotspots = safe_variant(doc_row[4], list)
     
     document_content = {
         "id": doc_row[0],
@@ -191,10 +191,10 @@ async def get_suggestions_for_document(
     }
     
     # Get suggestions for this document
-    suggestions_result = db.execute(text("""
+    suggestions_result = db.execute(text(f"""
         SELECT SUGGESTION_ID, DOC_ID, HOTSPOT_ID, ORIGINAL_TEXT, SUGGESTED_TEXT,
                CONFIDENCE, REASONING, GOOGLE_DOC_RANGE, STATUS
-        FROM THIRDEYE_DEV.PUBLIC.SUGGESTIONS
+        FROM {qt("SUGGESTIONS")}
         WHERE DOC_ID = :doc_id
         ORDER BY CREATED_AT DESC
     """), {"doc_id": documentId})
@@ -202,7 +202,7 @@ async def get_suggestions_for_document(
     
     suggestions = []
     for row in suggestions_rows:
-        google_doc_range = row[7] if isinstance(row[7], dict) else {}
+        google_doc_range = safe_variant(row[7], dict)
         suggestions.append({
             "id": row[0],
             "documentId": row[1],
@@ -344,8 +344,8 @@ async def apply_edit_to_google_doc(
         ).execute()
         
         # Update suggestion status in database
-        db.execute(text("""
-            UPDATE THIRDEYE_DEV.PUBLIC.SUGGESTIONS
+        db.execute(text(f"""
+            UPDATE {qt("SUGGESTIONS")}
             SET STATUS = 'applied',
                 APPLIED_AT = CURRENT_TIMESTAMP(),
                 APPLIED_BY = :user_id,

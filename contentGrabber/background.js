@@ -23,14 +23,17 @@
  */
 const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000';
 
-/** Gaze WebSocket URL - gaze2 streams at ~60 FPS when gaze_cursor.py --api is running */
-const GAZE_WS_URL = 'ws://127.0.0.1:8765';
+/** Gaze WebSocket URL - served by the unified backend */
+const GAZE_WS_URL = 'ws://127.0.0.1:8000/api/gaze/ws';
 
 /** Gaze HTTP API - fallback when WebSocket not connected */
-const GAZE_HTTP_URL = 'http://127.0.0.1:5000/gaze';
+const GAZE_HTTP_URL = 'http://127.0.0.1:8000/api/gaze';
 
 /** Reconnect delay (ms) when gaze WebSocket disconnects */
 const GAZE_WS_RECONNECT_DELAY = 2000;
+
+/** Max reconnect delay (ms) — caps exponential backoff */
+const GAZE_WS_MAX_RECONNECT_DELAY = 60000;
 
 /** HTTP polling interval (ms) when WebSocket not connected */
 const GAZE_HTTP_POLL_INTERVAL = 200;
@@ -43,9 +46,9 @@ const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 
 /**
  * Gaze tracking API endpoint (gaze2 runs on port 5000)
- * GET request that returns { x, y, confidence, screenWidth, screenHeight }
+ * Same as GAZE_HTTP_URL; used as the configurable default for storage.
  */
-const GAZE_API_URL = 'http://127.0.0.1:5000/gaze';
+const GAZE_API_URL = GAZE_HTTP_URL;
 
 /** Request timeout in milliseconds */
 const REQUEST_TIMEOUT = 5000;
@@ -252,10 +255,31 @@ function disconnectGazeWebSocket() {
   stopGazeHttpPoll();
 }
 
-// Start gaze connection when background loads
-connectGazeWebSocket();
-// Also start HTTP polling immediately - works even before WebSocket connects
-startGazeHttpPoll();
+// Start gaze connection only if tracking mode includes gaze
+chrome.storage.local.get(['tracking_mode'], (result) => {
+  const mode = result.tracking_mode || 'gaze+cursor';
+  if (mode !== 'cursor') {
+    connectGazeWebSocket();
+    startGazeHttpPoll();
+  } else {
+    console.log('[ContextGrabber] Tracking mode is cursor-only — skipping gaze connection');
+  }
+});
+
+// React to tracking mode changes at runtime
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.tracking_mode) {
+    const newMode = changes.tracking_mode.newValue || 'gaze+cursor';
+    console.log('[ContextGrabber] Tracking mode changed to:', newMode);
+    if (newMode === 'cursor') {
+      disconnectGazeWebSocket();
+      stopGazeHttpPoll();
+    } else {
+      connectGazeWebSocket();
+      startGazeHttpPoll();
+    }
+  }
+});
 
 // ============================================================================
 // EXTENSION ICON CLICK → Toggle extension on/off
@@ -512,6 +536,23 @@ async function getGazeApiUrl() {
 // ============================================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Quick backend reachability check — used by content script before attempting agent flow
+  if (message.type === 'BACKEND_HEALTH_CHECK') {
+    const timeout = message.timeoutMs || 1500;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    getApiBaseUrl().then(apiBase =>
+      fetch(`${apiBase}/health`, { method: 'GET', signal: controller.signal })
+    ).then(res => {
+      clearTimeout(timer);
+      sendResponse({ available: res.ok });
+    }).catch(() => {
+      clearTimeout(timer);
+      sendResponse({ available: false });
+    });
+    return true; // async
+  }
+
   // Handle request for Analysis API URL from content script
   if (message.type === 'GET_ANALYZE_API_URL') {
     getAnalyzeApiUrl().then(apiUrl => {

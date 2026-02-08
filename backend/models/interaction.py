@@ -15,8 +15,6 @@ class Interaction(Base):
     __tablename__ = "INTERACTIONS"
     __table_args__ = {
         "schema": "PUBLIC",
-        # Daily partitioning for Time Travel optimization
-        "postgresql_partition_by": "DATE_TRUNC('DAY', CREATED_AT)"
     }
     
     interaction_id = Column("INTERACTION_ID", String(36), primary_key=True)

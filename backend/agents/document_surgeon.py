@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List
 from .base_agent import BaseAgent
 from services.k2think_client import K2ThinkClient
 from services.google_drive_client import GoogleDriveClient
-from utils.database import engine, ensure_warehouse_resumed
+from utils.database import engine, ensure_warehouse_resumed, qualified_table as qt
 from sqlalchemy import text
 import json
 import uuid
@@ -91,14 +91,14 @@ class DocumentSurgeon(BaseAgent):
             await ensure_warehouse_resumed()
             with engine.connect() as conn:
                 # Get confusion events for this document
-                query = text("""
+                query = text(f"""
                     SELECT 
                         ANCHOR_ID,
                         COUNT(*) as confusion_count,
                         COUNT(DISTINCT USER_ID) as unique_users,
                         AVG(DWELL_TIME) as avg_dwell_time,
                         LISTAGG(DISTINCT USER_FEEDBACK, ', ') WITHIN GROUP (ORDER BY USER_FEEDBACK) as feedbacks
-                    FROM THIRDEYE_DEV.PUBLIC.INTERACTIONS
+                    FROM {qt("INTERACTIONS")}
                     WHERE DOC_ID = :doc_id
                     AND CREATED_AT >= DATEADD(day, -:time_window, CURRENT_TIMESTAMP())
                     AND ANCHOR_ID IS NOT NULL
@@ -231,9 +231,9 @@ Output JSON:
         try:
             await ensure_warehouse_resumed()
             with engine.connect() as conn:
-                query = text("""
+                query = text(f"""
                     SELECT CONTENT
-                    FROM THIRDEYE_DEV.PUBLIC.INTERACTIONS
+                    FROM {qt("INTERACTIONS")}
                     WHERE DOC_ID = :doc_id
                     AND ANCHOR_ID = :anchor_id
                     LIMIT 1
@@ -311,17 +311,87 @@ Output JSON:
         suggestion_id: str,
         access_token: str
     ) -> Dict[str, Any]:
-        """Apply suggestion to Google Doc"""
-        # In a full implementation, would:
-        # 1. Retrieve suggestion details
-        # 2. Use Google Docs API to apply changes
-        # 3. Track applied changes
-        
-        # For now, return placeholder
-        return self.create_response(success=True, data={
-            "applied": True,
-            "message": "Suggestion application would be implemented here using Google Docs API"
-        })
+        """Apply suggestion to Google Doc via the Docs API"""
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+
+        try:
+            # 1. Retrieve suggestion details from database
+            await ensure_warehouse_resumed()
+            suggestion = None
+            with engine.connect() as conn:
+                query = text(f"""
+                    SELECT ORIGINAL_TEXT, SUGGESTED_TEXT
+                    FROM {qt("DOCUMENT_SUGGESTIONS")}
+                    WHERE SUGGESTION_ID = :sid AND DOC_ID = :doc_id
+                    LIMIT 1
+                """)
+                row = conn.execute(query, {"sid": suggestion_id, "doc_id": doc_id}).fetchone()
+                if row:
+                    suggestion = {"original_text": row[0], "suggested_text": row[1]}
+
+            if not suggestion:
+                return self.create_response(
+                    success=False, error=f"Suggestion {suggestion_id} not found for doc {doc_id}"
+                )
+
+            original_text = suggestion["original_text"]
+            suggested_text = suggestion["suggested_text"]
+
+            if not original_text or not suggested_text:
+                return self.create_response(
+                    success=False, error="Suggestion has empty original or suggested text"
+                )
+
+            # 2. Use Google Docs API to find original text and replace it
+            credentials = Credentials(token=access_token)
+            docs_service = build("docs", "v1", credentials=credentials)
+
+            doc = docs_service.documents().get(documentId=doc_id).execute()
+            full_text = ""
+            for element in doc.get("body", {}).get("content", []):
+                if "paragraph" in element:
+                    for pe in element["paragraph"].get("elements", []):
+                        if "textRun" in pe:
+                            full_text += pe["textRun"].get("content", "")
+
+            text_index = full_text.find(original_text)
+            if text_index == -1:
+                return self.create_response(
+                    success=False, error="Original text not found in document"
+                )
+
+            start_index = text_index
+            end_index = text_index + len(original_text)
+
+            requests = [
+                {"deleteContent": {"range": {"startIndex": start_index, "endIndex": end_index}}},
+                {"insertText": {"location": {"index": start_index}, "text": suggested_text}},
+            ]
+
+            docs_service.documents().batchUpdate(
+                documentId=doc_id, body={"requests": requests}
+            ).execute()
+
+            # 3. Mark suggestion as applied in the database
+            with engine.connect() as conn:
+                conn.execute(text(f"""
+                    UPDATE {qt("DOCUMENT_SUGGESTIONS")}
+                    SET STATUS = 'applied', UPDATED_AT = CURRENT_TIMESTAMP()
+                    WHERE SUGGESTION_ID = :sid
+                """), {"sid": suggestion_id})
+                conn.commit()
+
+            return self.create_response(success=True, data={
+                "applied": True,
+                "suggestion_id": suggestion_id,
+                "doc_id": doc_id,
+                "message": "Suggestion applied to Google Doc successfully"
+            })
+
+        except Exception as e:
+            print(f"Error applying suggestion: {e}")
+            return self.create_response(success=False, error=f"Apply failed: {str(e)}")
     
     async def _store_suggestions(
         self,
@@ -341,8 +411,8 @@ Output JSON:
                 for suggestion in suggestions:
                     suggestion_id = str(uuid.uuid4())
                     
-                    insert_query = text("""
-                        INSERT INTO THIRDEYE_DEV.PUBLIC.DOCUMENT_SUGGESTIONS (
+                    insert_query = text(f"""
+                        INSERT INTO {qt("DOCUMENT_SUGGESTIONS")} (
                             SUGGESTION_ID, DOC_ID, ORG_ID, ANCHOR_ID, HOTSPOT_ID,
                             ORIGINAL_TEXT, SUGGESTED_TEXT, REASONING, CONFIDENCE,
                             CHANGES_MADE, STATUS, CREATED_BY, CREATED_AT, UPDATED_AT

@@ -7,7 +7,7 @@ Hypothesizes why the user is stuck using deep reasoning with K2-Think
 from typing import Dict, Any, Optional, List
 from .base_agent import BaseAgent
 from services.k2think_client import K2ThinkClient
-from utils.database import engine, ensure_warehouse_resumed
+from utils.database import engine, ensure_warehouse_resumed, qualified_table as qt
 from sqlalchemy import text
 import json
 import re
@@ -423,8 +423,8 @@ Show your reasoning step-by-step, then provide the JSON output."""
             hypothesis_id = str(uuid.uuid4())
             
             with engine.connect() as conn:
-                insert_query = text("""
-                    INSERT INTO THIRDEYE_DEV.PUBLIC.GAP_HYPOTHESES (
+                insert_query = text(f"""
+                    INSERT INTO {qt("GAP_HYPOTHESES")} (
                         HYPOTHESIS_ID, USER_ID, SESSION_ID, ANCHOR_ID, DOC_ID,
                         HYPOTHESES, CREATED_AT
                     ) VALUES (

@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from utils.database import get_db, ensure_warehouse_resumed
+from utils.database import get_db, ensure_warehouse_resumed, qualified_table as qt, safe_variant
 from routes.auth import get_current_user
 from models.user import User
 from models.session import Session as SessionModel
@@ -62,8 +62,8 @@ async def start_session(
     started_at = datetime.now()
     
     # Create session in database
-    db.execute(text("""
-        INSERT INTO THIRDEYE_DEV.PUBLIC.SESSIONS 
+    db.execute(text(f"""
+        INSERT INTO {qt("SESSIONS")} 
         (SESSION_ID, USER_ID, DOC_ID, DOC_TITLE, DOC_TYPE, STARTED_AT, IS_COMPLETE)
         VALUES (:session_id, :user_id, :doc_id, :doc_title, :doc_type, :started_at, :is_complete)
     """), {
@@ -96,9 +96,9 @@ async def stop_session(
     await ensure_warehouse_resumed()
     
     # Get session
-    result = db.execute(text("""
+    result = db.execute(text(f"""
         SELECT SESSION_ID, USER_ID, STARTED_AT, ENDED_AT
-        FROM THIRDEYE_DEV.PUBLIC.SESSIONS
+        FROM {qt("SESSIONS")}
         WHERE SESSION_ID = :session_id AND USER_ID = :user_id
         LIMIT 1
     """), {
@@ -125,16 +125,16 @@ async def stop_session(
     duration = int((end_time - start_time).total_seconds()) if start_time else 0
     
     # Count concepts detected (from notebook entries or interaction logs)
-    concepts_result = db.execute(text("""
+    concepts_result = db.execute(text(f"""
         SELECT COUNT(DISTINCT ENTRY_ID)
-        FROM THIRDEYE_DEV.PUBLIC.NOTEBOOK_ENTRIES
+        FROM {qt("NOTEBOOK_ENTRIES")}
         WHERE SESSION_ID = :session_id
     """), {"session_id": session_id})
     concepts_detected = concepts_result.fetchone()[0] or 0
     
     # Update session
-    db.execute(text("""
-        UPDATE THIRDEYE_DEV.PUBLIC.SESSIONS
+    db.execute(text(f"""
+        UPDATE {qt("SESSIONS")}
         SET ENDED_AT = :ended_at,
             DURATION_SECONDS = :duration,
             UPDATED_AT = CURRENT_TIMESTAMP()
@@ -169,9 +169,9 @@ async def get_status(
     await ensure_warehouse_resumed()
     
     # Get current active session
-    result = db.execute(text("""
+    result = db.execute(text(f"""
         SELECT SESSION_ID
-        FROM THIRDEYE_DEV.PUBLIC.SESSIONS
+        FROM {qt("SESSIONS")}
         WHERE USER_ID = :user_id 
           AND ENDED_AT IS NULL
           AND IS_COMPLETE = FALSE
@@ -225,9 +225,9 @@ async def track_history(
         
         if request.sessionId:
             # Update session metadata with history
-            result = db.execute(text("""
+            result = db.execute(text(f"""
                 SELECT METADATA
-                FROM THIRDEYE_DEV.PUBLIC.SESSIONS
+                FROM {qt("SESSIONS")}
                 WHERE SESSION_ID = :session_id AND USER_ID = :user_id
                 LIMIT 1
             """), {
@@ -252,8 +252,8 @@ async def track_history(
                 })
                 
                 # Update session metadata
-                db.execute(text("""
-                    UPDATE THIRDEYE_DEV.PUBLIC.SESSIONS
+                db.execute(text(f"""
+                    UPDATE {qt("SESSIONS")}
                     SET METADATA = :metadata,
                         UPDATED_AT = CURRENT_TIMESTAMP()
                     WHERE SESSION_ID = :session_id
@@ -292,9 +292,9 @@ async def analyze_history(
     
     try:
         # Get sessions with history data
-        result = db.execute(text("""
+        result = db.execute(text(f"""
             SELECT SESSION_ID, METADATA, STARTED_AT
-            FROM THIRDEYE_DEV.PUBLIC.SESSIONS
+            FROM {qt("SESSIONS")}
             WHERE USER_ID = :user_id
               AND STARTED_AT >= DATEADD(day, -:days_back, CURRENT_TIMESTAMP())
               AND METADATA IS NOT NULL
