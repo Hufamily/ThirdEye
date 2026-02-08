@@ -4,6 +4,7 @@
  */
 
 const DEFAULT_API_URL = 'http://localhost:8000/analyze';
+const DEFAULT_GAZE_URL = 'http://localhost:8000/gaze';
 
 /**
  * Show status message to user
@@ -24,9 +25,11 @@ function showStatus(message, isSuccess = true) {
  */
 async function loadSettings() {
   try {
-    const stored = await chrome.storage.local.get('analyze_api_url');
+    const stored = await chrome.storage.local.get(['analyze_api_url', 'gaze_api_url']);
     const apiUrl = stored.analyze_api_url || DEFAULT_API_URL;
+    const gazeUrl = stored.gaze_api_url || DEFAULT_GAZE_URL;
     document.getElementById('apiUrl').value = apiUrl;
+    document.getElementById('gazeUrl').value = gazeUrl;
   } catch (error) {
     console.error('Error loading settings:', error);
     showStatus('Error loading settings', false);
@@ -49,20 +52,31 @@ function validateApiUrl(url) {
  * Save settings
  */
 document.getElementById('save').addEventListener('click', async () => {
-  const url = document.getElementById('apiUrl').value.trim();
+  const apiUrl = document.getElementById('apiUrl').value.trim();
+  const gazeUrl = document.getElementById('gazeUrl').value.trim();
   
-  if (!url) {
-    showStatus('API URL cannot be empty', false);
+  if (!apiUrl) {
+    showStatus('Analysis API URL cannot be empty', false);
     return;
   }
   
-  if (!validateApiUrl(url)) {
-    showStatus('Invalid URL format. Example: http://localhost:8000/analyze', false);
+  // Validate API URL
+  if (!validateApiUrl(apiUrl)) {
+    showStatus('Invalid Analysis API URL format. Example: http://localhost:8000/analyze', false);
+    return;
+  }
+  
+  // Validate Gaze URL if provided
+  if (gazeUrl && !validateApiUrl(gazeUrl)) {
+    showStatus('Invalid Gaze API URL format. Example: http://localhost:8000/gaze', false);
     return;
   }
   
   try {
-    await chrome.storage.local.set({ analyze_api_url: url });
+    await chrome.storage.local.set({ 
+      analyze_api_url: apiUrl,
+      gaze_api_url: gazeUrl
+    });
     showStatus('✓ Settings saved successfully!', true);
   } catch (error) {
     console.error('Error saving settings:', error);
@@ -74,10 +88,14 @@ document.getElementById('save').addEventListener('click', async () => {
  * Reset to default
  */
 document.getElementById('reset').addEventListener('click', async () => {
-  if (confirm('Reset API URL to default? This cannot be undone.')) {
+  if (confirm('Reset all settings to defaults? This cannot be undone.')) {
     try {
-      await chrome.storage.local.set({ analyze_api_url: DEFAULT_API_URL });
+      await chrome.storage.local.set({ 
+        analyze_api_url: DEFAULT_API_URL,
+        gaze_api_url: DEFAULT_GAZE_URL
+      });
       document.getElementById('apiUrl').value = DEFAULT_API_URL;
+      document.getElementById('gazeUrl').value = DEFAULT_GAZE_URL;
       showStatus('✓ Reset to default settings', true);
     } catch (error) {
       console.error('Error resetting settings:', error);

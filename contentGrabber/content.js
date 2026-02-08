@@ -98,6 +98,33 @@ async function getAnalyzeApiUrl() {
   });
 }
 
+/**
+ * Get the gaze API URL from storage (via background script)
+ * @returns {Promise<string|null>} Gaze API URL or null if disabled
+ */
+async function getGazeApiUrl() {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'GET_GAZE_API_URL' },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[ContextGrabber] Could not get Gaze URL from background:', chrome.runtime.lastError.message);
+            resolve(GAZE_API_URL); // Fallback to default
+          } else if (response && response.gazeUrl !== undefined) {
+            resolve(response.gazeUrl); // Could be null if disabled
+          } else {
+            resolve(GAZE_API_URL); // Fallback to default
+          }
+        }
+      );
+    } catch (error) {
+      console.warn('[ContextGrabber] Error getting Gaze URL:', error);
+      resolve(GAZE_API_URL); // Fallback to default
+    }
+  });
+}
+
 // ============================================================================
 // STATE
 // ============================================================================
@@ -237,10 +264,19 @@ async function getGazePoint() {
   if (!gazeAvailable) return null;
 
   try {
+    const gazeUrl = await getGazeApiUrl();
+    
+    // If gaze URL is empty/null, gaze tracking is disabled
+    if (!gazeUrl) {
+      gazeAvailable = false;
+      console.log('[ContextGrabber] Gaze tracking disabled in settings');
+      return null;
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-    const response = await fetch(GAZE_API_URL, {
+    const response = await fetch(gazeUrl, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal

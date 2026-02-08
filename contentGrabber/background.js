@@ -29,6 +29,12 @@ const DEFAULT_API_BASE_URL = 'http://localhost:8000';
  */
 const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 
+/**
+ * Gaze tracking API endpoint
+ * GET request that returns { x, y, confidence }
+ */
+const GAZE_API_URL = 'http://127.0.0.1:8000/gaze';
+
 /** Request timeout in milliseconds */
 const REQUEST_TIMEOUT = 5000;
 
@@ -175,15 +181,39 @@ async function getAnalyzeApiUrl() {
   }
 }
 
+/**
+ * Gets the Gaze API URL from storage
+ * @returns {Promise<string|null>} Gaze API URL or null if disabled
+ */
+async function getGazeApiUrl() {
+  try {
+    const stored = await chrome.storage.local.get('gaze_api_url');
+    // Return null if explicitly empty, otherwise return URL or default
+    if (stored.gaze_api_url === '') return null;
+    return stored.gaze_api_url || GAZE_API_URL;
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting Gaze API URL:', error);
+    return GAZE_API_URL;
+  }
+}
+
 // ============================================================================
 // MESSAGE HANDLER: Receive content from content script
 // ============================================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Handle request for API URL from content script
+  // Handle request for Analysis API URL from content script
   if (message.type === 'GET_ANALYZE_API_URL') {
     getAnalyzeApiUrl().then(apiUrl => {
       sendResponse({ apiUrl });
+    });
+    return true; // Indicate we'll send response asynchronously
+  }
+  
+  // Handle request for Gaze API URL from content script
+  if (message.type === 'GET_GAZE_API_URL') {
+    getGazeApiUrl().then(gazeUrl => {
+      sendResponse({ gazeUrl });
     });
     return true; // Indicate we'll send response asynchronously
   }
