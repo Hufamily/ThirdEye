@@ -1,12 +1,20 @@
 import { useState, useRef, useEffect } from 'react'
 import { X, Send, Bot } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { aiSearch } from '../../utils/api'
 
 interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
   timestamp: Date
+  results?: Array<{
+    type: string
+    id: string
+    title: string
+    snippet: string
+    relevanceScore: number
+  }>
 }
 
 interface AISearchChatProps {
@@ -45,20 +53,51 @@ export function AISearchChat({ onClose }: AISearchChatProps) {
     }
 
     setMessages((prev) => [...prev, userMessage])
+    const query = input.trim()
     setInput('')
     setIsLoading(true)
 
-    // Simulate AI response
-    setTimeout(() => {
+    try {
+      // Call AI search API
+      const response = await aiSearch({ query })
+      
+      // Format results
+      let content = response.message || `I found ${response.results.length} relevant results for "${query}".`
+      
+      if (response.results.length > 0) {
+        content += '\n\n**Results:**\n'
+        response.results.forEach((result, index) => {
+          content += `${index + 1}. **${result.title}** (${result.type})\n   ${result.snippet}\n\n`
+        })
+      }
+      
+      if (response.suggestions && response.suggestions.length > 0) {
+        content += '\n**Suggestions:**\n'
+        response.suggestions.forEach((suggestion) => {
+          content += `- ${suggestion}\n`
+        })
+      }
+
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: `I found 3 relevant entries about "${input}" in your learning history. Would you like me to show them?`,
+        content: content,
         timestamp: new Date(),
+        results: response.results
       }
       setMessages((prev) => [...prev, assistantMessage])
+    } catch (error) {
+      console.error('AI search failed:', error)
+      const errorMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: `Sorry, I encountered an error while searching: ${error instanceof Error ? error.message : 'Unknown error'}. Please try again.`,
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, errorMessage])
+    } finally {
       setIsLoading(false)
-    }, 1000)
+    }
   }
 
   return (

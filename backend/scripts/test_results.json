@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-02-08T02:10:53.536100",
+  "results": {
+    "agent_00": {
+      "status": "FAIL",
+      "error": "Persona analysis failed: Client error '429 Too Many Requests' for url 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429"
+    },
+    "agent_05": {
+      "status": "PASS",
+      "passed": 3,
+      "failed": 0
+    },
+    "agent_10": {
+      "status": "PASS",
+      "passed": 3,
+      "failed": 0
+    },
+    "agent_20": {
+      "status": "PASS",
+      "passed": 2,
+      "failed": 0
+    }
+  }
+}

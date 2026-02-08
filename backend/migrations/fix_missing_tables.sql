@@ -1,0 +1,23 @@
+-- Quick fix for missing ORG_MEMBERSHIPS table
+-- Run this in Snowflake to create the missing table
+-- NOTE: Removed CREATE INDEX statements - Snowflake standard tables don't support explicit indexes
+-- The CLUSTER BY clause provides automatic optimization instead
+
+USE WAREHOUSE COMPUTE_WH;  -- Update with your warehouse name if different
+USE DATABASE THIRDEYE_DEV;
+USE SCHEMA PUBLIC;
+
+-- Organization Memberships Table
+CREATE TABLE IF NOT EXISTS THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS (
+    MEMBERSHIP_ID VARCHAR(36) PRIMARY KEY,
+    ORG_ID VARCHAR(36) NOT NULL REFERENCES THIRDEYE_DEV.PUBLIC.ORGANIZATIONS(ORG_ID),
+    USER_ID VARCHAR(36) NOT NULL REFERENCES THIRDEYE_DEV.PUBLIC.USERS(USER_ID),
+    ROLE VARCHAR(20) NOT NULL DEFAULT 'member',  -- 'admin' | 'member'
+    JOINED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    UNIQUE(ORG_ID, USER_ID)
+)
+CLUSTER BY (ORG_ID, USER_ID);
+
+-- Verify table was created
+SELECT 'ORG_MEMBERSHIPS' AS TABLE_NAME, COUNT(*) AS ROW_COUNT FROM THIRDEYE_DEV.PUBLIC.ORG_MEMBERSHIPS;

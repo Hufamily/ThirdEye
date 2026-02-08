@@ -280,6 +280,168 @@ chrome.action.onClicked.addListener((tab) => {
   });
 });
 
+// ============================================================================
+// BROWSER HISTORY TRACKING
+// ============================================================================
+
+/**
+ * Track page visits for learning context
+ */
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // Only track when page is fully loaded
+  if (changeInfo.status === 'complete' && tab.url) {
+    // Skip chrome:// and extension pages
+    if (tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
+      return;
+    }
+    
+    // Track visit asynchronously
+    trackPageVisit(tab).catch(err => {
+      console.error('[ContextGrabber] Error tracking visit:', err);
+    });
+  }
+});
+
+/**
+ * Track page visit using Chrome History API
+ */
+async function trackPageVisit(tab) {
+  try {
+    if (!tab.url) return;
+    
+    // Get visit details from history API
+    const visits = await chrome.history.getVisits({ url: tab.url });
+    const lastVisit = visits.length > 0 ? visits[0] : null;
+    
+    // Send to backend if session is active
+    const sessionData = await chrome.storage.local.get(['currentSessionId', 'authToken']);
+    if (sessionData.currentSessionId && sessionData.authToken) {
+      const response = await authenticatedFetch('/api/extension/history/track', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${sessionData.authToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          url: tab.url,
+          title: tab.title || '',
+          visitTime: lastVisit ? lastVisit.visitTime : Date.now(),
+          transition: lastVisit ? lastVisit.transition : 'unknown',
+          visitCount: visits.length,
+          sessionId: sessionData.currentSessionId
+        })
+      });
+      
+      if (response.ok) {
+        console.log('[ContextGrabber] Visit tracked:', tab.url);
+      }
+    }
+  } catch (error) {
+    // History API might not be available or permission not granted
+    console.debug('[ContextGrabber] Could not track visit (history permission may be missing):', error.message);
+  }
+}
+
+/**
+ * Get recent browsing history for analysis
+ */
+async function getRecentHistory(maxResults = 100, hoursBack = 24) {
+  try {
+    const endTime = Date.now();
+    const startTime = endTime - (hoursBack * 60 * 60 * 1000);
+    
+    const historyItems = await chrome.history.search({
+      text: '',
+      startTime: startTime,
+      endTime: endTime,
+      maxResults: maxResults
+    });
+    
+    return historyItems.map(item => ({
+      id: item.id,
+      url: item.url,
+      title: item.title || '',
+      visitCount: item.visitCount || 0,
+      lastVisitTime: item.lastVisitTime,
+      typedCount: item.typedCount || 0
+    }));
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting history:', error);
+    return [];
+  }
+}
+
+/**
+ * Analyze browsing patterns for learning context
+ */
+async function analyzeBrowsingPatterns(daysBack = 7) {
+  try {
+    const hoursBack = daysBack * 24;
+    const history = await getRecentHistory(500, hoursBack);
+    
+    // Group by domain
+    const domainGroups = {};
+    history.forEach(item => {
+      try {
+        const domain = new URL(item.url).hostname;
+        if (!domainGroups[domain]) {
+          domainGroups[domain] = {
+            domain: domain,
+            visits: 0,
+            urls: [],
+            lastVisit: 0
+          };
+        }
+        domainGroups[domain].visits += item.visitCount || 1;
+        domainGroups[domain].urls.push(item.url);
+        if (item.lastVisitTime > domainGroups[domain].lastVisit) {
+          domainGroups[domain].lastVisit = item.lastVisitTime;
+        }
+      } catch (e) {
+        // Skip invalid URLs
+      }
+    });
+    
+    // Sort by visit count
+    const topDomains = Object.values(domainGroups)
+      .sort((a, b) => b.visits - a.visits)
+      .slice(0, 20);
+    
+    return {
+      totalVisits: history.length,
+      topDomains: topDomains,
+      learningSites: topDomains.filter(d => 
+        d.domain.includes('docs.google.com') ||
+        d.domain.includes('github.com') ||
+        d.domain.includes('stackoverflow.com') ||
+        d.domain.includes('developer.mozilla.org') ||
+        d.domain.includes('medium.com') ||
+        d.domain.includes('wikipedia.org')
+      )
+    };
+  } catch (error) {
+    console.error('[ContextGrabber] Error analyzing patterns:', error);
+    return { totalVisits: 0, topDomains: [], learningSites: [] };
+  }
+}
+
+// Handle history analysis requests
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'GET_BROWSING_HISTORY') {
+    getRecentHistory(message.maxResults || 100, message.hoursBack || 24)
+      .then(history => sendResponse({ success: true, history }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true; // Keep channel open for async response
+  }
+  
+  if (message.type === 'ANALYZE_BROWSING_PATTERNS') {
+    analyzeBrowsingPatterns(message.daysBack || 7)
+      .then(analysis => sendResponse({ success: true, analysis }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+});
+
 /**
  * Updates the extension badge to show enabled/disabled state
  */

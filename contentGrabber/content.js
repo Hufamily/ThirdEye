@@ -2026,7 +2026,28 @@ function createPersistentOverlay() {
 function updateOverlayContent(html) {
   if (!currentOverlay) createPersistentOverlay();
   const body = currentOverlay.querySelector('#cg-body');
-  if (body) body.innerHTML = html;
+  const overlayContent = currentOverlay.querySelector('.cg-overlay-content');
+  if (body) {
+    body.innerHTML = html;
+    // Ensure body is visible (in case overlay was minimized)
+    body.style.display = 'block';
+    // Ensure overlay is visible and expanded
+    if (currentOverlay) {
+      currentOverlay.style.display = 'block';
+      currentOverlay.style.visibility = 'visible';
+      currentOverlay.style.maxHeight = '80vh'; // Ensure it's expanded
+      currentOverlay.style.height = 'auto';
+    }
+    // Ensure overlay content is visible
+    if (overlayContent) {
+      overlayContent.style.display = 'block';
+    }
+  }
+  // #region agent log
+  const debugUpdateContent = {location:'content.js:1872',message:'updateOverlayContent called',data:{hasOverlay:!!currentOverlay,hasBody:!!body,hasOverlayContent:!!overlayContent,htmlLength:html?.length||0,bodyDisplay:body?.style?.display,overlayDisplay:currentOverlay?.style?.display},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
+  console.log('[DEBUG]', JSON.stringify(debugUpdateContent));
+  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugUpdateContent)}).catch(()=>{});
+  // #endregion
 }
 
 /**
@@ -2604,6 +2625,28 @@ function getOverlayStyles() {
     /* Tab panel styling */
     .cg-tab-panel {
       color: hsl(0, 0%, 98%); /* matches frontend foreground */
+      overflow-y: auto;
+      max-height: calc(80vh - 200px);
+      min-height: 200px;
+      padding-right: 8px;
+    }
+    
+    .cg-tab-panel::-webkit-scrollbar {
+      width: 6px;
+    }
+    
+    .cg-tab-panel::-webkit-scrollbar-track {
+      background: hsl(0, 0%, 14.9%);
+      border-radius: 3px;
+    }
+    
+    .cg-tab-panel::-webkit-scrollbar-thumb {
+      background: hsl(0, 0%, 18%);
+      border-radius: 3px;
+    }
+    
+    .cg-tab-panel::-webkit-scrollbar-thumb:hover {
+      background: hsl(0, 0%, 25%);
     }
 
     /* Chatbot panel styles */
@@ -4268,17 +4311,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ enabled: extensionEnabled });
   }
 
-  // Extension icon was clicked → toggle if already running, or grab context
+  // Extension icon was clicked → toggle extension on/off
   if (message.type === 'GRAB_CONTEXT') {
-    // If user clicks icon, toggle the extension instead of grabbing context
+    // Toggle the extension - agent flow runs automatically via dwell detection
     toggleExtension();
     sendResponse({ received: true, enabled: extensionEnabled });
   }
 
   // Receive Google search results from background
+  // These are now ONLY used for Resources tab webpages via searchRelevantWebpages()
+  // DO NOT show search results overlay - agents handle all display now
   if (message.type === 'SHOW_SEARCH_RESULTS') {
-    showSearchResultsOverlay(message.data);
+    // The searchRelevantWebpages function has its own listener to handle these for Resources tab
+    // We completely ignore legacy search results - agents are the only display method
+    console.log('[ContextGrabber] Received search results (for Resources tab only, not displaying overlay)');
     sendResponse({ success: true });
+    return; // Don't process further
   }
 
   // Receive Google Images results from background
@@ -4287,6 +4335,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
   }
 
+  // Receive agent orchestration results
+  if (message.type === 'SHOW_AGENT_RESULTS') {
+    showAgentResultsOverlay(message.data.orchestrationResult, message.data.relevantWebpages || []);
+    sendResponse({ success: true });
   // Real-time gaze updates from WebSocket or HTTP poll (gaze2 stream)
   if (message.type === 'GAZE_UPDATE') {
     const raw = message.data;
@@ -4497,6 +4549,285 @@ function showImageResultsInOverlay(data) {
   setOverlayStatus('Images loaded');
 }
 
+/**
+ * Searches for relevant webpages based on concepts and hypothesis
+ * @param {Array<string>} concepts - Concepts from Agent 2.0
+ * @param {Object} hypothesis - Winning hypothesis from Agent 3.0
+ * @returns {Promise<Array>} Array of {title, url, snippet}
+ */
+async function searchRelevantWebpages(concepts, hypothesis) {
+  return new Promise((resolve) => {
+    // Build search query from concepts and hypothesis
+    const conceptText = concepts && concepts.length > 0 ? concepts.join(' ') : '';
+    const hypothesisText = hypothesis?.hypothesis || '';
+    const searchQuery = `${conceptText} ${hypothesisText}`.trim().substring(0, 100);
+    
+    if (!searchQuery) {
+      resolve([]);
+      return;
+    }
+    
+    // Store pending search with unique ID
+    const searchId = `webpage_search_${Date.now()}_${Math.random()}`;
+    if (!window._pendingWebpageSearches) {
+      window._pendingWebpageSearches = new Map();
+    }
+    
+    // Set up one-time listener for search results
+    const listener = (message) => {
+      if (message.type === 'SHOW_SEARCH_RESULTS') {
+        const messageQuery = (message.data.query || '').toLowerCase();
+        const ourQuery = searchQuery.toLowerCase();
+        
+        // Match if queries are similar (check if they share significant words)
+        const ourWords = ourQuery.split(/\s+/).filter(w => w.length > 3);
+        const messageWords = messageQuery.split(/\s+/).filter(w => w.length > 3);
+        const matchingWords = ourWords.filter(w => messageWords.includes(w));
+        
+        // If at least 30% of words match, consider it our search
+        if (matchingWords.length > 0 && matchingWords.length >= Math.ceil(ourWords.length * 0.3)) {
+          chrome.runtime.onMessage.removeListener(listener);
+          if (window._pendingWebpageSearches) {
+            window._pendingWebpageSearches.delete(searchId);
+          }
+          resolve(message.data.results || []);
+        }
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    
+    // Store search info
+    window._pendingWebpageSearches.set(searchId, { query: searchQuery, resolve, listener });
+    
+    // Use existing Google search functionality
+    chrome.runtime.sendMessage(
+      {
+        type: 'SEARCH_GOOGLE',
+        data: {
+          url: window.location.href,
+          text: searchQuery
+        }
+      },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn('[ContextGrabber] Web search error:', chrome.runtime.lastError);
+          chrome.runtime.onMessage.removeListener(listener);
+          if (window._pendingWebpageSearches) {
+            window._pendingWebpageSearches.delete(searchId);
+          }
+          resolve([]);
+        }
+      }
+    );
+    
+    // Timeout after 5 seconds
+    setTimeout(() => {
+      chrome.runtime.onMessage.removeListener(listener);
+      if (window._pendingWebpageSearches) {
+        window._pendingWebpageSearches.delete(searchId);
+      }
+      resolve([]);
+    }, 5000);
+  });
+}
+
+/**
+ * Displays agent orchestration results in the overlay
+ * @param {Object} orchestrationResult - Full orchestration result with agent outputs
+ * @param {Array} relevantWebpages - Relevant webpages from search
+ */
+function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
+  if (!orchestrationResult || !orchestrationResult.data) {
+    console.warn('[ContextGrabber] Invalid orchestration result');
+    return;
+  }
+  
+  const agents = orchestrationResult.data.agents || {};
+  const agent2 = agents['2.0'] || agents['target_interpreter'] || {};
+  const agent3 = agents['3.0'] || agents['gap_hypothesis'] || {};
+  const agent4 = agents['4.0'] || agents['explanation_composer'] || {};
+  
+  // #region agent log
+  const debugAgentData = {location:'content.js:4405',message:'agent data extracted',data:{agent2Keys:Object.keys(agent2),agent3Keys:Object.keys(agent3),agent4Keys:Object.keys(agent4),hasContentType:!!agent2.content_type,hasConcepts:!!(agent2.concepts?.length),hasCandidates:!!(agent3.candidates?.length),hasInstantHud:!!agent4.instant_hud,hasDeepDive:!!agent4.deep_dive,agent2Sample:JSON.stringify(agent2).substring(0,200),agent3Sample:JSON.stringify(agent3).substring(0,200),agent4Sample:JSON.stringify(agent4).substring(0,200)},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
+  console.log('[DEBUG]', JSON.stringify(debugAgentData));
+  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugAgentData)}).catch(()=>{});
+  // #endregion
+  
+  // Get winning hypothesis
+  let winningHypothesis = null;
+  if (agent3.candidates && agent3.winning_hypothesis) {
+    winningHypothesis = agent3.candidates.find(c => c.id === agent3.winning_hypothesis) || agent3.candidates[0];
+  } else if (agent3.candidates && agent3.candidates.length > 0) {
+    winningHypothesis = agent3.candidates[0];
+  }
+  
+  // #region agent log
+  const debugShowOverlay = {location:'content.js:4399',message:'showAgentResultsOverlay called',data:{hasResult:!!orchestrationResult,hasData:!!orchestrationResult?.data,hasAgents:!!(orchestrationResult?.data?.agents),agentKeys:orchestrationResult?.data?.agents?Object.keys(orchestrationResult.data.agents):[],webpageCount:relevantWebpages?.length||0,hasWinningHypothesis:!!winningHypothesis},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
+  console.log('[DEBUG]', JSON.stringify(debugShowOverlay));
+  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugShowOverlay)}).catch(()=>{});
+  // #endregion
+  
+  let html = '';
+  
+  // Snapshot preview removed per user request - no longer showing snapshot UI
+  
+  // Tab bar: Summary | Explanation | Resources
+  html += '<div class="cg-tab-bar">';
+  html += '<button class="cg-tab cg-tab-active" data-tab="summary">Summary</button>';
+  html += '<button class="cg-tab" data-tab="explanation">Explanation</button>';
+  html += '<button class="cg-tab" data-tab="resources">Resources</button>';
+  html += '</div>';
+  
+  // Summary Tab
+  html += '<div class="cg-tab-panel" id="cg-panel-summary">';
+  html += '<div class="cg-section">';
+  
+  // Summary (detailed summary from Agent 2.0)
+  if (agent2.summary) {
+    html += '<div style="margin-bottom: 16px;"><strong>Summary</strong>';
+    html += `<p style="margin-top: 8px; line-height: 1.6;">${escapeHtml(agent2.summary)}</p>`;
+    html += '</div>';
+  }
+  
+  // Content Type
+  if (agent2.content_type) {
+    html += `<div style="margin-bottom: 12px;"><strong>Content Type</strong><p style="display: inline-block; padding: 4px 8px; background: hsl(0, 0%, 18%); border-radius: 4px; margin-left: 8px;">${escapeHtml(agent2.content_type)}</p></div>`;
+  }
+  
+  // Concepts section REMOVED per user request
+  
+  // Gap Hypothesis
+  if (winningHypothesis) {
+    html += '<div style="margin-bottom: 12px;"><strong>Gap Hypothesis</strong>';
+    html += `<p style="margin-top: 8px;">${escapeHtml(winningHypothesis.hypothesis || '')}</p>`;
+    if (winningHypothesis.prerequisites && winningHypothesis.prerequisites.length > 0) {
+      html += '<div style="margin-top: 8px;"><strong style="font-size: 12px;">Prerequisites:</strong><ul style="margin: 4px 0 0 20px; font-size: 13px;">';
+      winningHypothesis.prerequisites.forEach(prereq => {
+        html += `<li>${escapeHtml(prereq)}</li>`;
+      });
+      html += '</ul></div>';
+    }
+    html += '</div>';
+  }
+  
+  // Fallback message if no agent data is available
+  if (!agent2.summary && !agent2.content_type && !winningHypothesis) {
+    html += '<div style="margin-bottom: 12px;"><p style="color: hsl(0, 0%, 60%);">Agent analysis completed. Check the Explanation tab for detailed insights.</p></div>';
+  }
+  
+  html += '</div></div>';
+  
+  // Explanation Tab
+  html += '<div class="cg-tab-panel" id="cg-panel-explanation" style="display:none">';
+  
+  // Check if Agent 4.0 has error
+  if (agent4.error) {
+    html += '<div class="cg-section">';
+    html += '<p style="color: hsl(0, 0%, 60%);">Explanation generation is pending. This usually means a gap hypothesis needs to be identified first.</p>';
+    if (winningHypothesis) {
+      html += '<p style="margin-top: 8px; color: hsl(0, 0%, 60%);">A hypothesis was found but explanation generation encountered an issue. Please try again.</p>';
+    }
+    html += '</div>';
+  }
+  
+  // Instant HUD
+  if (agent4.instant_hud) {
+    html += '<div class="cg-section">';
+    html += '<strong>Quick Summary</strong>';
+    if (agent4.instant_hud.summary || agent4.instant_hud.body) {
+      html += `<p style="margin-top: 8px; line-height: 1.6;">${escapeHtml(agent4.instant_hud.summary || agent4.instant_hud.body || '')}</p>`;
+    }
+    if (agent4.instant_hud.key_points && agent4.instant_hud.key_points.length > 0) {
+      html += '<ul style="margin: 8px 0 0 20px;">';
+      agent4.instant_hud.key_points.forEach(point => {
+        html += `<li>${escapeHtml(point)}</li>`;
+      });
+      html += '</ul>';
+    }
+    html += '</div>';
+  }
+  
+  // Deep Dive
+  if (agent4.deep_dive) {
+    html += '<div class="cg-section">';
+    html += '<strong>Deep Dive</strong>';
+    // Handle both old format (full_explanation) and new format (explanation)
+    const explanationText = agent4.deep_dive.explanation || agent4.deep_dive.full_explanation;
+    if (explanationText) {
+      html += `<p style="white-space: pre-wrap; line-height: 1.6; margin-top: 8px;">${escapeHtml(explanationText)}</p>`;
+    }
+    if (agent4.deep_dive.examples && agent4.deep_dive.examples.length > 0) {
+      html += '<div style="margin-top: 12px;"><strong style="font-size: 12px;">Examples:</strong>';
+      agent4.deep_dive.examples.forEach(example => {
+        // Handle both string examples and object examples
+        const exampleText = typeof example === 'string' ? example : (example.content || example.description || JSON.stringify(example));
+        html += `<div style="margin: 8px 0; padding: 8px; background: hsl(0, 0%, 14.9%); border-radius: 4px; font-size: 13px; line-height: 1.5;">${escapeHtml(exampleText)}</div>`;
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  
+  // Fallback if no explanation data
+  if (!agent4.instant_hud && !agent4.deep_dive && !agent4.error) {
+    html += '<div class="cg-section">';
+    html += '<p style="color: hsl(0, 0%, 60%);">Explanation is being generated. Please check back in a moment.</p>';
+    html += '</div>';
+  }
+  
+  html += '</div>';
+  
+  // Resources Tab
+  html += '<div class="cg-tab-panel" id="cg-panel-resources" style="display:none">';
+  if (relevantWebpages && relevantWebpages.length > 0) {
+    html += '<div class="cg-results">';
+    relevantWebpages.forEach((page) => {
+      html += '<div class="cg-result-item">';
+      html += `<a href="${escapeHtml(page.url)}" target="_blank" class="cg-result-title">${escapeHtml(page.title || 'Untitled')}</a>`;
+      html += `<div class="cg-result-url">${escapeHtml(page.url.substring(0, 60))}${page.url.length > 60 ? '...' : ''}</div>`;
+      if (page.snippet) {
+        html += `<div class="cg-result-snippet">${escapeHtml(page.snippet)}</div>`;
+      }
+      html += '</div>';
+    });
+    html += '</div>';
+  } else {
+    html += '<p class="cg-loading">No relevant webpages found.</p>';
+  }
+  html += '</div>';
+  
+  // #region agent log
+  const debugBeforeUpdate = {location:'content.js:4522',message:'about to update overlay content',data:{htmlLength:html.length,hasCurrentOverlay:!!currentOverlay},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
+  console.log('[DEBUG]', JSON.stringify(debugBeforeUpdate));
+  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugBeforeUpdate)}).catch(()=>{});
+  // #endregion
+  
+  updateOverlayContent(html);
+  setOverlayStatus('Analysis complete');
+  activeTab = 'summary';
+  
+  // #region agent log
+  const debugAfterUpdate = {location:'content.js:4525',message:'overlay content updated',data:{hasCurrentOverlay:!!currentOverlay,overlayVisible:currentOverlay?.style?.display!=='none'},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
+  console.log('[DEBUG]', JSON.stringify(debugAfterUpdate));
+  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugAfterUpdate)}).catch(()=>{});
+  // #endregion
+  
+  // Wire up tab switching
+  const tabs = currentOverlay.querySelectorAll('.cg-tab');
+  tabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      tabs.forEach(t => t.classList.remove('cg-tab-active'));
+      tab.classList.add('cg-tab-active');
+      
+      const panelId = tab.dataset.tab;
+      currentOverlay.querySelector('#cg-panel-summary').style.display = panelId === 'summary' ? 'block' : 'none';
+      currentOverlay.querySelector('#cg-panel-explanation').style.display = panelId === 'explanation' ? 'block' : 'none';
+      currentOverlay.querySelector('#cg-panel-resources').style.display = panelId === 'resources' ? 'block' : 'none';
+      activeTab = panelId;
+    });
+  });
+}
+
 // ============================================================================
 // DWELL DETECTION: Trigger scrape when position stays still
 // ============================================================================
@@ -4516,6 +4847,216 @@ function distance(a, b) {
  * @param {string} imageDataUrl - Data URL of the snapshot image
  * @returns {Promise<Array|null>} - Array of results or null on error/timeout
  */
+/**
+ * Send screenshot to Agent 1.0 (Capture & Scrape) API
+ * @param {string} imageDataUrl - Screenshot as data URL
+ * @param {string} url - Current page URL
+ * @param {Object} cursorPos - Cursor position {x, y}
+ * @param {string} textExtraction - Pre-extracted text from DOM
+ * @returns {Promise<Object|null>} Agent 1.0 response or null
+ */
+async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtraction) {
+  // #region agent log
+  const debugEntry = {location:'content.js:4569',message:'sendScreenshotToAgent10 entry',data:{hasImage:!!imageDataUrl,url:url?.substring(0,50),textLen:textExtraction?.length||0},timestamp:Date.now(),runId:'run1',hypothesisId:'A,B,C,D,E,F'};
+  console.log('[DEBUG]', JSON.stringify(debugEntry));
+  fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugEntry)}).catch(()=>{});
+  // #endregion
+  if (!imageDataUrl) return null;
+  
+  try {
+    // Get API base URL and auth token from storage
+    const storageData = await new Promise((resolve) => {
+      chrome.storage.local.get(['api_base_url', 'auth_token', 'user_id', 'session_id'], (result) => {
+        resolve({
+          apiBase: result.api_base_url || 'http://localhost:8000',
+          authToken: result.auth_token || null,
+          userId: result.user_id || null,
+          sessionId: result.session_id || null
+        });
+      });
+    });
+    // #region agent log
+    const debugStorage = {location:'content.js:4584',message:'storage data retrieved',data:{apiBase:storageData.apiBase,hasAuth:!!storageData.authToken,hasUserId:!!storageData.userId,hasSessionId:!!storageData.sessionId},timestamp:Date.now(),runId:'run1',hypothesisId:'F'};
+    console.log('[DEBUG]', JSON.stringify(debugStorage));
+    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugStorage)}).catch(()=>{});
+    // #endregion
+    
+    // First, call Agent 1.0 to capture content
+    const agent10Url = `${storageData.apiBase}/api/agents/capture-scrape`;
+    
+    // Prepare capture request payload
+    const capturePayload = {
+      url: url,
+      cursor_position: cursorPos,
+      screenshot: imageDataUrl,  // Base64 data URL
+      text_extraction: textExtraction || '',  // Pre-extracted text
+      context_lines: CONTEXT_LINES_BEFORE + CONTEXT_LINES_AFTER,
+      dwell_time_ms: DWELL_TIME_MS,
+      user_id: storageData.userId,
+      session_id: storageData.sessionId
+    };
+    
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+    
+    if (storageData.authToken) {
+      headers['Authorization'] = `Bearer ${storageData.authToken}`;
+    }
+    
+    // POST to Agent 1.0 API with timeout
+    const controller1 = new AbortController();
+    const timeoutId1 = setTimeout(() => controller1.abort(), 10000);  // 10s timeout for vision processing
+    
+    const captureResponse = await fetch(agent10Url, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(capturePayload),
+      signal: controller1.signal
+    });
+    
+    clearTimeout(timeoutId1);
+    // #region agent log
+    const debugCaptureResp = {location:'content.js:4619',message:'capture response received',data:{status:captureResponse.status,ok:captureResponse.ok,url:agent10Url.substring(0,60)},timestamp:Date.now(),runId:'run1',hypothesisId:'B'};
+    console.log('[DEBUG]', JSON.stringify(debugCaptureResp));
+    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCaptureResp)}).catch(()=>{});
+    // #endregion
+    
+    if (!captureResponse.ok) {
+      console.warn('[ContextGrabber] Agent 1.0 returned status:', captureResponse.status);
+      // #region agent log
+      const debugCaptureFail = {location:'content.js:4623',message:'capture endpoint failed',data:{status:captureResponse.status},timestamp:Date.now(),runId:'run1',hypothesisId:'B'};
+      console.log('[DEBUG]', JSON.stringify(debugCaptureFail));
+      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCaptureFail)}).catch(()=>{});
+      // #endregion
+      return null;
+    }
+    
+    const captureResult = await captureResponse.json();
+    // #region agent log
+    const debugCaptureResult = {location:'content.js:4628',message:'capture result parsed',data:{success:captureResult.success,hasData:!!captureResult.data,error:captureResult.error},timestamp:Date.now(),runId:'run1',hypothesisId:'B'};
+    console.log('[DEBUG]', JSON.stringify(debugCaptureResult));
+    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCaptureResult)}).catch(()=>{});
+    // #endregion
+    
+    if (!captureResult.success || !captureResult.data) {
+      console.warn('[ContextGrabber] Agent 1.0 failed:', captureResult.error);
+      // #region agent log
+      const debugCaptureInvalid = {location:'content.js:4630',message:'capture result invalid returning partial',data:{success:captureResult.success,hasData:!!captureResult.data},timestamp:Date.now(),runId:'run1',hypothesisId:'B'};
+      console.log('[DEBUG]', JSON.stringify(debugCaptureInvalid));
+      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCaptureInvalid)}).catch(()=>{});
+      // #endregion
+      // Return with success=false so caller knows capture failed
+      return {
+        success: false,
+        data: {
+          capture: captureResult.data || null,
+          orchestration: null
+        },
+        error: captureResult.error || 'Capture failed'
+      };
+    }
+    
+    // Now call orchestration endpoint to process through full pipeline
+    const orchestrateUrl = `${storageData.apiBase}/api/agents/orchestrate`;
+    
+    const orchestratePayload = {
+      user_id: storageData.userId,
+      capture_result: captureResult.data,
+      session_id: storageData.sessionId
+    };
+    
+    const controller2 = new AbortController();
+    const timeoutId2 = setTimeout(() => controller2.abort(), 30000);  // 30s timeout for full orchestration
+    
+    const orchestrateResponse = await fetch(orchestrateUrl, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(orchestratePayload),
+      signal: controller2.signal
+    });
+    
+    clearTimeout(timeoutId2);
+    // #region agent log
+    const debugOrchResp = {location:'content.js:4652',message:'orchestration response received',data:{status:orchestrateResponse.status,ok:orchestrateResponse.ok,url:orchestrateUrl.substring(0,60)},timestamp:Date.now(),runId:'run1',hypothesisId:'C'};
+    console.log('[DEBUG]', JSON.stringify(debugOrchResp));
+    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugOrchResp)}).catch(()=>{});
+    // #endregion
+    
+    if (!orchestrateResponse.ok) {
+      console.warn('[ContextGrabber] Orchestration returned status:', orchestrateResponse.status);
+      // #region agent log
+      const debugOrchFail = {location:'content.js:4657',message:'orchestration endpoint failed returning capture only',data:{status:orchestrateResponse.status},timestamp:Date.now(),runId:'run1',hypothesisId:'C'};
+      console.log('[DEBUG]', JSON.stringify(debugOrchFail));
+      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugOrchFail)}).catch(()=>{});
+      // #endregion
+      // Return result with success=false when orchestration fails, so caller knows it failed
+      return {
+        success: false,
+        data: {
+          capture: captureResult.data,
+          orchestration: null
+        },
+        error: `Orchestration endpoint returned status ${orchestrateResponse.status}`
+      };
+    }
+    
+    const orchestrateResult = await orchestrateResponse.json();
+    // #region agent log
+    const debugOrchResult = {location:'content.js:4662',message:'orchestration result parsed',data:{success:orchestrateResult.success,hasData:!!orchestrateResult.data,hasAgents:!!(orchestrateResult.data?.agents),agentKeys:orchestrateResult.data?.agents?Object.keys(orchestrateResult.data.agents):[],error:orchestrateResult.error},timestamp:Date.now(),runId:'run1',hypothesisId:'D,E'};
+    console.log('[DEBUG]', JSON.stringify(debugOrchResult));
+    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugOrchResult)}).catch(()=>{});
+    // #endregion
+    
+    // Check if orchestration actually succeeded
+    if (!orchestrateResult.success || !orchestrateResult.data) {
+      // #region agent log
+      const debugOrchFailed = {location:'content.js:4708',message:'orchestration result has success=false',data:{success:orchestrateResult.success,hasData:!!orchestrateResult.data,error:orchestrateResult.error},timestamp:Date.now(),runId:'run1',hypothesisId:'D'};
+      console.log('[DEBUG]', JSON.stringify(debugOrchFailed));
+      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugOrchFailed)}).catch(()=>{});
+      // #endregion
+      return {
+        success: false,
+        data: {
+          capture: captureResult.data,
+          orchestration: null
+        },
+        error: orchestrateResult.error || 'Orchestration returned success=false'
+      };
+    }
+    
+    // Merge orchestration results with capture result
+    const mergedResult = {
+      success: orchestrateResult.success,
+      data: {
+        capture: captureResult.data,
+        orchestration: orchestrateResult.data
+      },
+      error: orchestrateResult.error
+    };
+    // #region agent log
+    const debugMerged = {location:'content.js:4670',message:'sendScreenshotToAgent10 returning merged result',data:{success:mergedResult.success,hasOrchestration:!!mergedResult.data.orchestration,hasAgents:!!(mergedResult.data.orchestration?.agents),agentKeys:mergedResult.data.orchestration?.agents?Object.keys(mergedResult.data.orchestration.agents):[]},timestamp:Date.now(),runId:'run1',hypothesisId:'D,E'};
+    console.log('[DEBUG]', JSON.stringify(debugMerged));
+    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugMerged)}).catch(()=>{});
+    // #endregion
+    return mergedResult;
+  } catch (err) {
+    // #region agent log
+    const debugException = {location:'content.js:4671',message:'sendScreenshotToAgent10 exception caught',data:{name:err.name,message:err.message,isAbort:err.name==='AbortError',isFetchError:err.message?.includes('Failed to fetch')},timestamp:Date.now(),runId:'run1',hypothesisId:'A'};
+    console.log('[DEBUG]', JSON.stringify(debugException));
+    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugException)}).catch(()=>{});
+    // #endregion
+    if (err.name === 'AbortError') {
+      console.warn('[ContextGrabber] Request timed out');
+    } else if (err.message && err.message.includes('Failed to fetch')) {
+      console.warn('[ContextGrabber] Request failed: Backend may be offline or CORS issue');
+    } else {
+      console.warn('[ContextGrabber] Request failed:', err.message || err.toString());
+    }
+    return null;
+  }
+}
+
 async function sendImageToBackend(imageDataUrl) {
   const apiUrl = await getAnalyzeApiUrl();
   if (!imageDataUrl || !apiUrl) return null;
@@ -4563,6 +5104,112 @@ async function sendImageToBackend(imageDataUrl) {
       console.warn('[ContextGrabber] Backend image analysis failed:', err.message || err.toString());
     }
     return null;
+  }
+}
+
+/**
+ * Auto-saves notebook entry with agent data
+ * @param {Object} orchestrationResult - Full orchestration result
+ * @param {Array} relevantWebpages - Relevant webpages
+ * @param {string} originalText - Original extracted text
+ * @param {string} url - Page URL
+ */
+async function autoSaveToNotebook(orchestrationResult, relevantWebpages, originalText, url) {
+  try {
+    const agents = orchestrationResult.data?.agents || {};
+    const agent2 = agents['2.0'] || agents['target_interpreter'] || {};
+    const agent3 = agents['3.0'] || agents['gap_hypothesis'] || {};
+    const agent4 = agents['4.0'] || agents['explanation_composer'] || {};
+    
+    // Get winning hypothesis
+    let winningHypothesis = null;
+    if (agent3.candidates && agent3.winning_hypothesis) {
+      winningHypothesis = agent3.candidates.find(c => c.id === agent3.winning_hypothesis) || agent3.candidates[0];
+    }
+    
+    // Get storage data
+    const storageData = await new Promise((resolve) => {
+      chrome.storage.local.get(['api_base_url', 'auth_token', 'user_id', 'session_id'], (result) => {
+        resolve({
+          apiBase: result.api_base_url || 'http://localhost:8000',
+          authToken: result.auth_token || null,
+          userId: result.user_id || null,
+          sessionId: result.session_id || null
+        });
+      });
+    });
+    
+    if (!storageData.userId || !storageData.authToken) {
+      console.warn('[ContextGrabber] Cannot auto-save: missing user_id or auth_token');
+      return;
+    }
+    
+    // Prepare notebook entry data
+    const title = agent2.content_type || winningHypothesis?.hypothesis?.substring(0, 50) || 'Untitled Entry';
+    const snippet = agent4.instant_hud?.summary || originalText.substring(0, 200);
+    const preview = agent4.deep_dive?.explanation?.substring(0, 500) || snippet;
+    const concepts = agent2.concepts || [];
+    const prerequisites = winningHypothesis?.prerequisites || [];
+    const tags = [...concepts, ...prerequisites].filter(Boolean);
+    
+    // Full content as JSON
+    const content = JSON.stringify({
+      agentData: {
+        classification: agent2,
+        hypothesis: agent3,
+        explanation: agent4
+      },
+      relevantWebpages: relevantWebpages,
+      originalText: originalText,
+      url: url,
+      timestamp: new Date().toISOString()
+    });
+    
+    const entryData = {
+      sessionId: storageData.sessionId,
+      title: title,
+      snippet: snippet,
+      preview: preview,
+      content: content,
+      tags: tags,
+      date: new Date().toISOString().split('T')[0]
+    };
+    
+    // Call backend API
+    const response = await fetch(`${storageData.apiBase}/api/personal/notebook-entries`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${storageData.authToken}`
+      },
+      body: JSON.stringify(entryData)
+    });
+    
+    if (response.ok) {
+      const result = await response.json();
+      console.log('[ContextGrabber] Auto-saved to notebook:', result.id);
+      setOverlayStatus('Saved to notebook');
+      
+      // Show success notification briefly
+      setTimeout(() => {
+        if (currentOverlay) {
+          const statusEl = currentOverlay.querySelector('.cg-status');
+          if (statusEl) {
+            statusEl.textContent = 'Saved to notebook';
+            setTimeout(() => {
+              statusEl.textContent = '';
+            }, 3000);
+          }
+        }
+      }, 100);
+    } else {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+      console.warn('[ContextGrabber] Auto-save failed:', error);
+      setOverlayStatus('Save failed');
+    }
+  } catch (err) {
+    console.error('[ContextGrabber] Auto-save error:', err);
+    setOverlayStatus('Save error');
   }
 }
 
@@ -4623,6 +5270,24 @@ async function triggerSearchFromPoint(x, y, snapshotSize = SNAPSHOT_SIZE) {
     }).catch(() => {}); // Ignore errors
   }
 
+  // --- AGENT ORCHESTRATION FLOW (Primary Method) ---
+  // Always try to use agents, with or without snapshot
+  let agentFlowCompleted = false;
+  
+  // 1) Try to capture a snapshot of the area around the dwell point
+  try {
+    const snapshot = await captureAreaSnapshot(x, y);
+    lastSnapshotDataUrl = snapshot;
+  } catch (err) {
+    console.warn('[ContextGrabber] Snapshot capture failed:', err);
+    lastSnapshotDataUrl = null;
+    
+    // Check if it's a permission error
+    const errorMsg = err.message || err.toString();
+    if (errorMsg.includes('activeTab') || errorMsg.includes('not been invoked') || 
+        errorMsg.includes('permission') || errorMsg.includes('Permission')) {
+      console.warn('[ContextGrabber] Screenshot permission not available, will use text-only for agents');
+      // Continue without snapshot - agents can work with text only
   // --- SCREENSHOT API PRIORITY MODE ---
   if (SCREENSHOT_PRIORITY === 'api-only' || SCREENSHOT_PRIORITY === 'api-first') {
     // 1) Capture a snapshot of the area around the dwell point
@@ -4650,7 +5315,32 @@ async function triggerSearchFromPoint(x, y, snapshotSize = SNAPSHOT_SIZE) {
         }
       }
     }
+  }
 
+  // 2) Send to Agent 1.0 (Capture & Scrape) API and orchestrate
+  // Try with snapshot if available, or text-only if not
+  try {
+    console.log('[ContextGrabber] Sending to Agent 1.0 API...');
+    setOverlayStatus('Extracting content...');
+    
+    const agent10Result = await sendScreenshotToAgent10(lastSnapshotDataUrl, url, { x, y }, text);
+    // #region agent log
+    const debugResultReceived = {location:'content.js:4922',message:'agent10Result received in triggerSearchFromPoint',data:{isNull:!agent10Result,hasSuccess:!!(agent10Result?.success),success:agent10Result?.success,hasData:!!agent10Result?.data,hasOrchestration:!!(agent10Result?.data?.orchestration),hasAgents:!!(agent10Result?.data?.orchestration?.agents),agentKeys:agent10Result?.data?.orchestration?.agents?Object.keys(agent10Result.data.orchestration.agents):[]},timestamp:Date.now(),runId:'run1',hypothesisId:'A,B,C,D,E'};
+    console.log('[DEBUG]', JSON.stringify(debugResultReceived));
+    fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugResultReceived)}).catch(()=>{});
+    // #endregion
+    if (agent10Result && agent10Result.success) {
+      // The structure from sendScreenshotToAgent10 is:
+      // { success: true, data: { capture: {...}, orchestration: { agents: {...} } } }
+      const resultData = agent10Result.data || {};
+      const captureData = resultData.capture || resultData;
+      const orchestrationData = resultData.orchestration;
+      
+      console.log('[ContextGrabber] Agent 1.0 result structure:', {
+        hasCapture: !!captureData,
+        hasOrchestration: !!orchestrationData,
+        dataKeys: Object.keys(resultData),
+        orchestrationKeys: orchestrationData ? Object.keys(orchestrationData) : []
     // 2) Send to backend image analysis API
     let backendResults = null;
     const currentApiUrl = await getAnalyzeApiUrl();
@@ -4676,32 +5366,102 @@ async function triggerSearchFromPoint(x, y, snapshotSize = SNAPSHOT_SIZE) {
         query: text.substring(0, 60) + '...',
         results: backendResults
       });
-      return;
-    }
-
-    // 4) If api-only mode and no results, show message and stop
-    if (SCREENSHOT_PRIORITY === 'api-only') {
-      if (!lastSnapshotDataUrl) {
-        showErrorOverlay('Capture Failed', 
-          'Unable to capture screenshot. Make sure you\'ve clicked the extension icon to grant permissions.');
-      } else if (!backendResults || backendResults.length === 0) {
-        showErrorOverlay('No Results', 
-          'The backend API did not return any results. Falling back to text-based search.');
-        // Fall through to Google search as fallback
-      } else {
-        setOverlayStatus('API complete');
-        // Still show the snapshot if captured
-        if (lastSnapshotDataUrl) {
-          showSearchResultsOverlay({
-            query: text.substring(0, 60) + '...',
-            results: backendResults || []
-          });
+      // #region agent log
+      const debugExtracted = {location:'content.js:4930',message:'extracted orchestration data',data:{hasOrchestration:!!orchestrationData,orchestrationKeys:orchestrationData?Object.keys(orchestrationData):[],hasAgents:!!(orchestrationData?.agents),agentKeys:orchestrationData?.agents?Object.keys(orchestrationData.agents):[]},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
+      console.log('[DEBUG]', JSON.stringify(debugExtracted));
+      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugExtracted)}).catch(()=>{});
+      // #endregion
+      
+      // Use extracted text if better than DOM extraction
+      if (captureData?.extracted_text && captureData.extracted_text.length > text.length) {
+        text = captureData.extracted_text;
+        console.log('[ContextGrabber] Using Agent 1.0 extracted text (better than DOM)');
+      }
+      
+      // Check if orchestration result is available
+      const agents = orchestrationData?.agents || {};
+      // #region agent log
+      const debugAgentsCheck = {location:'content.js:4944',message:'checking agents object',data:{hasAgents:!!agents,agentCount:Object.keys(agents).length,agentKeys:Object.keys(agents),agent2Full:JSON.stringify(agents['2.0']||{}).substring(0,500),agent3Full:JSON.stringify(agents['3.0']||{}).substring(0,500),agent4Full:JSON.stringify(agents['4.0']||{}).substring(0,500),orchestrationDataFull:JSON.stringify(orchestrationData).substring(0,1000)},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
+      console.log('[DEBUG]', JSON.stringify(debugAgentsCheck));
+      console.log('[DEBUG FULL] Orchestration data:', JSON.stringify(orchestrationData, null, 2));
+      console.log('[DEBUG FULL] Agents:', JSON.stringify(agents, null, 2));
+      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugAgentsCheck)}).catch(()=>{});
+      // #endregion
+      
+      if (agents && Object.keys(agents).length > 0) {
+        console.log('[ContextGrabber] Orchestration complete, processing results. Agents:', Object.keys(agents));
+        setOverlayStatus('Processing agent results...');
+        
+        // Extract concepts and hypothesis for web search
+        const agent2 = agents['2.0'] || agents['target_interpreter'] || {};
+        const agent3 = agents['3.0'] || agents['gap_hypothesis'] || {};
+        
+        // Get winning hypothesis
+        let winningHypothesis = null;
+        if (agent3.candidates && agent3.winning_hypothesis) {
+          winningHypothesis = agent3.candidates.find(c => c.id === agent3.winning_hypothesis) || agent3.candidates[0];
         }
+        
+        // Search for relevant webpages
+        const concepts = agent2.concepts || [];
+        setOverlayStatus('Finding relevant resources...');
+        const relevantWebpages = await searchRelevantWebpages(concepts, winningHypothesis);
+        
+        // Display agent results
+        showAgentResultsOverlay({
+          success: true,
+          data: {
+            agents: agents,
+            capture: captureData
+          }
+        }, relevantWebpages);
+        
+        // Auto-save to notebook
+        await autoSaveToNotebook({
+          success: true,
+          data: {
+            agents: agents,
+            capture: captureData
+          }
+        }, relevantWebpages, text, url);
+        
+        agentFlowCompleted = true;
+        return; // Done with agent flow - don't fall through to Google search
+      } else {
+        console.warn('[ContextGrabber] No orchestration agents found. Full result:', JSON.stringify(agent10Result, null, 2));
+        // #region agent log
+        const debugNoAgents = {location:'content.js:4986',message:'no agents found in orchestration',data:{hasOrchestration:!!orchestrationData,hasAgents:!!(orchestrationData?.agents),agentKeys:orchestrationData?.agents?Object.keys(orchestrationData.agents):[]},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
+        console.log('[DEBUG]', JSON.stringify(debugNoAgents));
+        fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugNoAgents)}).catch(()=>{});
+        // #endregion
+        // Show error instead of falling back to Google search
+        showErrorOverlay('Agent Processing Failed', 
+          'The agent orchestration did not return results. Please check backend logs and ensure agents are running.');
         return;
       }
+    } else {
+      console.warn('[ContextGrabber] Agent 1.0 call failed or returned no success:', agent10Result);
+      // #region agent log
+      const debugCheckFailed = {location:'content.js:4992',message:'agent10Result check failed showing error',data:{isNull:!agent10Result,hasSuccess:!!(agent10Result?.success),success:agent10Result?.success},timestamp:Date.now(),runId:'run1',hypothesisId:'A,B,C,D'};
+      console.log('[DEBUG]', JSON.stringify(debugCheckFailed));
+      fetch('http://127.0.0.1:7243/ingest/6ed3f67c-a961-4b6e-83a6-c9bfc2dcd30b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(debugCheckFailed)}).catch(()=>{});
+      // #endregion
+      showErrorOverlay('Agent Processing Failed', 
+        'Failed to process content with agents. Please check backend connection and try again.');
+      return;
     }
-    // Otherwise fall through to Google search (api-first mode)
+  } catch (err) {
+    console.error('[ContextGrabber] Agent 1.0 extraction failed:', err);
+    showErrorOverlay('Agent Processing Error', 
+      `Failed to process with agents: ${err.message || err.toString()}. Please check backend connection.`);
+    return;
   }
+  
+  // If we reach here, agent flow didn't complete - show error
+  if (!agentFlowCompleted) {
+    console.error('[ContextGrabber] Agent flow did not complete');
+    showErrorOverlay('Processing Failed', 
+      'Unable to process content. Please ensure backend is running and try again.');
 
   // --- GOOGLE SEARCH FALLBACK ---
   if (SCREENSHOT_PRIORITY !== 'api-only') {

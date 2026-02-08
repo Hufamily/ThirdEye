@@ -1,31 +1,58 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { SessionTimeline } from '../components/personal/SessionTimeline'
 import { MarkdownEditor } from '../components/personal/MarkdownEditor'
 import { AISearchChat } from '../components/personal/AISearchChat'
 import { AccountInfo } from '../components/personal/profile/AccountInfo'
 import { TimeSavedStats } from '../components/personal/profile/TimeSavedStats'
 import { Navigation } from '../components/ui/Navigation'
+import { LoadingSpinner } from '../components/ui/LoadingSpinner'
 import { useUIStore } from '../store/useStore'
+import { getProfile, ProfileResponse } from '../utils/api'
 
 export default function PersonalPage() {
   const [showAISearch, setShowAISearch] = useState(false)
   const { sidebarOpen, setSidebarOpen } = useUIStore()
+  const [profileData, setProfileData] = useState<ProfileResponse | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
-  const [profileData] = useState({
-    name: 'John Doe',
-    email: 'john.doe@example.com',
-    googleConnected: true,
-    timeSaved: {
-      totalHours: 45.5,
-      thisWeek: 8.2,
-      thisMonth: 32.1,
-      breakdown: [
-        { category: 'Documentation Reading', hours: 15.2 },
-        { category: 'Code Review', hours: 12.8 },
-        { category: 'Learning', hours: 17.5 },
-      ],
-    },
-  })
+  useEffect(() => {
+    const fetchProfile = async () => {
+      try {
+        setIsLoading(true)
+        const data = await getProfile()
+        setProfileData(data)
+      } catch (err) {
+        console.error('Failed to fetch profile:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load profile')
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    fetchProfile()
+  }, [])
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <LoadingSpinner />
+      </div>
+    )
+  }
+
+  if (error || !profileData) {
+    return (
+      <div className="min-h-screen bg-background overflow-x-hidden">
+        <Navigation />
+        <div className="w-full max-w-7xl mx-auto px-4 pt-[73px] pb-4">
+          <div className="text-center text-red-500">
+            {error || 'Failed to load profile data'}
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-screen bg-background overflow-x-hidden">
@@ -42,7 +69,10 @@ export default function PersonalPage() {
               totalHours={profileData.timeSaved.totalHours}
               thisWeek={profileData.timeSaved.thisWeek}
               thisMonth={profileData.timeSaved.thisMonth}
-              breakdown={profileData.timeSaved.breakdown}
+              breakdown={profileData.timeSaved.breakdown.map(item => ({
+                category: item.category || item.label || 'Other',
+                hours: item.hours
+              }))}
             />
           </div>
 

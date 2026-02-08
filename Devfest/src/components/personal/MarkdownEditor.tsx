@@ -4,6 +4,8 @@ import { motion } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import { usePersonalPageStore } from '../../store/useStore'
 import { format } from 'date-fns'
+import { getSessionNotes, saveSessionNotes, generateSessionSummary, exportSessionToGoogleDoc, downloadSessionMarkdown } from '../../utils/api'
+import { LoadingSpinner } from '../ui/LoadingSpinner'
 
 interface ChronologicalEntry {
   id: string
@@ -201,93 +203,198 @@ export function MarkdownEditor() {
   const [isRenaming, setIsRenaming] = useState(false)
   const [entries, setEntries] = useState<ChronologicalEntry[]>([])
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date())
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   // Load session data when selected
   useEffect(() => {
-    if (selectedSessionId && mockSessions[selectedSessionId]) {
-      const session = mockSessions[selectedSessionId]
-      // Sort entries by timestamp (newest first)
-      const sortedEntries = [...session.entries].sort(
-        (a, b) => b.timestamp.getTime() - a.timestamp.getTime()
-      )
-      setEntries(sortedEntries)
-      setSessionTitle(session.title)
-      setLastUpdated(session.lastUpdated)
-    } else {
-      setSessionTitle('')
-      setEntries([])
+    const fetchSessionNotes = async () => {
+      if (!selectedSessionId) {
+        setSessionTitle('')
+        setEntries([])
+        return
+      }
+
+      try {
+        setIsLoading(true)
+        setError(null)
+        const sessionNotes = await getSessionNotes(selectedSessionId)
+        
+        // Convert API response to ChronologicalEntry format
+        const convertedEntries: ChronologicalEntry[] = sessionNotes.entries.map((entry: any) => ({
+          id: entry.id,
+          timestamp: new Date(entry.timestamp),
+          searchQuery: entry.searchQuery || '',
+          document: entry.document || { title: '', type: 'other' },
+          context: entry.context || '',
+          agentAction: entry.agentAction || '',
+          agentResponse: entry.agentResponse || '',
+          links: entry.links || []
+        }))
+
+        // Sort entries by timestamp (newest first)
+        const sortedEntries = convertedEntries.sort(
+          (a, b) => b.timestamp.getTime() - a.timestamp.getTime()
+        )
+        
+        setEntries(sortedEntries)
+        setSessionTitle(sessionNotes.title)
+        setLastUpdated(new Date(sessionNotes.lastUpdated))
+      } catch (err) {
+        console.error('Failed to fetch session notes:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load session notes')
+        // Fallback to mock data if available
+        if (mockSessions[selectedSessionId]) {
+          const session = mockSessions[selectedSessionId]
+          const sortedEntries = [...session.entries].sort(
+            (a, b) => b.timestamp.getTime() - a.timestamp.getTime()
+          )
+          setEntries(sortedEntries)
+          setSessionTitle(session.title)
+          setLastUpdated(session.lastUpdated)
+        }
+      } finally {
+        setIsLoading(false)
+      }
     }
+
+    fetchSessionNotes()
   }, [selectedSessionId])
 
-  const handleSaveAll = () => {
-    setLastUpdated(new Date())
-    // Save all entries logic - would call API
-  }
+  const handleSaveAll = async () => {
+    if (!selectedSessionId) return
 
-  const handleGenerateSummary = () => {
-    // Generate summary logic - would call API
-    console.log('Generating summary...')
-  }
-
-  const handleExportGoogleDoc = () => {
-    // Export to Google Doc logic - only knowledge/notes + links
-    const content = entries
-      .map((entry) => {
-        const dateStr = format(entry.timestamp, 'MMM d, yyyy')
-        let docContent = `## ${entry.document.title} - ${dateStr}\n\n`
-        docContent += `${entry.agentResponse}\n\n`
-        
-        if (entry.links.length > 0) {
-          docContent += `**Further Reading:**\n`
-          docContent += entry.links.map((link) => `- [${link.title}](${link.url})${link.description ? ` - ${link.description}` : ''}`).join('\n')
-          docContent += '\n\n'
-        }
-        
-        return docContent
+    try {
+      setIsLoading(true)
+      await saveSessionNotes(selectedSessionId, {
+        title: sessionTitle,
+        entries: entries.map(entry => ({
+          id: entry.id,
+          title: entry.document.title,
+          content: entry.agentResponse,
+          context: entry.context,
+          agentAction: entry.agentAction,
+          agentResponse: entry.agentResponse,
+          links: entry.links,
+          timestamp: entry.timestamp.toISOString()
+        }))
       })
-      .join('---\n\n')
-    
-    const fullContent = `# ${sessionTitle}\n\n${content}`
-    
-    // In a real implementation, this would call Google Docs API
-    console.log('Exporting to Google Doc:', fullContent)
-    // For now, we'll create a downloadable text file that can be imported to Google Docs
-    const blob = new Blob([fullContent], { type: 'text/plain' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${sessionTitle.replace(/\s+/g, '-')}-notes.txt`
-    a.click()
-    URL.revokeObjectURL(url)
+      setLastUpdated(new Date())
+      alert('Notes saved successfully!')
+    } catch (err) {
+      console.error('Failed to save notes:', err)
+      alert('Failed to save notes. Please try again.')
+    } finally {
+      setIsLoading(false)
+    }
   }
 
-  const handleExportMarkdown = () => {
-    // Export markdown - only knowledge/notes + links (no agent metadata)
-    const markdown = entries
-      .map((entry) => {
-        const dateStr = format(entry.timestamp, 'MMM d, yyyy')
-        let docContent = `## ${entry.document.title} - ${dateStr}\n\n`
-        docContent += `${entry.agentResponse}\n\n`
-        
-        if (entry.links.length > 0) {
-          docContent += `**Further Reading:**\n\n`
-          docContent += entry.links.map((link) => `- [${link.title}](${link.url})${link.description ? ` - ${link.description}` : ''}`).join('\n')
-          docContent += '\n\n'
-        }
-        
-        return docContent
+  const handleGenerateSummary = async () => {
+    if (!selectedSessionId) return
+
+    try {
+      setIsLoading(true)
+      const summary = await generateSessionSummary(selectedSessionId)
+      alert(`Summary generated:\n\n${summary.summary}`)
+    } catch (err) {
+      console.error('Failed to generate summary:', err)
+      alert('Failed to generate summary. Please try again.')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleExportGoogleDoc = async () => {
+    if (!selectedSessionId) return
+
+    try {
+      setIsLoading(true)
+      const result = await exportSessionToGoogleDoc(selectedSessionId, {
+        includeMetadata: true,
+        format: 'markdown'
       })
-      .join('---\n\n')
-    
-    const fullMarkdown = `# ${sessionTitle}\n\n${markdown}`
-    
-    const blob = new Blob([fullMarkdown], { type: 'text/markdown' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${sessionTitle.replace(/\s+/g, '-')}-notes.md`
-    a.click()
-    URL.revokeObjectURL(url)
+      alert(`Exported to Google Doc!\n\nURL: ${result.googleDocUrl}`)
+      if (result.googleDocUrl) {
+        window.open(result.googleDocUrl, '_blank')
+      }
+    } catch (err) {
+      console.error('Failed to export to Google Doc:', err)
+      // Fallback to download
+      const content = entries
+        .map((entry) => {
+          const dateStr = format(entry.timestamp, 'MMM d, yyyy')
+          let docContent = `## ${entry.document.title} - ${dateStr}\n\n`
+          docContent += `${entry.agentResponse}\n\n`
+          
+          if (entry.links.length > 0) {
+            docContent += `**Further Reading:**\n`
+            docContent += entry.links.map((link) => `- [${link.title}](${link.url})${link.description ? ` - ${link.description}` : ''}`).join('\n')
+            docContent += '\n\n'
+          }
+          
+          return docContent
+        })
+        .join('---\n\n')
+      
+      const fullContent = `# ${sessionTitle}\n\n${content}`
+      
+      // Create a downloadable text file that can be imported to Google Docs
+      const blob = new Blob([fullContent], { type: 'text/plain' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${sessionTitle.replace(/\s+/g, '-')}-notes.txt`
+      a.click()
+      URL.revokeObjectURL(url)
+      alert('Google Doc export not available. Downloaded as text file instead.')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleExportMarkdown = async () => {
+    if (!selectedSessionId) return
+
+    try {
+      setIsLoading(true)
+      const blob = await downloadSessionMarkdown(selectedSessionId)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${sessionTitle.replace(/\s+/g, '-')}-notes.md`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('Failed to download markdown:', err)
+      // Fallback to client-side generation
+      const markdown = entries
+        .map((entry) => {
+          const dateStr = format(entry.timestamp, 'MMM d, yyyy')
+          let docContent = `## ${entry.document.title} - ${dateStr}\n\n`
+          docContent += `${entry.agentResponse}\n\n`
+          
+          if (entry.links.length > 0) {
+            docContent += `**Further Reading:**\n\n`
+            docContent += entry.links.map((link) => `- [${link.title}](${link.url})${link.description ? ` - ${link.description}` : ''}`).join('\n')
+            docContent += '\n\n'
+          }
+          
+          return docContent
+        })
+        .join('---\n\n')
+      
+      const fullMarkdown = `# ${sessionTitle}\n\n${markdown}`
+      
+      const blob = new Blob([fullMarkdown], { type: 'text/markdown' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${sessionTitle.replace(/\s+/g, '-')}-notes.md`
+      a.click()
+      URL.revokeObjectURL(url)
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   const handleRename = () => {
@@ -320,6 +427,24 @@ export function MarkdownEditor() {
         <div className="text-center">
           <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
           <p>Select a session to view notes</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (isLoading && entries.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-full min-h-[400px]">
+        <LoadingSpinner />
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center h-full min-h-[400px] text-red-500">
+        <div className="text-center">
+          <p>{error}</p>
         </div>
       </div>
     )

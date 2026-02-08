@@ -1,9 +1,12 @@
+import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { FileText, Clock, TrendingUp, Building2 } from 'lucide-react'
 import { motion } from 'framer-motion'
 import { EmptyState } from '../../components/ui/EmptyState'
 import { Navigation } from '../../components/ui/Navigation'
+import { LoadingSpinner } from '../../components/ui/LoadingSpinner'
 import { FileText as FileTextIcon } from 'lucide-react'
+import { getEnterpriseDocuments } from '../../utils/api'
 
 interface Document {
   id: string
@@ -16,7 +19,39 @@ interface Document {
 
 export default function EnterpriseDocuments() {
   const navigate = useNavigate()
-  const documents: Document[] = [
+  const [documents, setDocuments] = useState<Document[]>([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const fetchDocuments = async () => {
+      try {
+        setIsLoading(true)
+        const response = await getEnterpriseDocuments(50, 0)
+        // Transform API response to match component interface
+        const transformedDocs: Document[] = response.documents.map((doc) => ({
+          id: doc.id,
+          title: doc.title,
+          lastUpdated: doc.googleDoc.lastModified 
+            ? new Date(doc.googleDoc.lastModified).toLocaleDateString()
+            : 'Unknown',
+          views: doc.usersAffected,
+          concepts: Math.round(doc.totalTriggers / 3), // Estimate concepts from triggers
+          engagement: Math.min(100, Math.round(doc.confusionDensity))
+        }))
+        setDocuments(transformedDocs)
+      } catch (err) {
+        console.error('Failed to fetch documents:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load documents')
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    fetchDocuments()
+  }, [])
+
+  const mockDocuments: Document[] = [
     {
       id: '1',
       title: 'React Best Practices Guide',
@@ -83,8 +118,16 @@ export default function EnterpriseDocuments() {
       {/* Padding-top accounts for: Nav bar (73px) + Header bar (~50px) = ~123px */}
       <div className="max-w-7xl mx-auto px-4 pb-6 pt-[123px]">
 
-        {/* Documents Grid */}
-        {documents.length === 0 ? (
+        {/* Loading State */}
+        {isLoading ? (
+          <div className="flex items-center justify-center py-12">
+            <LoadingSpinner />
+          </div>
+        ) : error ? (
+          <div className="text-center text-red-500 py-12">
+            {error}
+          </div>
+        ) : documents.length === 0 ? (
           <EmptyState
             icon={FileTextIcon}
             title="No documents yet"
