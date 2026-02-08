@@ -288,12 +288,33 @@ Show your reasoning step-by-step, then provide the JSON output."""
         classification: Dict[str, Any],
         persona_card: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """Fallback hypothesis generation using heuristics"""
+        """Fallback hypothesis generation using heuristics - ALWAYS generate at least one hypothesis"""
         hypotheses = []
         
         concepts = classification.get("concepts", [])
         known_gaps = persona_card.get("knownGaps", [])
         complexity = classification.get("complexity", "unknown")
+        content_type = classification.get("content_type", "general")
+        text = classification.get("text", "")[:500]  # Use text for better hypothesis
+        
+        # ALWAYS generate at least one hypothesis based on content
+        if not hypotheses:
+            # Generate a general hypothesis based on content type and concepts
+            if concepts and len(concepts) > 0:
+                main_concept = concepts[0] if concepts else "this topic"
+                hypothesis_text = f"The user may need foundational understanding of {main_concept} to fully grasp this {content_type} content."
+            else:
+                hypothesis_text = f"The user may need additional context or background knowledge to understand this {content_type} content."
+            
+            hypotheses.append({
+                "id": "gap_1",
+                "hypothesis": hypothesis_text,
+                "confidence": 0.6,
+                "reasoning": f"Based on content type '{content_type}' and complexity '{complexity}'",
+                "prerequisites": concepts[:3] if concepts else [],
+                "impact": "medium",
+                "evidence": [f"Content type: {content_type}", f"Complexity: {complexity}"]
+            })
         
         # Check if concepts relate to known gaps
         for gap in known_gaps[:3]:  # Top 3 gaps

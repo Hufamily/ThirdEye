@@ -2471,6 +2471,28 @@ function getOverlayStyles() {
     /* Tab panel styling */
     .cg-tab-panel {
       color: hsl(0, 0%, 98%); /* matches frontend foreground */
+      overflow-y: auto;
+      max-height: calc(80vh - 200px);
+      min-height: 200px;
+      padding-right: 8px;
+    }
+    
+    .cg-tab-panel::-webkit-scrollbar {
+      width: 6px;
+    }
+    
+    .cg-tab-panel::-webkit-scrollbar-track {
+      background: hsl(0, 0%, 14.9%);
+      border-radius: 3px;
+    }
+    
+    .cg-tab-panel::-webkit-scrollbar-thumb {
+      background: hsl(0, 0%, 18%);
+      border-radius: 3px;
+    }
+    
+    .cg-tab-panel::-webkit-scrollbar-thumb:hover {
+      background: hsl(0, 0%, 25%);
     }
 
     /* Chatbot panel styles */
@@ -4463,19 +4485,19 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   html += '<div class="cg-tab-panel" id="cg-panel-summary">';
   html += '<div class="cg-section">';
   
+  // Summary (detailed summary from Agent 2.0)
+  if (agent2.summary) {
+    html += '<div style="margin-bottom: 16px;"><strong>Summary</strong>';
+    html += `<p style="margin-top: 8px; line-height: 1.6;">${escapeHtml(agent2.summary)}</p>`;
+    html += '</div>';
+  }
+  
   // Content Type
   if (agent2.content_type) {
     html += `<div style="margin-bottom: 12px;"><strong>Content Type</strong><p style="display: inline-block; padding: 4px 8px; background: hsl(0, 0%, 18%); border-radius: 4px; margin-left: 8px;">${escapeHtml(agent2.content_type)}</p></div>`;
   }
   
-  // Concepts
-  if (agent2.concepts && agent2.concepts.length > 0) {
-    html += '<div style="margin-bottom: 12px;"><strong>Concepts</strong><ul style="margin: 8px 0 0 20px;">';
-    agent2.concepts.forEach(concept => {
-      html += `<li>${escapeHtml(concept)}</li>`;
-    });
-    html += '</ul></div>';
-  }
+  // Concepts section REMOVED per user request
   
   // Gap Hypothesis
   if (winningHypothesis) {
@@ -4492,7 +4514,7 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   }
   
   // Fallback message if no agent data is available
-  if (!agent2.content_type && (!agent2.concepts || agent2.concepts.length === 0) && !winningHypothesis) {
+  if (!agent2.summary && !agent2.content_type && !winningHypothesis) {
     html += '<div style="margin-bottom: 12px;"><p style="color: hsl(0, 0%, 60%);">Agent analysis completed. Check the Explanation tab for detailed insights.</p></div>';
   }
   
@@ -4501,12 +4523,22 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   // Explanation Tab
   html += '<div class="cg-tab-panel" id="cg-panel-explanation" style="display:none">';
   
+  // Check if Agent 4.0 has error
+  if (agent4.error) {
+    html += '<div class="cg-section">';
+    html += '<p style="color: hsl(0, 0%, 60%);">Explanation generation is pending. This usually means a gap hypothesis needs to be identified first.</p>';
+    if (winningHypothesis) {
+      html += '<p style="margin-top: 8px; color: hsl(0, 0%, 60%);">A hypothesis was found but explanation generation encountered an issue. Please try again.</p>';
+    }
+    html += '</div>';
+  }
+  
   // Instant HUD
   if (agent4.instant_hud) {
     html += '<div class="cg-section">';
     html += '<strong>Quick Summary</strong>';
-    if (agent4.instant_hud.summary) {
-      html += `<p>${escapeHtml(agent4.instant_hud.summary)}</p>`;
+    if (agent4.instant_hud.summary || agent4.instant_hud.body) {
+      html += `<p style="margin-top: 8px; line-height: 1.6;">${escapeHtml(agent4.instant_hud.summary || agent4.instant_hud.body || '')}</p>`;
     }
     if (agent4.instant_hud.key_points && agent4.instant_hud.key_points.length > 0) {
       html += '<ul style="margin: 8px 0 0 20px;">';
@@ -4522,16 +4554,27 @@ function showAgentResultsOverlay(orchestrationResult, relevantWebpages = []) {
   if (agent4.deep_dive) {
     html += '<div class="cg-section">';
     html += '<strong>Deep Dive</strong>';
-    if (agent4.deep_dive.explanation) {
-      html += `<p style="white-space: pre-wrap;">${escapeHtml(agent4.deep_dive.explanation)}</p>`;
+    // Handle both old format (full_explanation) and new format (explanation)
+    const explanationText = agent4.deep_dive.explanation || agent4.deep_dive.full_explanation;
+    if (explanationText) {
+      html += `<p style="white-space: pre-wrap; line-height: 1.6; margin-top: 8px;">${escapeHtml(explanationText)}</p>`;
     }
     if (agent4.deep_dive.examples && agent4.deep_dive.examples.length > 0) {
       html += '<div style="margin-top: 12px;"><strong style="font-size: 12px;">Examples:</strong>';
       agent4.deep_dive.examples.forEach(example => {
-        html += `<div style="margin: 8px 0; padding: 8px; background: hsl(0, 0%, 14.9%); border-radius: 4px; font-size: 13px;">${escapeHtml(example)}</div>`;
+        // Handle both string examples and object examples
+        const exampleText = typeof example === 'string' ? example : (example.content || example.description || JSON.stringify(example));
+        html += `<div style="margin: 8px 0; padding: 8px; background: hsl(0, 0%, 14.9%); border-radius: 4px; font-size: 13px; line-height: 1.5;">${escapeHtml(exampleText)}</div>`;
       });
       html += '</div>';
     }
+    html += '</div>';
+  }
+  
+  // Fallback if no explanation data
+  if (!agent4.instant_hud && !agent4.deep_dive && !agent4.error) {
+    html += '<div class="cg-section">';
+    html += '<p style="color: hsl(0, 0%, 60%);">Explanation is being generated. Please check back in a moment.</p>';
     html += '</div>';
   }
   

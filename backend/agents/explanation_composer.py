@@ -7,6 +7,7 @@ Crafts personalized explanations based on gap hypothesis using K2-Think
 from typing import Dict, Any, Optional, List
 from .base_agent import BaseAgent
 from services.k2think_client import K2ThinkClient
+from services.gemini_client import GeminiClient
 from utils.database import engine, ensure_warehouse_resumed
 from sqlalchemy import text
 import json
@@ -31,6 +32,13 @@ class ExplanationComposer(BaseAgent):
         except Exception as e:
             print(f"Warning: K2-Think client initialization failed: {e}")
             self.k2think = None
+        
+        # Fallback to Gemini if K2-Think unavailable
+        try:
+            self.gemini = GeminiClient()
+        except Exception as e:
+            print(f"Warning: Gemini client initialization failed: {e}")
+            self.gemini = None
     
     async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -121,27 +129,30 @@ class ExplanationComposer(BaseAgent):
         
         learning_style = persona_card.get("learningStyle", "reading")
         expertise_level = self._get_relevant_expertise(persona_card, content)
+        content_text = content.get('text', '')[:1000]  # Use more context
         
-        prompt = f"""Generate a concise 2-3 sentence explanation for an instant overlay.
+        prompt = f"""You are an expert teacher explaining concepts clearly. Generate a concise explanation that helps the user understand the content.
 
-Gap Hypothesis: {hypothesis.get('hypothesis', '')}
-Original Content: {content.get('text', '')[:200]}
+Content to Explain:
+{content_text}
+
+Gap Hypothesis: {hypothesis.get('hypothesis', 'Understanding this content')}
 Learning Style: {learning_style}
 Expertise Level: {expertise_level}
-Reading State: {reading_state}
 
 Requirements:
-- Maximum 2-3 sentences
-- Directly addresses the gap
-- Uses {learning_style} learning style (visual = analogies, reading = clear text)
+- Write a clear, educational explanation (2-4 sentences)
+- Define key terms and concepts
+- Explain the main ideas in simple terms
+- Use {learning_style} learning style (visual = analogies/metaphors, reading = clear structured text)
 - Appropriate for {expertise_level} level
-- Friendly, helpful tone
+- Friendly, helpful, educational tone
+- CRITICAL: Do NOT mention any product names, tools, monitoring platforms, or software. Only explain the actual concepts and content.
 
 Output JSON:
 {{
-  "title": "Brief title",
-  "body": "2-3 sentence explanation",
-  "key_points": ["point1", "point2", "point3"]
+  "summary": "2-4 sentence clear explanation with definitions",
+  "key_points": ["key concept 1", "key concept 2", "key concept 3"]
 }}"""
         
         if self.k2think:
@@ -153,9 +164,35 @@ Output JSON:
                 )
                 return self._parse_explanation_result(result, "instant")
             except Exception as e:
-                print(f"K2-Think instant HUD failed: {e}")
+                print(f"K2-Think instant HUD failed: {e}, trying Gemini fallback")
         
-        # Fallback
+        # Try Gemini fallback
+        if self.gemini:
+            try:
+                gemini_result = await self.gemini.analyze(
+                    prompt=prompt,
+                    system_instruction="You are an expert teacher. Generate clear, educational explanations. Always respond with valid JSON only.",
+                    temperature=0.5,
+                    json_mode=True
+                )
+                content = self.gemini.extract_text_from_response(gemini_result)
+                content = content.strip()
+                if content.startswith("```json"):
+                    content = content[7:]
+                if content.startswith("```"):
+                    content = content[3:]
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+                parsed = json.loads(content)
+                return {
+                    "summary": parsed.get("summary") or parsed.get("body", ""),
+                    "key_points": parsed.get("key_points", [])
+                }
+            except Exception as e:
+                print(f"Gemini instant HUD fallback failed: {e}")
+        
+        # Final fallback
         return self._fallback_instant_hud(hypothesis, content, learning_style)
     
     async def _generate_deep_dive(
@@ -170,37 +207,35 @@ Output JSON:
         learning_style = persona_card.get("learningStyle", "reading")
         expertise_level = self._get_relevant_expertise(persona_card, content)
         
-        prompt = f"""Generate a detailed, personalized explanation.
+        content_text = content.get('text', '')[:1500]  # Use more content
+        
+        prompt = f"""You are an expert teacher. Write a comprehensive, educational explanation that helps the user understand this content deeply.
 
-Gap Hypothesis: {hypothesis.get('hypothesis', '')}
-Prerequisites: {', '.join(hypothesis.get('prerequisites', []))}
-Original Content: {content.get('text', '')[:500]}
+Content to Explain:
+{content_text}
+
+Gap Hypothesis: {hypothesis.get('hypothesis', 'Understanding this content')}
+Prerequisites: {', '.join(hypothesis.get('prerequisites', [])) if hypothesis.get('prerequisites') else 'None specified'}
 Learning Style: {learning_style}
 Expertise Level: {expertise_level}
-Reading State: {reading_state}
 
 Requirements:
-1. Directly address the identified gap
-2. Match {learning_style} learning style:
-   - Visual: Use analogies, diagrams, visual metaphors
+1. Write a clear, detailed explanation (4-8 sentences) that explains the main concepts
+2. Define key terms and concepts clearly
+3. Explain WHY things work the way they do, not just WHAT they are
+4. Match {learning_style} learning style:
+   - Visual: Use analogies, metaphors, visual descriptions
    - Reading: Clear, structured text with examples
-   - Auditory: Conversational tone, step-by-step walkthrough
-3. Assume {expertise_level} level knowledge
-4. Include:
-   - Concrete examples (code if technical)
-   - Analogies/metaphors
-   - Step-by-step breakdown
-   - Common mistakes to avoid
-   - Next steps for learning
+   - Auditory: Conversational, step-by-step walkthrough
+5. Appropriate for {expertise_level} level - explain concepts they might not know
+6. Include concrete examples to illustrate points
+7. Educational, helpful, friendly tone
+8. CRITICAL: Do NOT mention any product names, tools, monitoring platforms, analytics tools, or software. Only explain the actual subject matter, concepts, and ideas from the content.
 
 Output JSON:
 {{
-  "full_explanation": "Detailed explanation text",
-  "examples": [{{"type": "code|analogy|text", "content": "..."}}],
-  "analogies": [{{"title": "...", "description": "..."}}],
-  "step_by_step": ["step1", "step2", "step3"],
-  "common_mistakes": ["mistake1", "mistake2"],
-  "next_steps": ["step1", "step2"]
+  "explanation": "Detailed 4-8 sentence explanation with definitions and context",
+  "examples": ["example 1", "example 2", "example 3"]
 }}"""
         
         if self.k2think:
@@ -215,13 +250,39 @@ Output JSON:
                 )
                 return self._parse_explanation_result(result, "deep")
             except Exception as e:
-                print(f"K2-Think deep dive failed: {e}")
+                print(f"K2-Think deep dive failed: {e}, trying Gemini fallback")
         
-        # Fallback
+        # Try Gemini fallback
+        if self.gemini:
+            try:
+                gemini_result = await self.gemini.analyze(
+                    prompt=prompt,
+                    system_instruction="You are an expert teacher. Generate detailed, educational explanations with definitions and examples. Always respond with valid JSON only.",
+                    temperature=0.5,
+                    json_mode=True
+                )
+                content_text = self.gemini.extract_text_from_response(gemini_result)
+                content_text = content_text.strip()
+                if content_text.startswith("```json"):
+                    content_text = content_text[7:]
+                if content_text.startswith("```"):
+                    content_text = content_text[3:]
+                if content_text.endswith("```"):
+                    content_text = content_text[:-3]
+                content_text = content_text.strip()
+                parsed = json.loads(content_text)
+                return {
+                    "explanation": parsed.get("explanation") or parsed.get("full_explanation", content_text),
+                    "examples": parsed.get("examples", [])
+                }
+            except Exception as e:
+                print(f"Gemini deep dive fallback failed: {e}")
+        
+        # Final fallback
         return self._fallback_deep_dive(hypothesis, content, learning_style)
     
     def _parse_explanation_result(self, result: Dict[str, Any], explanation_type: str) -> Dict[str, Any]:
-        """Parse K2-Think explanation result"""
+        """Parse K2-Think explanation result - extract clean text, remove JSON formatting"""
         try:
             # Extract text from response
             text = ""
@@ -234,55 +295,100 @@ Output JSON:
                     text = result["content"]
                 else:
                     text = str(result)
+            elif isinstance(result, str):
+                text = result
             
             if not text:
                 return self._create_fallback_explanation(explanation_type)
             
-            # Try to extract JSON
+            # Clean up text - remove markdown code blocks
+            text = text.strip()
+            text = re.sub(r'```json\s*', '', text)
+            text = re.sub(r'```\s*', '', text)
+            text = re.sub(r'```', '', text)
+            
+            # Try to extract JSON and parse it
             json_match = re.search(r'\{[\s\S]*\}', text)
             if json_match:
-                json_str = json_match.group(0)
-                json_str = re.sub(r'```json\s*', '', json_str)
-                json_str = re.sub(r'```\s*', '', json_str)
-                
-                parsed = json.loads(json_str)
-                
-                if explanation_type == "instant":
-                    return {
-                        "title": parsed.get("title", "Explanation"),
-                        "body": parsed.get("body", text[:200]),
-                        "key_points": parsed.get("key_points", [])
-                    }
-                else:  # deep
-                    return {
-                        "full_explanation": parsed.get("full_explanation", text),
-                        "examples": parsed.get("examples", []),
-                        "analogies": parsed.get("analogies", []),
-                        "step_by_step": parsed.get("step_by_step", []),
-                        "common_mistakes": parsed.get("common_mistakes", []),
-                        "next_steps": parsed.get("next_steps", [])
-                    }
+                try:
+                    json_str = json_match.group(0)
+                    parsed = json.loads(json_str)
+                    
+                    if explanation_type == "instant":
+                        summary = parsed.get("summary") or parsed.get("body", "")
+                        # Clean summary - remove any remaining JSON artifacts
+                        summary = self._clean_text(summary)
+                        return {
+                            "summary": summary[:500] if summary else text[:300],
+                            "key_points": parsed.get("key_points", [])
+                        }
+                    else:  # deep
+                        explanation = parsed.get("explanation") or parsed.get("full_explanation", "")
+                        # Clean explanation - remove any remaining JSON artifacts
+                        explanation = self._clean_text(explanation)
+                        examples = parsed.get("examples", [])
+                        # Clean examples
+                        cleaned_examples = [self._clean_text(str(ex)) for ex in examples if ex]
+                        return {
+                            "explanation": explanation[:2000] if explanation else text[:1000],
+                            "examples": cleaned_examples[:5]
+                        }
+                except json.JSONDecodeError as e:
+                    print(f"JSON parse error: {e}, using text directly")
+                    # If JSON parsing fails, extract text content
+                    text = self._extract_text_from_json_like_string(text)
             
-            # Fallback: use text as-is
+            # Fallback: clean and use text as-is
+            cleaned_text = self._clean_text(text)
             if explanation_type == "instant":
                 return {
-                    "title": "Explanation",
-                    "body": text[:200],
-                    "key_points": text.split('.')[:3]
+                    "summary": cleaned_text[:500],
+                    "key_points": [s.strip() for s in cleaned_text.split('.')[:3] if s.strip() and len(s.strip()) > 10]
                 }
             else:
                 return {
-                    "full_explanation": text,
-                    "examples": [],
-                    "analogies": [],
-                    "step_by_step": [],
-                    "common_mistakes": [],
-                    "next_steps": []
+                    "explanation": cleaned_text[:2000],
+                    "examples": [s.strip() for s in cleaned_text.split('.')[:5] if s.strip() and len(s.strip()) > 30]
                 }
                 
         except Exception as e:
             print(f"Error parsing explanation: {e}")
+            import traceback
+            traceback.print_exc()
             return self._create_fallback_explanation(explanation_type)
+    
+    def _clean_text(self, text: str) -> str:
+        """Remove JSON artifacts and clean up text"""
+        if not text:
+            return ""
+        
+        # Remove JSON structure markers
+        text = re.sub(r'^\s*\{[\s\S]*?"(?:summary|body|explanation|full_explanation)"\s*:\s*"', '', text)
+        text = re.sub(r'"\s*\}[\s\S]*$', '', text)
+        text = re.sub(r'\\"', '"', text)  # Unescape quotes
+        text = re.sub(r'\\n', '\n', text)  # Unescape newlines
+        text = re.sub(r'\\t', ' ', text)  # Unescape tabs
+        
+        # Remove any remaining JSON-like patterns
+        text = re.sub(r'\{[^}]*\}', '', text)  # Remove {key: value} patterns
+        text = re.sub(r'\[[^\]]*\]', '', text)  # Remove [item] patterns
+        
+        return text.strip()
+    
+    def _extract_text_from_json_like_string(self, text: str) -> str:
+        """Extract readable text from JSON-like string"""
+        # Try to find text content between quotes
+        quoted_text = re.findall(r'"(?:summary|body|explanation|full_explanation)"\s*:\s*"([^"]+)"', text)
+        if quoted_text:
+            return quoted_text[0]
+        
+        # Try to find any quoted strings that look like explanations
+        all_quoted = re.findall(r'"([^"]{20,})"', text)  # Quotes with at least 20 chars
+        if all_quoted:
+            # Return the longest one (likely the explanation)
+            return max(all_quoted, key=len)
+        
+        return text
     
     def _create_fallback_explanation(self, explanation_type: str) -> Dict[str, Any]:
         """Create fallback explanation structure"""
@@ -329,22 +435,22 @@ Output JSON:
     ) -> Dict[str, Any]:
         """Fallback deep dive generation"""
         prerequisites = hypothesis.get("prerequisites", [])
+        content_text = content.get("text", "")[:500]
+        hypothesis_text = hypothesis.get("hypothesis", "Understanding this content")
+        
+        # Generate a basic explanation from the content
+        explanation = f"{hypothesis_text}. "
+        if prerequisites:
+            explanation += f"This concept builds on: {', '.join(prerequisites[:3])}. "
+        if content_text:
+            # Extract first few sentences as explanation
+            sentences = [s.strip() for s in content_text.split('.')[:3] if s.strip()]
+            if sentences:
+                explanation += " ".join(sentences) + "."
         
         return {
-            "full_explanation": f"To understand this content, you need to know about: {', '.join(prerequisites)}. {hypothesis.get('hypothesis', '')}",
-            "examples": [],
-            "analogies": [],
-            "step_by_step": [
-                f"Step 1: Learn about {prerequisites[0] if prerequisites else 'prerequisites'}",
-                "Step 2: Understand how it relates to the current concept",
-                "Step 3: Practice applying the knowledge"
-            ],
-            "common_mistakes": [],
-            "next_steps": [
-                f"Review: {prerequisites[0] if prerequisites else 'prerequisites'}",
-                "Read related documentation",
-                "Try practice exercises"
-            ]
+            "explanation": explanation or f"To understand this content, you need to know about: {', '.join(prerequisites) if prerequisites else 'the fundamentals'}. {hypothesis_text}",
+            "examples": prerequisites[:3] if prerequisites else []
         }
     
     def _generate_action_cards(

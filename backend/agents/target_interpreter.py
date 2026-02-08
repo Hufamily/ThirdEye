@@ -86,7 +86,7 @@ class TargetInterpreter(BaseAgent):
             )
             
             # Extract concepts
-            concepts = self._extract_concepts(text)
+            concepts = await self._extract_concepts(text)
             
             # Check if relates to known gaps
             known_gaps = persona_card.get("knownGaps", [])
@@ -107,11 +107,15 @@ class TargetInterpreter(BaseAgent):
                 "estimated_difficulty": self._estimate_difficulty(text, user_expertise, known_gaps)
             }
             
+            # Generate a brief summary using Gemini
+            summary = await self._generate_summary(text, classification.get("content_type", "general"), concepts)
+            
             result = {
                 "content_type": classification.get("content_type", "general"),
                 "aoi_type": aoi_type,
                 "complexity": complexity,
                 "concepts": concepts,
+                "summary": summary,  # Add summary field
                 "relates_to_gap": relates_to_gap,
                 "user_context": user_context,
                 "classification_confidence": classification.get("confidence", 0.8)
@@ -259,24 +263,148 @@ Return JSON with:
         
         return "general"
     
-    def _extract_concepts(self, text: str) -> List[str]:
-        """Extract key concepts from text"""
+    async def _extract_concepts(self, text: str) -> List[str]:
+        """Extract key concepts from text using Gemini for better quality"""
+        # Filter out UI elements, dates, common words before sending to Gemini
+        filtered_text = self._filter_ui_elements(text)
+        
+        if len(filtered_text.strip()) < 50:
+            # Text too short after filtering, use original
+            filtered_text = text
+        
+        try:
+            # Use Gemini to extract meaningful concepts
+            prompt = f"""Extract the 5-8 most important concepts, topics, or key ideas from this text. 
+Focus on substantive, domain-specific concepts. EXCLUDE:
+- UI elements (like "Close Session", "Chat", "Capturing")
+- Dates and times (like "Tuesday", "February", "PM", "EDT")
+- Common action words (like "Extracting", "Clicking")
+- User interface terms
+- Product names (like "ThirdEye", "Third Eye", or any monitoring/analytics tool names)
+- Company names unless they're the main topic
+
+Text:
+{filtered_text[:2000]}
+
+Return JSON with only meaningful, substantive concepts:
+{{"concepts": ["concept1", "concept2", ...]}}"""
+            
+            response = await self.gemini.analyze(
+                prompt=prompt,
+                system_instruction="You are an expert at extracting key concepts from text. Ignore UI elements, dates, and common words. Focus on domain-specific topics and ideas. Always respond with valid JSON only.",
+                temperature=0.3,
+                json_mode=True
+            )
+            
+            content = self.gemini.extract_text_from_response(response)
+            content = content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+            
+            import json
+            result = json.loads(content)
+            concepts = result.get("concepts", [])
+            if concepts and isinstance(concepts, list):
+                # Filter out any remaining UI elements
+                filtered_concepts = self._filter_concept_list(concepts)
+                return filtered_concepts[:10]
+        except Exception as e:
+            print(f"Error extracting concepts with Gemini: {e}")
+        
+        # Fallback to regex-based extraction with filtering
         concepts = []
+        tech_terms = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', filtered_text)
+        concepts.extend([term for term in tech_terms[:10]])
+        quoted = re.findall(r'"([^"]+)"', filtered_text)
+        concepts.extend([q for q in quoted[:5]])
+        filtered_concepts = self._filter_concept_list(concepts)
+        return filtered_concepts[:10]
+    
+    def _filter_ui_elements(self, text: str) -> str:
+        """Remove UI elements, dates, and common words from text"""
+        # Remove common UI phrases
+        ui_patterns = [
+            r'close session',
+            r'chat',
+            r'capturing',
+            r'extracting',
+            r'click',
+            r'button',
+            r'save to notebook',
+            r'joseph yung',  # User name
+            r'thirdeye',  # Product name
+            r'third eye',  # Product name variant
+        ]
         
-        # Extract technical terms (capitalized words, acronyms)
-        tech_terms = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-        concepts.extend([term.lower() for term in tech_terms[:5]])
+        filtered = text
+        for pattern in ui_patterns:
+            filtered = re.sub(pattern, '', filtered, flags=re.IGNORECASE)
         
-        # Extract quoted terms
-        quoted = re.findall(r'"([^"]+)"', text)
-        concepts.extend([q.lower() for q in quoted[:3]])
+        # Remove dates and times
+        filtered = re.sub(r'\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b', '', filtered, flags=re.IGNORECASE)
+        filtered = re.sub(r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\b', '', filtered, flags=re.IGNORECASE)
+        filtered = re.sub(r'\b\d{1,2}:\d{2}\s*(?:AM|PM|EDT|EST|PST|PDT)\b', '', filtered, flags=re.IGNORECASE)
         
-        # Extract code-like terms
-        code_terms = re.findall(r'\b[a-z_]+\(|\b[A-Z_][A-Z_]+\b', text)
-        concepts.extend([term.lower().rstrip('(') for term in code_terms[:5]])
+        return filtered
+    
+    def _filter_concept_list(self, concepts: List[str]) -> List[str]:
+        """Filter out UI elements and common words from concept list"""
+        ui_words = {
+            'extracting', 'capturing', 'clicking', 'click', 'close', 'session', 
+            'chat', 'button', 'save', 'notebook', 'joseph', 'yung',
+            'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'monday',
+            'january', 'february', 'march', 'april', 'may', 'june', 'july',
+            'august', 'september', 'october', 'november', 'december',
+            'pm', 'am', 'edt', 'est', 'pst', 'pdt',
+            'thirdeye', 'third eye', 'monitoring', 'analytics tool'  # Product names
+        }
         
-        # Remove duplicates and limit
-        return list(dict.fromkeys(concepts))[:10]
+        filtered = []
+        for concept in concepts:
+            concept_lower = concept.lower().strip()
+            # Skip if it's a UI word or too short
+            if concept_lower in ui_words or len(concept_lower) < 3:
+                continue
+            # Skip if it contains multiple UI words
+            words = concept_lower.split()
+            if len(words) > 1 and all(w in ui_words for w in words):
+                continue
+            filtered.append(concept)
+        
+        return filtered
+    
+    async def _generate_summary(self, text: str, content_type: str, concepts: List[str]) -> str:
+        """Generate a brief summary of the content"""
+        try:
+            prompt = f"""Write a concise 2-3 sentence summary of this content. Focus on the main ideas and key information.
+IMPORTANT: Do NOT mention any product names, tools, or monitoring platforms. Only explain the actual content and concepts.
+
+Content Type: {content_type}
+Key Concepts: {', '.join(concepts[:5]) if concepts else 'None'}
+
+Text:
+{text[:1500]}
+
+Return a clear, informative summary in 2-3 sentences. Focus on the subject matter, not any tools or products."""
+            
+            response = await self.gemini.analyze(
+                prompt=prompt,
+                system_instruction="You are an expert at summarizing content. Write clear, concise summaries.",
+                temperature=0.5
+            )
+            
+            summary = self.gemini.extract_text_from_response(response)
+            return summary.strip()[:500]  # Limit length
+        except Exception as e:
+            print(f"Error generating summary: {e}")
+            # Fallback: use first few sentences
+            sentences = text.split('.')[:3]
+            return '. '.join(sentences).strip() + '.'
     
     def _check_gap_relevance(
         self,

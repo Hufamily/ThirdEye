@@ -56,25 +56,43 @@ class AgentOrchestrator:
         try:
             # Step 1: Get persona card if not provided
             if not persona_card:
-                persona_architect = PersonaArchitect()
-                persona_result = await persona_architect.process({
-                    "user_id": user_id,
-                    "include_docs": True,
-                    "include_sessions": True,
-                    "include_searches": True,
-                    "include_history": True
-                })
-                
-                if persona_result.get("success"):
-                    persona_card = persona_result.get("data", {}).get("personaCard", {})
-                else:
-                    # Fallback empty persona card
-                    persona_card = {
-                        "expertiseLevels": {},
-                        "learningStyle": "reading",
-                        "knownGaps": [],
-                        "activeProjects": []
-                    }
+                try:
+                    print(f"[AgentOrchestrator] Building persona card for user_id: {user_id}")
+                    persona_architect = PersonaArchitect()
+                    persona_result = await persona_architect.process({
+                        "user_id": user_id,
+                        "include_docs": True,
+                        "include_sessions": True,  # Includes chat/session history
+                        "include_searches": True,
+                        "include_history": True    # Includes browser history
+                    })
+                    
+                    if persona_result.get("success"):
+                        persona_card = persona_result.get("data", {}).get("personaCard", {})
+                        print(f"[AgentOrchestrator] Persona card built successfully with keys: {list(persona_card.keys())}")
+                        print(f"[AgentOrchestrator] Persona - expertiseLevels: {list(persona_card.get('expertiseLevels', {}).keys())}")
+                        print(f"[AgentOrchestrator] Persona - knownGaps count: {len(persona_card.get('knownGaps', []))}")
+                        print(f"[AgentOrchestrator] Persona - activeProjects count: {len(persona_card.get('activeProjects', []))}")
+                    else:
+                        print(f"[AgentOrchestrator] Persona fetch failed: {persona_result.get('error', 'Unknown')}")
+                except Exception as e:
+                    print(f"[AgentOrchestrator] Persona fetch exception: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Ensure persona_card has required structure
+            if not persona_card:
+                persona_card = {}
+            if "expertiseLevels" not in persona_card:
+                persona_card["expertiseLevels"] = {}
+            if "learningStyle" not in persona_card:
+                persona_card["learningStyle"] = "reading"
+            if "knownGaps" not in persona_card:
+                persona_card["knownGaps"] = []
+            if "activeProjects" not in persona_card:
+                persona_card["activeProjects"] = []
+            
+            print(f"[AgentOrchestrator] Using persona_card with keys: {list(persona_card.keys())}")
             
             # Step 2: Use Dedalus to orchestrate agents if available
             if self.dedalus:
@@ -146,14 +164,25 @@ class AgentOrchestrator:
         
         # Agent 2.0: Target Interpreter
         try:
+            # Normalize capture_result format - Agent 2.0 expects "text" field
+            normalized_capture = dict(capture_result)
+            if "extracted_text" in normalized_capture and "text" not in normalized_capture:
+                normalized_capture["text"] = normalized_capture["extracted_text"]
+            
+            print(f"[AgentOrchestrator] Agent 2.0 input - capture keys: {list(normalized_capture.keys())}, has_text: {'text' in normalized_capture}, has_extracted_text: {'extracted_text' in normalized_capture}")
+            print(f"[AgentOrchestrator] Agent 2.0 input - text length: {len(normalized_capture.get('text', ''))}")
+            print(f"[AgentOrchestrator] Agent 2.0 input - persona_card keys: {list(persona_card.keys()) if persona_card else 'None'}")
+            
             target_interpreter = TargetInterpreter()
             classification_result = await target_interpreter.process({
-                "capture_result": capture_result,
+                "capture_result": normalized_capture,
                 "persona_card": persona_card
             })
             print(f"[AgentOrchestrator] Agent 2.0 result: success={classification_result.get('success')}, has_data={bool(classification_result.get('data'))}")
             if not classification_result.get("success"):
                 print(f"[AgentOrchestrator] Agent 2.0 returned success=False: {classification_result.get('error', 'Unknown error')}")
+            else:
+                print(f"[AgentOrchestrator] Agent 2.0 data keys: {list(classification_result.get('data', {}).keys())}")
             results["agents"]["2.0"] = classification_result.get("data", {})
         except Exception as e:
             print(f"[AgentOrchestrator] Agent 2.0 failed with exception: {e}")
@@ -164,15 +193,26 @@ class AgentOrchestrator:
         # Agent 3.0: Gap Hypothesis
         try:
             classification_data = results["agents"].get("2.0", {})
-            print(f"[AgentOrchestrator] Agent 3.0 input - classification_data keys: {list(classification_data.keys())}")
+            # Agent 3.0 needs the original text - add it from capture_result
+            if "text" not in classification_data and normalized_capture.get("text"):
+                classification_data["text"] = normalized_capture["text"]
+            if "text" not in classification_data and normalized_capture.get("extracted_text"):
+                classification_data["text"] = normalized_capture["extracted_text"]
+            
+            print(f"[AgentOrchestrator] Agent 3.0 input - classification_data keys: {list(classification_data.keys())}, has_text: {'text' in classification_data}")
             gap_hypothesis = GapHypothesis()
             hypothesis_result = await gap_hypothesis.process({
                 "classification_result": classification_data,
-                "persona_card": persona_card
+                "persona_card": persona_card,
+                "user_id": user_id,
+                "session_id": session_id
             })
             print(f"[AgentOrchestrator] Agent 3.0 result: success={hypothesis_result.get('success')}, has_data={bool(hypothesis_result.get('data'))}")
             if not hypothesis_result.get("success"):
                 print(f"[AgentOrchestrator] Agent 3.0 returned success=False: {hypothesis_result.get('error', 'Unknown error')}")
+            else:
+                data = hypothesis_result.get("data", {})
+                print(f"[AgentOrchestrator] Agent 3.0 data keys: {list(data.keys())}, has_candidates: {bool(data.get('candidates'))}")
             results["agents"]["3.0"] = hypothesis_result.get("data", {})
         except Exception as e:
             print(f"[AgentOrchestrator] Agent 3.0 failed with exception: {e}")
@@ -197,16 +237,44 @@ class AgentOrchestrator:
             if not winning_hypothesis and hypothesis_data.get("candidates"):
                 winning_hypothesis = hypothesis_data["candidates"][0]
             
+            # ALWAYS generate explanation even if no hypothesis - use content-based explanation
+            if not winning_hypothesis:
+                print(f"[AgentOrchestrator] No hypothesis found, creating content-based explanation")
+                # Create a basic hypothesis from the content itself
+                concepts = classification_data.get("concepts", [])
+                content_type = classification_data.get("content_type", "content")
+                winning_hypothesis = {
+                    "id": "content_based",
+                    "hypothesis": f"Understanding {content_type} content",
+                    "prerequisites": concepts[:3] if concepts else [],
+                    "impact": "medium"
+                }
+            
             if winning_hypothesis:
+                # Ensure original_content has text field
+                original_content = dict(capture_result)
+                if "text" not in original_content and normalized_capture.get("text"):
+                    original_content["text"] = normalized_capture["text"]
+                if "text" not in original_content and normalized_capture.get("extracted_text"):
+                    original_content["text"] = normalized_capture["extracted_text"]
+                
+                print(f"[AgentOrchestrator] Agent 4.0 input - has_winning_hypothesis: True, original_content keys: {list(original_content.keys())}")
                 explanation_composer = ExplanationComposer()
                 explanation_result = await explanation_composer.process({
                     "winning_hypothesis": winning_hypothesis,
-                    "original_content": capture_result,
+                    "original_content": original_content,
                     "persona_card": persona_card,
-                    "reading_state": "confused"
+                    "reading_state": "confused",
+                    "user_id": user_id,
+                    "session_id": session_id
                 })
+                print(f"[AgentOrchestrator] Agent 4.0 result: success={explanation_result.get('success')}, has_data={bool(explanation_result.get('data'))}")
+                if explanation_result.get("success"):
+                    data = explanation_result.get("data", {})
+                    print(f"[AgentOrchestrator] Agent 4.0 data keys: {list(data.keys())}, has_instant_hud: {bool(data.get('instant_hud'))}, has_deep_dive: {bool(data.get('deep_dive'))}")
                 results["agents"]["4.0"] = explanation_result.get("data", {})
             else:
+                print(f"[AgentOrchestrator] Agent 4.0 skipped - no winning hypothesis. Hypothesis data: {hypothesis_data}")
                 results["agents"]["4.0"] = {"error": "No hypothesis available"}
         except Exception as e:
             print(f"Agent 4.0 failed: {e}")
