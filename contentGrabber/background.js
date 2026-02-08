@@ -35,6 +35,24 @@ const REQUEST_TIMEOUT = 5000;
 /** Max words to use from extracted text as a Google search query */
 const MAX_SEARCH_QUERY_WORDS = 12;
 
+/** Provider defaults for direct LLM integrations */
+const DEFAULT_PROVIDER_SETTINGS = {
+  llm_provider_mode: 'backend', // backend | k2 | gemini | dedalus
+
+  k2_base_url: '',
+  k2_chat_path: '/v1/chat/completions',
+  k2_model: 'k2-think',
+  k2_api_key: '',
+
+  gemini_model: 'gemini-1.5-pro',
+  gemini_api_key: '',
+
+  dedalus_base_url: '',
+  dedalus_chat_path: '/v1/chat/completions',
+  dedalus_model: 'dedalus-default',
+  dedalus_api_key: '',
+};
+
 // ============================================================================
 // AUTHENTICATION HELPERS
 // ============================================================================
@@ -302,6 +320,261 @@ function updateBadgeForTab(tabId, enabled) {
 }
 
 // ============================================================================
+<<<<<<< Updated upstream
+=======
+// CONTEXT MENU: Right-click → Settings
+// ============================================================================
+
+// Create context menu on extension load
+chrome.contextMenus.create({
+  id: 'thirdeye-settings',
+  title: 'ThirdEye Settings',
+  contexts: ['page']
+});
+
+// Handle context menu click → open options page
+chrome.contextMenus.onClicked.addListener((info) => {
+  if (info.menuItemId === 'thirdeye-settings') {
+    chrome.runtime.openOptionsPage();
+  }
+});
+
+// ============================================================================
+// GET ANALYZE API URL
+// ============================================================================
+
+/**
+ * Gets the Analysis API URL from storage
+ * @returns {Promise<string>} API URL
+ */
+async function getAnalyzeApiUrl() {
+  try {
+    const stored = await chrome.storage.local.get('analyze_api_url');
+    return stored.analyze_api_url || ANALYZE_API_URL;
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting API URL:', error);
+    return ANALYZE_API_URL;
+  }
+}
+
+/**
+ * Gets the Gaze API URL from storage
+ * @returns {Promise<string|null>} Gaze API URL or null if disabled
+ */
+async function getGazeApiUrl() {
+  try {
+    const stored = await chrome.storage.local.get('gaze_api_url');
+    // Return null if explicitly empty, otherwise return URL or default
+    if (stored.gaze_api_url === '') return null;
+    return stored.gaze_api_url || GAZE_API_URL;
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting Gaze API URL:', error);
+    return GAZE_API_URL;
+  }
+}
+
+/**
+ * Loads provider settings from storage with defaults.
+ */
+async function getProviderSettings() {
+  try {
+    const keys = Object.keys(DEFAULT_PROVIDER_SETTINGS);
+    const stored = await chrome.storage.local.get(keys);
+    return {
+      ...DEFAULT_PROVIDER_SETTINGS,
+      ...stored,
+    };
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting provider settings:', error);
+    return { ...DEFAULT_PROVIDER_SETTINGS };
+  }
+}
+
+function toOpenAiMessages(data) {
+  const contextJson = JSON.stringify(data.context || {}, null, 2).slice(0, 12000);
+  return [
+    {
+      role: 'system',
+      content: 'You are ThirdEye, a concise study assistant. Prefer practical, actionable explanations.',
+    },
+    {
+      role: 'user',
+      content: `User message:\n${data.message || ''}\n\nContext JSON:\n${contextJson}`,
+    },
+  ];
+}
+
+function normalizeChatResponse(text, provider) {
+  return {
+    response: String(text || '').trim(),
+    provider,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function normalizePath(path, fallback) {
+  const p = String(path || fallback || '').trim();
+  if (!p) return fallback;
+  return p.startsWith('/') ? p : `/${p}`;
+}
+
+async function callOpenAICompatibleChat(providerName, cfg, data) {
+  const baseUrl = String(cfg.base_url || '').replace(/\/+$/, '');
+  const apiKey = String(cfg.api_key || '').trim();
+  const model = String(cfg.model || '').trim();
+  const chatPath = normalizePath(cfg.chat_path, '/v1/chat/completions');
+
+  if (!baseUrl || !apiKey || !model) {
+    throw new Error(`${providerName} is missing base URL, model, or API key`);
+  }
+
+  const url = `${baseUrl}${chatPath}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.2,
+      messages: toOpenAiMessages(data),
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`${providerName} API error ${response.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const payload = await response.json();
+  const text =
+    payload?.choices?.[0]?.message?.content ||
+    payload?.output_text ||
+    payload?.response ||
+    '';
+  if (!text) {
+    throw new Error(`${providerName} returned empty response`);
+  }
+  return normalizeChatResponse(text, providerName);
+}
+
+async function callGeminiChat(settings, data) {
+  const apiKey = String(settings.gemini_api_key || '').trim();
+  const model = String(settings.gemini_model || '').trim();
+
+  if (!apiKey || !model) {
+    throw new Error('Gemini is missing model or API key');
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const contextJson = JSON.stringify(data.context || {}, null, 2).slice(0, 12000);
+  const prompt = `User message:\n${data.message || ''}\n\nContext JSON:\n${contextJson}\n\nRespond with concise helpful explanation.`;
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.2 },
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`Gemini API error ${response.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const payload = await response.json();
+  const text = payload?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('\n').trim() || '';
+  if (!text) throw new Error('Gemini returned empty response');
+  return normalizeChatResponse(text, 'gemini');
+}
+
+async function sendChatMessageViaProvider(data, settings) {
+  const mode = settings.llm_provider_mode;
+  if (mode === 'k2') {
+    return callOpenAICompatibleChat('k2', {
+      base_url: settings.k2_base_url,
+      chat_path: settings.k2_chat_path,
+      model: settings.k2_model,
+      api_key: settings.k2_api_key,
+    }, data);
+  }
+  if (mode === 'gemini') {
+    return callGeminiChat(settings, data);
+  }
+  if (mode === 'dedalus') {
+    return callOpenAICompatibleChat('dedalus', {
+      base_url: settings.dedalus_base_url,
+      chat_path: settings.dedalus_chat_path,
+      model: settings.dedalus_model,
+      api_key: settings.dedalus_api_key,
+    }, data);
+  }
+  return null;
+}
+
+function tryParseJsonObject(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    const match = String(text).match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function callProviderAnalysis(data, settings) {
+  const analysisPrompt = [
+    'Analyze the reading content and return STRICT JSON only.',
+    'Required JSON schema:',
+    '{"summary":"string","confusion_points":["string"],"image_queries":["string"]}',
+    'Rules:',
+    '- summary: one concise paragraph',
+    '- confusion_points: 2-4 likely confusion areas',
+    '- image_queries: 2-4 image search queries',
+    '',
+    `URL: ${data.url || ''}`,
+    `Text: ${(data.text || '').slice(0, 4000)}`,
+  ].join('\n');
+
+  const response = await sendChatMessageViaProvider({
+    message: analysisPrompt,
+    sessionId: null,
+    context: {
+      type: 'analysis',
+      sourceUrl: data.url,
+    },
+  }, settings);
+
+  if (!response?.response) return null;
+  const parsed = tryParseJsonObject(response.response);
+  if (!parsed) return null;
+
+  const normalized = {
+    summary: String(parsed.summary || '').trim(),
+    confusion_points: Array.isArray(parsed.confusion_points) ? parsed.confusion_points.map(x => String(x)).slice(0, 4) : [],
+    image_queries: Array.isArray(parsed.image_queries) ? parsed.image_queries.map(x => String(x)).slice(0, 4) : [],
+  };
+
+  if (!normalized.summary) return null;
+  if (normalized.confusion_points.length === 0) {
+    normalized.confusion_points = ['Possible conceptual gap in this section.', 'Terminology may need clarification.'];
+  }
+  if (normalized.image_queries.length === 0) {
+    normalized.image_queries = ['visual explanation of key concept'];
+  }
+  return normalized;
+}
+
+// ============================================================================
+>>>>>>> Stashed changes
 // MESSAGE HANDLER: Receive content from content script
 // ============================================================================
 
@@ -1111,6 +1384,18 @@ async function analyzeContent(data, tabId) {
  */
 async function callAnalysisAPI(data) {
   try {
+    const providerSettings = await getProviderSettings();
+    if (providerSettings.llm_provider_mode && providerSettings.llm_provider_mode !== 'backend') {
+      try {
+        const providerAnalysis = await callProviderAnalysis(data, providerSettings);
+        if (providerAnalysis) {
+          return providerAnalysis;
+        }
+      } catch (providerErr) {
+        console.warn('[ContextGrabber] Provider analysis failed, falling back to backend:', providerErr.message);
+      }
+    }
+
     const sessionId = await getCurrentSessionId();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
@@ -1384,6 +1669,15 @@ async function createNotebookEntry(entry) {
  */
 async function sendChatMessage(data) {
   try {
+    const providerSettings = await getProviderSettings();
+    if (providerSettings.llm_provider_mode && providerSettings.llm_provider_mode !== 'backend') {
+      try {
+        return await sendChatMessageViaProvider(data, providerSettings);
+      } catch (providerErr) {
+        console.warn('[ContextGrabber] Provider chat failed, falling back to backend:', providerErr.message);
+      }
+    }
+
     const response = await authenticatedFetch('/api/extension/chat', {
       method: 'POST',
       body: JSON.stringify({
