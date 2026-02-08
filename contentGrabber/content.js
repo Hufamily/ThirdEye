@@ -19,8 +19,8 @@ console.log('[ContextGrabber] Script starting to load...');
 // CONFIGURATION - MODIFY THESE FOR YOUR SETUP
 // ============================================================================
 
-/** Gaze tracking API endpoint (GET request) */
-const GAZE_API_URL = 'http://127.0.0.1:8000/gaze';
+/** Gaze tracking API endpoint (GET request) - fallback when WebSocket not connected. gaze2 runs on 5000. */
+const GAZE_API_URL = 'http://127.0.0.1:5000/gaze';
 
 /** Analysis API endpoint (POST request) */
 const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
@@ -29,10 +29,10 @@ const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 const ENABLE_GAZE_MODE = true;
 
 /** Gaze tracking poll interval in milliseconds */
-const GAZE_POLL_INTERVAL = 300;
+const GAZE_POLL_INTERVAL = 200;
 
 /** Request timeout in milliseconds */
-const REQUEST_TIMEOUT = 3000;
+const REQUEST_TIMEOUT = 5000;
 
 /** Minimum confidence threshold for gaze coordinates (0-1) */
 const MIN_CONFIDENCE = 0.5;
@@ -55,6 +55,20 @@ const DWELL_CHECK_INTERVAL = 200;
 /** Snapshot capture region size in pixels (width & height around the point) */
 const SNAPSHOT_SIZE = 400;
 
+/** Gaze-centered screenshot size (smaller region for real-time gaze capture) */
+const GAZE_SNAPSHOT_SIZE = 200;
+
+/** Red gaze overlay diameter in pixels */
+const GAZE_OVERLAY_DIAMETER = 20;
+
+/** Gaze deadband in pixels — gaze must move at least this far to be considered
+ *  a genuine shift in attention. Small jitters within this radius are suppressed.
+ *  Works with the server-side deadband for two-layer noise rejection. */
+const GAZE_DEADBAND_PX = 100;
+
+/** Gaze EMA smoothing factor (0-1). Lower = smoother but laggier. */
+const GAZE_SMOOTH_FACTOR = 0.35;
+
 /** 
  * Screenshot API priority mode:
  * - 'api-only': Only use screenshot + backend API, never fall back to Google
@@ -66,6 +80,64 @@ const SCREENSHOT_PRIORITY = 'api-first';
 /** Number of text lines to capture before and after the target point (centered window) */
 const CONTEXT_LINES_BEFORE = 10;
 const CONTEXT_LINES_AFTER = 10;
+
+// ============================================================================
+// HELPER FUNCTIONS - Get settings from background script
+// ============================================================================
+
+/**
+ * Get the analysis API URL from storage (via background script)
+ * @returns {Promise<string>} API URL
+ */
+async function getAnalyzeApiUrl() {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'GET_ANALYZE_API_URL' },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[ContextGrabber] Could not get API URL from background:', chrome.runtime.lastError.message);
+            resolve(ANALYZE_API_URL); // Fallback to default
+          } else if (response && response.apiUrl) {
+            resolve(response.apiUrl);
+          } else {
+            resolve(ANALYZE_API_URL); // Fallback to default
+          }
+        }
+      );
+    } catch (error) {
+      console.warn('[ContextGrabber] Error getting API URL:', error);
+      resolve(ANALYZE_API_URL); // Fallback to default
+    }
+  });
+}
+
+/**
+ * Get the gaze API URL from storage (via background script)
+ * @returns {Promise<string|null>} Gaze API URL or null if disabled
+ */
+async function getGazeApiUrl() {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'GET_GAZE_API_URL' },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[ContextGrabber] Could not get Gaze URL from background:', chrome.runtime.lastError.message);
+            resolve(GAZE_API_URL); // Fallback to default
+          } else if (response && response.gazeUrl !== undefined) {
+            resolve(response.gazeUrl); // Could be null if disabled
+          } else {
+            resolve(GAZE_API_URL); // Fallback to default
+          }
+        }
+      );
+    } catch (error) {
+      console.warn('[ContextGrabber] Error getting Gaze URL:', error);
+      resolve(GAZE_API_URL); // Fallback to default
+    }
+  });
+}
 
 // ============================================================================
 // STATE
@@ -96,6 +168,10 @@ let isHoveringOverlay = false;        // Tracks if cursor is inside the overlay
 let lastExtractedRegionKey = '';      // De-dup key for special page extractions
 let pdfTrackingOverlay = null;        // Transparent overlay for PDF mouse tracking
 let lastScrollTime = 0;               // Timestamp of last scroll event
+let lastGazePoint = null;             // Latest gaze from WebSocket {x, y, screenWidth, screenHeight}
+let gazeOverlayEl = null;             // Red circle DOM element for gaze cursor
+let smoothedGaze = null;              // EMA-smoothed gaze position {x, y}
+let settledGaze = null;               // Last gaze position that passed deadband {x, y}
 
 // Chatbot panel state
 let chatbotExpanded = false;          // Whether chatbot panel is expanded
@@ -206,10 +282,19 @@ async function getGazePoint() {
   if (!gazeAvailable) return null;
 
   try {
+    const gazeUrl = await getGazeApiUrl();
+    
+    // If gaze URL is empty/null, gaze tracking is disabled
+    if (!gazeUrl) {
+      gazeAvailable = false;
+      console.log('[ContextGrabber] Gaze tracking disabled in settings');
+      return null;
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-    const response = await fetch(GAZE_API_URL, {
+    const response = await fetch(gazeUrl, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal
@@ -246,6 +331,75 @@ async function getGazePoint() {
     gazeAvailable = false;
     return null;
   }
+}
+
+// ============================================================================
+// GAZE OVERLAY: Red circle at gaze position (real-time from WebSocket)
+// ============================================================================
+
+/**
+ * Converts screen coordinates to viewport coordinates.
+ * Gaze model outputs screen pixels; we need viewport-relative for overlay.
+ * Uses window.screenX/Y and chrome height to map screen -> viewport.
+ */
+function screenToViewport(screenX, screenY) {
+  const topOffset = typeof window.outerHeight !== 'undefined'
+    ? Math.max(0, window.outerHeight - window.innerHeight)
+    : 0;
+  const viewportLeft = window.screenX || 0;
+  const viewportTop = (window.screenY || 0) + topOffset;
+  const x = screenX - viewportLeft;
+  const y = screenY - viewportTop;
+  return {
+    x: Math.max(0, Math.min(window.innerWidth, x)),
+    y: Math.max(0, Math.min(window.innerHeight, y))
+  };
+}
+
+/**
+ * Creates the red gaze overlay element (fixed, pointer-events: none, high z-index).
+ * Created once and reused; position updated in real time.
+ */
+function createGazeOverlay() {
+  if (gazeOverlayEl) return gazeOverlayEl;
+  const el = document.createElement('div');
+  el.id = 'cg-gaze-overlay';
+  el.style.cssText = `
+    position: fixed;
+    width: ${GAZE_OVERLAY_DIAMETER}px;
+    height: ${GAZE_OVERLAY_DIAMETER}px;
+    border-radius: 50%;
+    background: rgba(255, 0, 0, 0.8);
+    pointer-events: none;
+    z-index: 2147483647;
+    left: -100px;
+    top: -100px;
+    transform: translate(-50%, -50%);
+    box-shadow: 0 0 4px rgba(0,0,0,0.3);
+  `;
+  document.body.appendChild(el);
+  gazeOverlayEl = el;
+  return el;
+}
+
+/**
+ * Updates the gaze overlay position. Call when GAZE_UPDATE arrives.
+ * Hides overlay when extension disabled or no gaze.
+ */
+function updateGazeOverlay(data) {
+  if (!extensionEnabled) {
+    if (gazeOverlayEl) gazeOverlayEl.style.display = 'none';
+    return;
+  }
+  if (!data || data.available === false) {
+    if (gazeOverlayEl) gazeOverlayEl.style.display = 'none';
+    return;
+  }
+  const vp = screenToViewport(data.x, data.y);
+  createGazeOverlay();
+  gazeOverlayEl.style.display = 'block';
+  gazeOverlayEl.style.left = vp.x + 'px';
+  gazeOverlayEl.style.top = vp.y + 'px';
 }
 
 // ============================================================================
@@ -3650,7 +3804,7 @@ function loadUserInfo() {
  */
 function openPersonalDashboard() {
   chrome.storage.local.get(['api_base_url'], (result) => {
-    const apiBase = result.api_base_url || 'http://localhost:8000';
+    const apiBase = result.analyze_api_url ? new URL(result.analyze_api_url).origin : 'http://127.0.0.1:8000';
     const dashboardUrl = `${apiBase.replace('/api', '')}/personal`;
     chrome.tabs.create({ url: dashboardUrl });
   });
@@ -4078,6 +4232,10 @@ function toggleExtension() {
     if (currentOverlay) {
       currentOverlay.style.display = 'none';
     }
+    // Hide gaze cursor overlay
+    if (gazeOverlayEl) {
+      gazeOverlayEl.style.display = 'none';
+    }
   }
   
   // Update the toggle button appearance
@@ -4181,6 +4339,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'SHOW_AGENT_RESULTS') {
     showAgentResultsOverlay(message.data.orchestrationResult, message.data.relevantWebpages || []);
     sendResponse({ success: true });
+  // Real-time gaze updates from WebSocket or HTTP poll (gaze2 stream)
+  if (message.type === 'GAZE_UPDATE') {
+    const raw = message.data;
+    gazeAvailable = true;
+
+    // EMA-smooth the incoming gaze coordinates
+    if (!smoothedGaze) {
+      smoothedGaze = { x: raw.x, y: raw.y };
+    } else {
+      smoothedGaze.x = GAZE_SMOOTH_FACTOR * raw.x + (1 - GAZE_SMOOTH_FACTOR) * smoothedGaze.x;
+      smoothedGaze.y = GAZE_SMOOTH_FACTOR * raw.y + (1 - GAZE_SMOOTH_FACTOR) * smoothedGaze.y;
+    }
+
+    // Deadband: only accept a new gaze position when it moves beyond threshold
+    if (!settledGaze) {
+      settledGaze = { x: smoothedGaze.x, y: smoothedGaze.y };
+    }
+    const gdx = smoothedGaze.x - settledGaze.x;
+    const gdy = smoothedGaze.y - settledGaze.y;
+    if (gdx * gdx + gdy * gdy >= GAZE_DEADBAND_PX * GAZE_DEADBAND_PX) {
+      settledGaze = { x: smoothedGaze.x, y: smoothedGaze.y };
+    }
+
+    // Publish the settled (deadbanded) position
+    lastGazePoint = {
+      x: settledGaze.x,
+      y: settledGaze.y,
+      screenWidth: raw.screenWidth,
+      screenHeight: raw.screenHeight,
+      available: raw.available,
+      confidence: raw.confidence
+    };
+
+    updateGazeOverlay(lastGazePoint);
+    if (!window.__cgGazeReceived) {
+      window.__cgGazeReceived = true;
+      console.log('[ContextGrabber] Gaze tracking active — red dot following your eyes');
+    }
+    sendResponse({ received: true });
   }
 });
 
@@ -4861,7 +5058,8 @@ async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtract
 }
 
 async function sendImageToBackend(imageDataUrl) {
-  if (!imageDataUrl || !ANALYZE_API_URL) return null;
+  const apiUrl = await getAnalyzeApiUrl();
+  if (!imageDataUrl || !apiUrl) return null;
 
   try {
     // Convert data URL to blob
@@ -4876,7 +5074,7 @@ async function sendImageToBackend(imageDataUrl) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-    const backendResponse = await fetch(ANALYZE_API_URL, {
+    const backendResponse = await fetch(apiUrl, {
       method: 'POST',
       body: formData,
       signal: controller.signal
@@ -5020,7 +5218,7 @@ async function autoSaveToNotebook(orchestrationResult, relevantWebpages, origina
  * Also captures a snapshot of the area around the dwell point.
  * Respects SCREENSHOT_PRIORITY setting.
  */
-async function triggerSearchFromPoint(x, y) {
+async function triggerSearchFromPoint(x, y, snapshotSize = SNAPSHOT_SIZE) {
   // Try to extract text — dispatches to PDF / Google Docs / normal extractors
   const target = resolveTargetFromPoint(x, y);
   let text = target ? target.text.trim() : '';
@@ -5090,6 +5288,32 @@ async function triggerSearchFromPoint(x, y) {
         errorMsg.includes('permission') || errorMsg.includes('Permission')) {
       console.warn('[ContextGrabber] Screenshot permission not available, will use text-only for agents');
       // Continue without snapshot - agents can work with text only
+  // --- SCREENSHOT API PRIORITY MODE ---
+  if (SCREENSHOT_PRIORITY === 'api-only' || SCREENSHOT_PRIORITY === 'api-first') {
+    // 1) Capture a snapshot of the area around the dwell point
+    try {
+      const snapshot = await captureAreaSnapshot(x, y, snapshotSize);
+      lastSnapshotDataUrl = snapshot;
+    } catch (err) {
+      console.warn('[ContextGrabber] Snapshot capture failed:', err);
+      lastSnapshotDataUrl = null;
+      
+      // Check if it's a permission error
+      const errorMsg = err.message || err.toString();
+      if (errorMsg.includes('activeTab') || errorMsg.includes('not been invoked') || 
+          errorMsg.includes('permission') || errorMsg.includes('Permission')) {
+        // Show warning but continue with text-based search
+        if (SCREENSHOT_PRIORITY === 'api-only') {
+          showErrorOverlay('Permission Required', 
+            'Please click the ThirdEye extension icon in your browser toolbar first to enable screenshot capture. ' +
+            'This grants the extension permission to capture screenshots.');
+          return; // Only return early in api-only mode
+        } else {
+          // In api-first mode, show info and continue with Google search
+          console.warn('[ContextGrabber] Screenshot permission not available, using text-based search');
+          // Don't show error overlay - just log and continue
+        }
+      }
     }
   }
 
@@ -5117,6 +5341,30 @@ async function triggerSearchFromPoint(x, y) {
         hasOrchestration: !!orchestrationData,
         dataKeys: Object.keys(resultData),
         orchestrationKeys: orchestrationData ? Object.keys(orchestrationData) : []
+    // 2) Send to backend image analysis API
+    let backendResults = null;
+    const currentApiUrl = await getAnalyzeApiUrl();
+    if (lastSnapshotDataUrl && currentApiUrl) {
+      console.log('[ContextGrabber] Sending snapshot to backend analysis...');
+      setOverlayStatus('Analyzing screenshot...');
+      backendResults = await sendImageToBackend(lastSnapshotDataUrl);
+      
+      // If backend failed, show helpful message (only for api-only mode)
+      if (!backendResults && SCREENSHOT_PRIORITY === 'api-only') {
+        const backendUrl = currentApiUrl || 'configured endpoint';
+        showErrorOverlay('Backend Unavailable', 
+          'The analysis backend is not responding. Please check if the backend server is running at ' + backendUrl + 
+          '. Falling back to text-based search.');
+        // Don't return - let it fall through to Google search
+      }
+    }
+
+    // 3) If backend returned results, display them
+    if (backendResults && backendResults.length > 0) {
+      console.log('[ContextGrabber] Backend provided', backendResults.length, 'results');
+      showSearchResultsOverlay({
+        query: text.substring(0, 60) + '...',
+        results: backendResults
       });
       // #region agent log
       const debugExtracted = {location:'content.js:4930',message:'extracted orchestration data',data:{hasOrchestration:!!orchestrationData,orchestrationKeys:orchestrationData?Object.keys(orchestrationData):[],hasAgents:!!(orchestrationData?.agents),agentKeys:orchestrationData?.agents?Object.keys(orchestrationData.agents):[]},timestamp:Date.now(),runId:'run1',hypothesisId:'E'};
@@ -5214,6 +5462,64 @@ async function triggerSearchFromPoint(x, y) {
     console.error('[ContextGrabber] Agent flow did not complete');
     showErrorOverlay('Processing Failed', 
       'Unable to process content. Please ensure backend is running and try again.');
+
+  // --- GOOGLE SEARCH FALLBACK ---
+  if (SCREENSHOT_PRIORITY !== 'api-only') {
+    console.log('[ContextGrabber] Using Google text search');
+    setOverlayStatus('Searching Google...');
+
+    // Capture snapshot if not already done
+    if (!lastSnapshotDataUrl && SCREENSHOT_PRIORITY !== 'google-only') {
+      try {
+        const snapshot = await captureAreaSnapshot(x, y, snapshotSize);
+        lastSnapshotDataUrl = snapshot;
+      } catch (err) {
+        console.warn('[ContextGrabber] Snapshot capture failed:', err);
+        lastSnapshotDataUrl = null;
+      }
+    }
+
+    // Request web search results
+    chrome.runtime.sendMessage(
+      { type: 'SEARCH_GOOGLE', data: { url, text } },
+      response => {
+        if (chrome.runtime.lastError) {
+          console.error('[ContextGrabber] Message error:', chrome.runtime.lastError);
+        }
+      }
+    );
+
+    // Request image search results in parallel
+    chrome.runtime.sendMessage(
+      { type: 'SEARCH_GOOGLE_IMAGES', data: { url, text } },
+      response => {
+        if (chrome.runtime.lastError) {
+          console.error('[ContextGrabber] Image search message error:', chrome.runtime.lastError);
+        }
+      }
+    );
+
+    // If text extraction was thin, try OCR on the snapshot
+    if (lastSnapshotDataUrl && text.replace(/\[.*?\]/g, '').trim().length < 60) {
+      console.log('[ContextGrabber] Text is thin, attempting OCR on snapshot...');
+      setOverlayStatus('Running OCR...');
+      performClientOCR(lastSnapshotDataUrl).then(ocrText => {
+        if (ocrText && ocrText.trim().length > 10) {
+          console.log('[ContextGrabber] OCR extracted:', ocrText.substring(0, 80));
+          // Re-search with better text from OCR
+          chrome.runtime.sendMessage(
+            { type: 'SEARCH_GOOGLE', data: { url, text: ocrText.trim() } },
+            () => {
+              if (chrome.runtime.lastError) {
+                console.error('[ContextGrabber] OCR re-search error:', chrome.runtime.lastError);
+              }
+            }
+          );
+        }
+      }).catch(err => {
+        console.warn('[ContextGrabber] OCR failed:', err);
+      });
+    }
   }
 }
 
@@ -5296,18 +5602,19 @@ async function performClientOCR(imageDataUrl) {
  *
  * @param {number} x - Client X coordinate (CSS pixels)
  * @param {number} y - Client Y coordinate (CSS pixels)
+ * @param {number} size - Square region size (default SNAPSHOT_SIZE, use GAZE_SNAPSHOT_SIZE for gaze-centered)
  * @returns {Promise<string|null>} Cropped snapshot as a data URL, or null
  */
-async function captureAreaSnapshot(x, y) {
+async function captureAreaSnapshot(x, y, size = SNAPSHOT_SIZE) {
   return new Promise((resolve, reject) => {
     const dpr = window.devicePixelRatio || 1;
-    const halfSize = SNAPSHOT_SIZE / 2;
+    const halfSize = size / 2;
 
     // Region in CSS pixels, clamped to viewport
     const cropX = Math.max(0, x - halfSize);
     const cropY = Math.max(0, y - halfSize);
-    const cropW = Math.min(SNAPSHOT_SIZE, window.innerWidth - cropX);
-    const cropH = Math.min(SNAPSHOT_SIZE, window.innerHeight - cropY);
+    const cropW = Math.min(size, window.innerWidth - cropX);
+    const cropH = Math.min(size, window.innerHeight - cropY);
 
     chrome.runtime.sendMessage(
       {
@@ -5387,15 +5694,36 @@ async function dwellDetectionLoop() {
         continue;
       }
 
+      // Skip if gaze point falls inside the overlay (mouse-hover only catches cursor,
+      // not eye gaze — so we do an explicit bounding-rect hit test here).
+      if (currentOverlay) {
+        const overlayRect = currentOverlay.getBoundingClientRect();
+        // Peek at gaze position before the full point resolution below
+        let gazeVp = null;
+        if (lastGazePoint && lastGazePoint.available !== false) {
+          gazeVp = screenToViewport(lastGazePoint.x, lastGazePoint.y);
+        }
+        const testPt = gazeVp || smoothedMousePos;
+        if (testPt.x >= overlayRect.left && testPt.x <= overlayRect.right &&
+            testPt.y >= overlayRect.top  && testPt.y <= overlayRect.bottom) {
+          dwellAnchor = null;
+          continue;
+        }
+      }
+
       // Skip briefly after a scroll (content shifted under cursor)
       if (Date.now() - lastScrollTime < 500) {
         dwellAnchor = null;
         continue;
       }
 
-      // Get current point: gaze API first, then smoothed mouse fallback
+      // Get current point: WebSocket gaze first, then HTTP gaze API, then mouse fallback
       let point = null;
-      if (gazeAvailable) {
+      if (lastGazePoint && lastGazePoint.available !== false) {
+        const vp = screenToViewport(lastGazePoint.x, lastGazePoint.y);
+        point = { x: Math.round(vp.x), y: Math.round(vp.y) };
+      }
+      if (!point && gazeAvailable) {
         point = await getGazePoint();
       }
       if (!point) {
@@ -5421,14 +5749,14 @@ async function dwellDetectionLoop() {
 
       if (!dwellAnchor) {
         // Start a dwell anchor (velocity gate removed — decay handles it now)
-        dwellAnchor = { x: point.x, y: point.y, time: now };
+        dwellAnchor = { x: point.x, y: point.y, time: now, fromGaze: !!lastGazePoint };
         continue;
       }
 
       // Check if position moved outside the dwell radius
       if (distance(point, dwellAnchor) > DWELL_RADIUS) {
         // Moved away — reset anchor
-        dwellAnchor = { x: point.x, y: point.y, time: now };
+        dwellAnchor = { x: point.x, y: point.y, time: now, fromGaze: !!lastGazePoint };
         continue;
       }
 
@@ -5437,7 +5765,8 @@ async function dwellDetectionLoop() {
 
       if (dwellDuration >= DWELL_TIME_MS && mouseVelocity < VELOCITY_REST_THRESHOLD) {
         // Dwell threshold reached AND cursor is at rest — trigger scrape
-        triggerSearchFromPoint(dwellAnchor.x, dwellAnchor.y);
+        const snapshotSize = dwellAnchor.fromGaze ? GAZE_SNAPSHOT_SIZE : SNAPSHOT_SIZE;
+        triggerSearchFromPoint(dwellAnchor.x, dwellAnchor.y, snapshotSize);
         // Reset anchor so we don't re-trigger immediately
         dwellAnchor = null;
       }

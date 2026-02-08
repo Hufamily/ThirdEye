@@ -18,16 +18,34 @@
 // ============================================================================
 
 /**
- * API Base URL - configurable, defaults to localhost
- * Can be overridden via chrome.storage.local['api_base_url']
+ * API Base URL - configurable, defaults to 127.0.0.1:8000
+ * Can be overridden via chrome.storage.local['analyze_api_url']
  */
-const DEFAULT_API_BASE_URL = 'http://localhost:8000';
+const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000';
+
+/** Gaze WebSocket URL - gaze2 streams at ~60 FPS when gaze_cursor.py --api is running */
+const GAZE_WS_URL = 'ws://127.0.0.1:8765';
+
+/** Gaze HTTP API - fallback when WebSocket not connected */
+const GAZE_HTTP_URL = 'http://127.0.0.1:5000/gaze';
+
+/** Reconnect delay (ms) when gaze WebSocket disconnects */
+const GAZE_WS_RECONNECT_DELAY = 2000;
+
+/** HTTP polling interval (ms) when WebSocket not connected */
+const GAZE_HTTP_POLL_INTERVAL = 200;
 
 /**
  * Analysis API endpoint
  * POST request with { url, text } body
  */
 const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
+
+/**
+ * Gaze tracking API endpoint (gaze2 runs on port 5000)
+ * GET request that returns { x, y, confidence, screenWidth, screenHeight }
+ */
+const GAZE_API_URL = 'http://127.0.0.1:5000/gaze';
 
 /** Request timeout in milliseconds */
 const REQUEST_TIMEOUT = 5000;
@@ -60,8 +78,12 @@ async function getAuthToken() {
  */
 async function getApiBaseUrl() {
   try {
-    const result = await chrome.storage.local.get(['api_base_url']);
-    return result.api_base_url || DEFAULT_API_BASE_URL;
+    const result = await chrome.storage.local.get(['analyze_api_url']);
+    if (result.analyze_api_url) {
+      // Derive base URL from stored analyze endpoint (strip path)
+      try { return new URL(result.analyze_api_url).origin; } catch (_) {}
+    }
+    return DEFAULT_API_BASE_URL;
   } catch (error) {
     console.error('[ContextGrabber] Error getting API base URL:', error);
     return DEFAULT_API_BASE_URL;
@@ -102,6 +124,138 @@ async function authenticatedFetch(endpoint, options = {}) {
   
   return response;
 }
+
+// ============================================================================
+// GAZE WEBSOCKET + HTTP FALLBACK: Relay gaze to content scripts
+// ============================================================================
+
+let gazeWs = null;
+let gazeWsReconnectTimer = null;
+let gazeHttpPollTimer = null;
+
+/**
+ * Sends gaze data to all http/https tabs. Called by both WebSocket and HTTP poll.
+ */
+function relayGazeToTabs(data) {
+  if (!data || (data.available === false && !data.x && !data.y)) return;
+  chrome.tabs.query({}, (tabs) => {
+    tabs.forEach((tab) => {
+      if (!tab.id || !tab.url) return;
+      if (tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) return;
+      if (!tab.url.startsWith('http')) return;
+
+      chrome.tabs.sendMessage(tab.id, {
+        type: 'GAZE_UPDATE',
+        data: {
+          x: data.x,
+          y: data.y,
+          confidence: data.confidence || 1,
+          screenWidth: data.screenWidth || 1920,
+          screenHeight: data.screenHeight || 1080,
+          available: data.available !== false
+        }
+      }).catch(() => { /* Tab may not have content script loaded */ });
+    });
+  });
+}
+
+/**
+ * HTTP polling fallback - background can fetch localhost without CORS.
+ * Used when WebSocket is not connected.
+ */
+async function pollGazeHttp() {
+  if (gazeWs && gazeWs.readyState === WebSocket.OPEN) return; // WebSocket active, skip poll
+
+  try {
+    const res = await fetch(GAZE_HTTP_URL, { method: 'GET' });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.available !== false && typeof data.x === 'number' && typeof data.y === 'number') {
+      relayGazeToTabs({
+        x: data.x,
+        y: data.y,
+        confidence: data.confidence,
+        screenWidth: data.screenWidth || 1920,
+        screenHeight: data.screenHeight || 1080,
+        available: true
+      });
+    }
+  } catch (e) {
+    // API not running - expected when gaze_cursor not started
+  }
+}
+
+function startGazeHttpPoll() {
+  if (gazeHttpPollTimer) return;
+  gazeHttpPollTimer = setInterval(pollGazeHttp, GAZE_HTTP_POLL_INTERVAL);
+  console.log('[ContextGrabber] Gaze HTTP polling started (fallback when WebSocket offline)');
+}
+
+function stopGazeHttpPoll() {
+  if (gazeHttpPollTimer) {
+    clearInterval(gazeHttpPollTimer);
+    gazeHttpPollTimer = null;
+  }
+}
+
+/**
+ * Connects to the gaze2 WebSocket server and relays gaze (x, y) to all active tabs.
+ */
+function connectGazeWebSocket() {
+  if (gazeWs && gazeWs.readyState === WebSocket.OPEN) return;
+
+  try {
+    gazeWs = new WebSocket(GAZE_WS_URL);
+
+    gazeWs.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (!data.available) return;
+        relayGazeToTabs(data);
+      } catch (e) {
+        console.warn('[ContextGrabber] Gaze message parse error:', e);
+      }
+    };
+
+    gazeWs.onclose = () => {
+      gazeWs = null;
+      startGazeHttpPoll(); // Fall back to HTTP when WebSocket drops
+      gazeWsReconnectTimer = setTimeout(connectGazeWebSocket, GAZE_WS_RECONNECT_DELAY);
+    };
+
+    gazeWs.onerror = () => {
+      gazeWsReconnectTimer = setTimeout(connectGazeWebSocket, GAZE_WS_RECONNECT_DELAY);
+    };
+
+    gazeWs.onopen = () => {
+      console.log('[ContextGrabber] Gaze WebSocket connected');
+      stopGazeHttpPoll(); // Prefer WebSocket over HTTP
+    };
+  } catch (e) {
+    console.warn('[ContextGrabber] Gaze WebSocket connect error:', e);
+    gazeWsReconnectTimer = setTimeout(connectGazeWebSocket, GAZE_WS_RECONNECT_DELAY);
+  }
+}
+
+/**
+ * Disconnects the gaze WebSocket (e.g. when extension is disabled)
+ */
+function disconnectGazeWebSocket() {
+  if (gazeWsReconnectTimer) {
+    clearTimeout(gazeWsReconnectTimer);
+    gazeWsReconnectTimer = null;
+  }
+  if (gazeWs) {
+    gazeWs.close();
+    gazeWs = null;
+  }
+  stopGazeHttpPoll();
+}
+
+// Start gaze connection when background loads
+connectGazeWebSocket();
+// Also start HTTP polling immediately - works even before WebSocket connects
+startGazeHttpPoll();
 
 // ============================================================================
 // EXTENSION ICON CLICK → Toggle extension on/off
@@ -302,10 +456,78 @@ function updateBadgeForTab(tabId, enabled) {
 }
 
 // ============================================================================
+// CONTEXT MENU: Right-click → Settings
+// ============================================================================
+
+// Create context menu on extension load
+chrome.contextMenus.create({
+  id: 'thirdeye-settings',
+  title: 'ThirdEye Settings',
+  contexts: ['page']
+});
+
+// Handle context menu click → open options page
+chrome.contextMenus.onClicked.addListener((info) => {
+  if (info.menuItemId === 'thirdeye-settings') {
+    chrome.runtime.openOptionsPage();
+  }
+});
+
+// ============================================================================
+// GET ANALYZE API URL
+// ============================================================================
+
+/**
+ * Gets the Analysis API URL from storage
+ * @returns {Promise<string>} API URL
+ */
+async function getAnalyzeApiUrl() {
+  try {
+    const stored = await chrome.storage.local.get('analyze_api_url');
+    return stored.analyze_api_url || ANALYZE_API_URL;
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting API URL:', error);
+    return ANALYZE_API_URL;
+  }
+}
+
+/**
+ * Gets the Gaze API URL from storage
+ * @returns {Promise<string|null>} Gaze API URL or null if disabled
+ */
+async function getGazeApiUrl() {
+  try {
+    const stored = await chrome.storage.local.get('gaze_api_url');
+    // Return null if explicitly empty, otherwise return URL or default
+    if (stored.gaze_api_url === '') return null;
+    return stored.gaze_api_url || GAZE_API_URL;
+  } catch (error) {
+    console.error('[ContextGrabber] Error getting Gaze API URL:', error);
+    return GAZE_API_URL;
+  }
+}
+
+// ============================================================================
 // MESSAGE HANDLER: Receive content from content script
 // ============================================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Handle request for Analysis API URL from content script
+  if (message.type === 'GET_ANALYZE_API_URL') {
+    getAnalyzeApiUrl().then(apiUrl => {
+      sendResponse({ apiUrl });
+    });
+    return true; // Indicate we'll send response asynchronously
+  }
+  
+  // Handle request for Gaze API URL from content script
+  if (message.type === 'GET_GAZE_API_URL') {
+    getGazeApiUrl().then(gazeUrl => {
+      sendResponse({ gazeUrl });
+    });
+    return true; // Indicate we'll send response asynchronously
+  }
+  
   // Handle extension state changes from content script
   if (message.type === 'EXTENSION_STATE_CHANGED') {
     if (sender.tab && sender.tab.id) {
@@ -1170,7 +1392,8 @@ async function tryOldAnalysisAPI(data) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-    const response = await fetch(ANALYZE_API_URL, {
+    const apiUrl = await getAnalyzeApiUrl();
+    const response = await fetch(apiUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'

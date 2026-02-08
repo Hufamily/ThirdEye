@@ -14,9 +14,7 @@ A production-ready, real-time gaze tracking application with RESTful API support
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.12+
+- Python 3.11-3.13 recommended (3.14 is not supported by all gaze dependencies)
 - Webcam
 - Linux/macOS/Windows
 
@@ -32,6 +30,10 @@ cp .env.example .env
 # Install dependencies
 pip install -r requirements.txt
 pip install gazefollower
+python -m pip install --upgrade pip
+pip install -r GazeFollower/requirements.txt
+pip install -r requirements.txt  # Flask for API
+pip install pyautogui            # optional: OS cursor control
 ```
 
 ### Run
@@ -106,6 +108,17 @@ GAZE_SHOW_CURSOR=true
 ```
 
 ## Docker Deployment
+To move your actual OS cursor with gaze:
+```bash
+python gaze_cursor.py --control-cursor
+```
+
+The application will:
+1. Show a camera preview (close when ready)
+2. Run calibration (follow the calibration points)
+3. Start tracking and display the red circle at your gaze position
+4. If `--control-cursor` is enabled, also moves the OS cursor
+5. Press ESC to exit
 
 ### Build and Run
 
@@ -169,6 +182,12 @@ fetch('http://localhost:5000/gaze')
     console.log(`Gaze at: (${data.x}, ${data.y})`);
   });
 ```
+**Usage:**
+- **Standalone** (mock data): `python run_api.py` — for development without camera
+- **With live gaze**: `python gaze_cursor.py --api` — runs gaze cursor + API; `/gaze` returns real coordinates
+- **With live gaze + OS cursor**: `python gaze_cursor.py --api --control-cursor`
+
+**Chrome extension integration:** When run with `--api`, gaze_cursor also starts a WebSocket server at `ws://127.0.0.1:8765` that streams gaze coordinates at ~60 FPS. The ThirdEye Chrome extension connects to this stream for real-time red overlay and gaze-centered screenshot capture.
 
 ### cURL
 
@@ -222,6 +241,11 @@ See [PRODUCTION.md](PRODUCTION.md) for:
 - Check logs: `tail -f logs/gaze_tracker.log`
 - Verify port: `lsof -i :5000`
 - Test health: `curl http://localhost:5000/health`
+- `gaze_cursor.py` - Main application script
+- `api/` - Flask API with `/gaze` endpoint
+- `gaze_websocket_server.py` - WebSocket server for real-time gaze streaming
+- `run_api.py` - Start the API server
+- `GazeFollower/` - Gaze tracking library (based on [GazeFollower](https://github.com/GanchengZhu/GazeFollower))
 
 ## License
 
