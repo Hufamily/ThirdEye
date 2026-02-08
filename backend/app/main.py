@@ -28,20 +28,36 @@ app = FastAPI(
 )
 
 # CORS Configuration
-# Allow frontend origin (adjust for production)
+# Allow frontend origin and Chrome extension origins
+# Chrome extensions make requests from webpage origins (content scripts run in page context)
 frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        frontend_url,
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# For development: allow all origins (Chrome extensions can make requests from any webpage)
+# In production, restrict to specific origins
+is_production = os.getenv("ENVIRONMENT", "development") == "production"
+
+if is_production:
+    # Production: only allow specific origins
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            frontend_url,
+            "http://localhost:5173",
+            "http://localhost:3000",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # Development: allow all origins (needed for Chrome extension content scripts)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Allow all origins for Chrome extension compatibility
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.get("/")

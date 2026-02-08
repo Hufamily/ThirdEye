@@ -133,6 +133,11 @@ class AgentOrchestrator:
     ) -> Dict[str, Any]:
         """Process agents directly without Dedalus (fallback)"""
         
+        print(f"[AgentOrchestrator] Starting direct agent processing")
+        print(f"[AgentOrchestrator] Capture result keys: {list(capture_result.keys()) if capture_result else 'None'}")
+        print(f"[AgentOrchestrator] Persona card keys: {list(persona_card.keys()) if persona_card else 'None'}")
+        print(f"[AgentOrchestrator] User ID: {user_id}")
+        
         results = {
             "user_id": user_id,
             "session_id": session_id,
@@ -146,22 +151,33 @@ class AgentOrchestrator:
                 "capture_result": capture_result,
                 "persona_card": persona_card
             })
+            print(f"[AgentOrchestrator] Agent 2.0 result: success={classification_result.get('success')}, has_data={bool(classification_result.get('data'))}")
+            if not classification_result.get("success"):
+                print(f"[AgentOrchestrator] Agent 2.0 returned success=False: {classification_result.get('error', 'Unknown error')}")
             results["agents"]["2.0"] = classification_result.get("data", {})
         except Exception as e:
-            print(f"Agent 2.0 failed: {e}")
+            print(f"[AgentOrchestrator] Agent 2.0 failed with exception: {e}")
+            import traceback
+            traceback.print_exc()
             results["agents"]["2.0"] = {"error": str(e)}
         
         # Agent 3.0: Gap Hypothesis
         try:
             classification_data = results["agents"].get("2.0", {})
+            print(f"[AgentOrchestrator] Agent 3.0 input - classification_data keys: {list(classification_data.keys())}")
             gap_hypothesis = GapHypothesis()
             hypothesis_result = await gap_hypothesis.process({
                 "classification_result": classification_data,
                 "persona_card": persona_card
             })
+            print(f"[AgentOrchestrator] Agent 3.0 result: success={hypothesis_result.get('success')}, has_data={bool(hypothesis_result.get('data'))}")
+            if not hypothesis_result.get("success"):
+                print(f"[AgentOrchestrator] Agent 3.0 returned success=False: {hypothesis_result.get('error', 'Unknown error')}")
             results["agents"]["3.0"] = hypothesis_result.get("data", {})
         except Exception as e:
-            print(f"Agent 3.0 failed: {e}")
+            print(f"[AgentOrchestrator] Agent 3.0 failed with exception: {e}")
+            import traceback
+            traceback.print_exc()
             results["agents"]["3.0"] = {"error": str(e)}
         
         # Agent 4.0: Explanation Composer
