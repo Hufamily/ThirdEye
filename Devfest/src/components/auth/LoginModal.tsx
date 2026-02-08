@@ -122,6 +122,8 @@ export function LoginModal({ isOpen, onClose, initialAccountType }: LoginModalPr
                   size="large"
                   text="signin_with"
                   shape="rectangular"
+                  // Note: Scopes are configured in Google Cloud Console OAuth consent screen
+                  // The component will request whatever scopes are configured there
                 />
               </div>
             </div>

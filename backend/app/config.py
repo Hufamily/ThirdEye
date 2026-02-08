@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     k2_base_url: str = "https://api.kimi-k2.ai"
     k2_model: str = "kimi/k2-think"
     
+    # Gemini API (for LLM operations)
+    gemini_api_key: Optional[str] = None
+    
     # Server Configuration
     api_host: str = "0.0.0.0"
     api_port: int = 8000

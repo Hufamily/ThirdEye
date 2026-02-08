@@ -17,7 +17,7 @@ env_path = root_dir / ".env"
 load_dotenv(env_path)  # Load from root .env
 
 # Import routes
-from routes import auth, personal, enterprise, extension
+from routes import auth, personal, enterprise, extension, agents, google_auth
 
 app = FastAPI(
     title="ThirdEye API",
@@ -81,6 +81,8 @@ app.include_router(auth.router, prefix="/api/auth", tags=["authentication"])
 app.include_router(personal.router, prefix="/api/personal", tags=["personal"])
 app.include_router(enterprise.router, prefix="/api/enterprise", tags=["enterprise"])
 app.include_router(extension.router, prefix="/api/extension", tags=["extension"])
+app.include_router(agents.router, prefix="/api/agents", tags=["agents"])
+app.include_router(google_auth.router, prefix="/api/google-auth", tags=["google-auth"])
 
 if __name__ == "__main__":
     import uvicorn

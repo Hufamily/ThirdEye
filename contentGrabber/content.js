@@ -4317,6 +4317,86 @@ function distance(a, b) {
  * @param {string} imageDataUrl - Data URL of the snapshot image
  * @returns {Promise<Array|null>} - Array of results or null on error/timeout
  */
+/**
+ * Send screenshot to Agent 1.0 (Capture & Scrape) API
+ * @param {string} imageDataUrl - Screenshot as data URL
+ * @param {string} url - Current page URL
+ * @param {Object} cursorPos - Cursor position {x, y}
+ * @param {string} textExtraction - Pre-extracted text from DOM
+ * @returns {Promise<Object|null>} Agent 1.0 response or null
+ */
+async function sendScreenshotToAgent10(imageDataUrl, url, cursorPos, textExtraction) {
+  if (!imageDataUrl) return null;
+  
+  try {
+    // Get API base URL and auth token from storage
+    const storageData = await new Promise((resolve) => {
+      chrome.storage.local.get(['api_base_url', 'auth_token'], (result) => {
+        resolve({
+          apiBase: result.api_base_url || 'http://localhost:8000',
+          authToken: result.auth_token || null
+        });
+      });
+    });
+    
+    const agent10Url = `${storageData.apiBase}/api/agents/capture-scrape`;
+    
+    // Prepare request payload
+    const payload = {
+      url: url,
+      cursor_position: cursorPos,
+      screenshot: imageDataUrl,  // Base64 data URL
+      text_extraction: textExtraction || '',  // Pre-extracted text
+      context_lines: CONTEXT_LINES_BEFORE + CONTEXT_LINES_AFTER,
+      dwell_time_ms: DWELL_TIME_MS
+    };
+    
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+    
+    if (storageData.authToken) {
+      headers['Authorization'] = `Bearer ${storageData.authToken}`;
+    }
+    
+    // POST to Agent 1.0 API with timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);  // 10s timeout for vision processing
+    
+    const response = await fetch(agent10Url, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      console.warn('[ContextGrabber] Agent 1.0 returned status:', response.status);
+      return null;
+    }
+    
+    const data = await response.json();
+    if (data.success) {
+      console.log('[ContextGrabber] Agent 1.0 extraction successful');
+      return data;
+    } else {
+      console.warn('[ContextGrabber] Agent 1.0 error:', data.error || 'unknown');
+      return null;
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      console.warn('[ContextGrabber] Agent 1.0 request timed out');
+    } else if (err.message && err.message.includes('Failed to fetch')) {
+      console.warn('[ContextGrabber] Agent 1.0 request failed: Backend may be offline or CORS issue');
+    } else {
+      console.warn('[ContextGrabber] Agent 1.0 request failed:', err.message || err.toString());
+    }
+    return null;
+  }
+}
+
 async function sendImageToBackend(imageDataUrl) {
   if (!imageDataUrl || !ANALYZE_API_URL) return null;
 
@@ -4451,7 +4531,34 @@ async function triggerSearchFromPoint(x, y) {
       }
     }
 
-    // 2) Send to backend image analysis API
+    // 2) Send screenshot to Agent 1.0 (Capture & Scrape) API
+    if (lastSnapshotDataUrl) {
+      console.log('[ContextGrabber] Sending screenshot to Agent 1.0 API...');
+      setOverlayStatus('Extracting content from screenshot...');
+      
+      try {
+        const agent10Result = await sendScreenshotToAgent10(lastSnapshotDataUrl, url, { x, y }, text);
+        if (agent10Result && agent10Result.success) {
+          const extractedData = agent10Result.data;
+          console.log('[ContextGrabber] Agent 1.0 extracted:', {
+            text_length: extractedData.extracted_text?.length || 0,
+            source: extractedData.text_source,
+            content_types: extractedData.content_types_detected || []
+          });
+          
+          // Use extracted text if better than DOM extraction
+          if (extractedData.extracted_text && extractedData.extracted_text.length > text.length) {
+            text = extractedData.extracted_text;
+            console.log('[ContextGrabber] Using Agent 1.0 extracted text (better than DOM)');
+          }
+        }
+      } catch (err) {
+        console.warn('[ContextGrabber] Agent 1.0 extraction failed:', err);
+        // Continue with existing text extraction
+      }
+    }
+
+    // 3) Send to backend image analysis API (legacy)
     let backendResults = null;
     if (lastSnapshotDataUrl && ANALYZE_API_URL) {
       console.log('[ContextGrabber] Sending snapshot to backend analysis...');

@@ -195,3 +195,179 @@ async def get_status(
         isGazeTracking=is_gaze_tracking,
         hasWebcamAccess=has_webcam_access
     )
+
+
+class TrackHistoryRequest(BaseModel):
+    """Request model for tracking browser history"""
+    url: str
+    title: str
+    visitTime: int  # Unix timestamp in milliseconds
+    transition: str  # 'link', 'typed', 'reload', etc.
+    visitCount: int
+    sessionId: Optional[str] = None
+
+
+@router.post("/history/track")
+async def track_history(
+    request: TrackHistoryRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    POST /api/extension/history/track
+    Track browser history visit for learning context analysis
+    """
+    ensure_warehouse_resumed()
+    
+    try:
+        # Store history visit (could create BROWSER_HISTORY table or store in SESSIONS metadata)
+        # For now, store in session metadata if sessionId provided
+        
+        if request.sessionId:
+            # Update session metadata with history
+            result = db.execute(text("""
+                SELECT METADATA
+                FROM THIRDEYE_DEV.PUBLIC.SESSIONS
+                WHERE SESSION_ID = :session_id AND USER_ID = :user_id
+                LIMIT 1
+            """), {
+                "session_id": request.sessionId,
+                "user_id": current_user.user_id
+            })
+            
+            session_row = result.fetchone()
+            if session_row:
+                import json
+                metadata = json.loads(session_row[0]) if session_row[0] else {}
+                
+                if "history_visits" not in metadata:
+                    metadata["history_visits"] = []
+                
+                metadata["history_visits"].append({
+                    "url": request.url,
+                    "title": request.title,
+                    "visitTime": request.visitTime,
+                    "transition": request.transition,
+                    "visitCount": request.visitCount
+                })
+                
+                # Update session metadata
+                db.execute(text("""
+                    UPDATE THIRDEYE_DEV.PUBLIC.SESSIONS
+                    SET METADATA = :metadata,
+                        UPDATED_AT = CURRENT_TIMESTAMP()
+                    WHERE SESSION_ID = :session_id
+                """), {
+                    "session_id": request.sessionId,
+                    "metadata": json.dumps(metadata)
+                })
+                db.commit()
+        
+        return {"success": True, "message": "History tracked"}
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "code": "HISTORY_TRACKING_ERROR",
+                    "message": f"Failed to track history: {str(e)}",
+                    "details": {}
+                }
+            }
+        )
+
+
+@router.get("/history/analyze")
+async def analyze_history(
+    days_back: int = 7,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    GET /api/extension/history/analyze?days_back=7
+    Analyze user's browsing patterns for learning context
+    """
+    ensure_warehouse_resumed()
+    
+    try:
+        # Get sessions with history data
+        result = db.execute(text("""
+            SELECT SESSION_ID, METADATA, STARTED_AT
+            FROM THIRDEYE_DEV.PUBLIC.SESSIONS
+            WHERE USER_ID = :user_id
+              AND STARTED_AT >= DATEADD(day, -:days_back, CURRENT_TIMESTAMP())
+              AND METADATA IS NOT NULL
+            ORDER BY STARTED_AT DESC
+        """), {
+            "user_id": current_user.user_id,
+            "days_back": days_back
+        })
+        
+        import json
+        all_visits = []
+        domain_groups = {}
+        
+        for row in result:
+            metadata = json.loads(row[1]) if row[1] else {}
+            visits = metadata.get("history_visits", [])
+            
+            for visit in visits:
+                all_visits.append(visit)
+                
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(visit["url"]).netloc
+                    
+                    if domain not in domain_groups:
+                        domain_groups[domain] = {
+                            "domain": domain,
+                            "visits": 0,
+                            "urls": [],
+                            "lastVisit": 0
+                        }
+                    
+                    domain_groups[domain]["visits"] += 1
+                    domain_groups[domain]["urls"].append(visit["url"])
+                    if visit["visitTime"] > domain_groups[domain]["lastVisit"]:
+                        domain_groups[domain]["lastVisit"] = visit["visitTime"]
+                except Exception:
+                    pass
+        
+        # Sort by visit count
+        top_domains = sorted(
+            domain_groups.values(),
+            key=lambda x: x["visits"],
+            reverse=True
+        )[:20]
+        
+        # Identify learning sites
+        learning_keywords = [
+            'docs.google.com', 'github.com', 'stackoverflow.com',
+            'developer.mozilla.org', 'medium.com', 'wikipedia.org',
+            'youtube.com', 'coursera.org', 'udemy.com', 'khanacademy.org'
+        ]
+        
+        learning_sites = [
+            d for d in top_domains
+            if any(keyword in d["domain"] for keyword in learning_keywords)
+        ]
+        
+        return {
+            "totalVisits": len(all_visits),
+            "topDomains": top_domains,
+            "learningSites": learning_sites,
+            "daysAnalyzed": days_back
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "code": "HISTORY_ANALYSIS_ERROR",
+                    "message": f"Failed to analyze history: {str(e)}",
+                    "details": {}
+                }
+            }
+        )
