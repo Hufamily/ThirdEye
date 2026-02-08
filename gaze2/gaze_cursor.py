@@ -1,18 +1,55 @@
+#!/usr/bin/env python3
 # _*_ coding: utf-8 _*_
 """
-Gaze Cursor Display Script
+Gaze Cursor Display Script.
+
 Displays a red transparent circle at the gaze position in a fullscreen window.
 Press ESC to exit.
 
-Optional: run with --api to also start the Flask API (GET /gaze) in a background thread.
+Optional:
+- --api: start Flask API in a background thread (GET /gaze)
+- --control-cursor: move the OS cursor to follow gaze (requires pyautogui)
 """
 
 import argparse
-import pygame
-from pygame.locals import KEYDOWN, K_ESCAPE, QUIT, K_UP, K_DOWN
+import os
+import sys
+from pathlib import Path
 
-from gazefollower import GazeFollower
-from screeninfo import get_monitors
+# Allow running without installing gazefollower globally.
+SCRIPT_DIR = Path(__file__).resolve().parent
+LOCAL_GAZEFOLLOWER_ROOT = SCRIPT_DIR / "GazeFollower"
+if LOCAL_GAZEFOLLOWER_ROOT.exists():
+    sys.path.insert(0, str(LOCAL_GAZEFOLLOWER_ROOT))
+
+try:
+    import pygame
+    from pygame.locals import KEYDOWN, K_ESCAPE, QUIT, K_UP, K_DOWN
+except ModuleNotFoundError as e:
+    missing = e.name or "pygame"
+    raise SystemExit(
+        f"Missing dependency: {missing}\n"
+        "Install with:\n"
+        "  python -m pip install -r gaze2/GazeFollower/requirements.txt"
+    )
+
+try:
+    from screeninfo import get_monitors
+except ModuleNotFoundError:
+    raise SystemExit(
+        "Missing dependency: screeninfo\n"
+        "Install with:\n"
+        "  python -m pip install -r gaze2/GazeFollower/requirements.txt"
+    )
+
+try:
+    from gazefollower import GazeFollower
+except ModuleNotFoundError:
+    raise SystemExit(
+        "Could not import 'gazefollower'.\n"
+        "Install local package with:\n"
+        "  cd gaze2/GazeFollower && python -m pip install -e ."
+    )
 
 # Y-axis correction: Gaze trackers often have a downward bias due to camera position.
 # Positive values move the circle UP (subtract from Y). Adjust as needed for your setup.
@@ -22,6 +59,25 @@ Y_OFFSET_CORRECTION = 50
 # Optional: Y scale factor. 1.0 = no change. <1.0 compresses vertical range (reduces error at top/bottom).
 # Try 0.85-0.95 if Y is less accurate at screen edges.
 Y_SCALE = 1.0
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--api", action="store_true", help="Start Flask API in background (GET /gaze)")
+parser.add_argument("--api-port", type=int, default=5000, help="Port for API (default: 5000)")
+parser.add_argument(
+    "--control-cursor",
+    action="store_true",
+    help="Move the OS cursor to gaze position (requires pyautogui and OS permissions)",
+)
+parser.add_argument(
+    "--cursor-smoothing",
+    type=float,
+    default=0.25,
+    help="Smoothing factor for cursor control in [0.0, 1.0] (default: 0.25)",
+)
+args = parser.parse_args()
+
+# Validate smoothing range.
+args.cursor_smoothing = max(0.0, min(1.0, args.cursor_smoothing))
 
 # Initialize pygame
 pygame.init()
@@ -34,13 +90,28 @@ screen_height = monitors[0].height
 # Create fullscreen window
 win = pygame.display.set_mode((screen_width, screen_height), pygame.FULLSCREEN)
 pygame.display.set_caption("Gaze Cursor")
-pygame.mouse.set_visible(False)  # Hide mouse cursor
+pygame.mouse.set_visible(False)  # Hide mouse cursor inside pygame window
 
-# Parse args (e.g. --api to run Flask API in background)
-parser = argparse.ArgumentParser()
-parser.add_argument("--api", action="store_true", help="Start Flask API in background (GET /gaze)")
-parser.add_argument("--api-port", type=int, default=5000, help="Port for API (default: 5000)")
-args = parser.parse_args()
+# Optional OS-level cursor control
+pyautogui = None
+if args.control_cursor:
+    try:
+        import pyautogui as _pyautogui
+        _pyautogui.FAILSAFE = False
+        pyautogui = _pyautogui
+        print("OS cursor control: enabled")
+    except ModuleNotFoundError:
+        raise SystemExit(
+            "Missing dependency: pyautogui\n"
+            "Install with:\n"
+            "  python -m pip install pyautogui"
+        )
+    except Exception as e:
+        raise SystemExit(
+            "OS cursor control could not start. "
+            "On macOS, enable Accessibility permission for your terminal.\n"
+            f"Details: {e}"
+        )
 
 # Start API in background thread if requested
 if args.api:
@@ -76,6 +147,7 @@ running = True
 gaze_x, gaze_y = screen_width // 2, screen_height // 2  # Default to center
 y_offset = Y_OFFSET_CORRECTION  # Mutable for live adjustment
 y_scale = Y_SCALE
+cursor_x, cursor_y = float(gaze_x), float(gaze_y)
 
 while running:
     # Handle events
@@ -110,6 +182,12 @@ while running:
             set_gaze(float(gaze_x), float(gaze_y), confidence=1.0)
         except ImportError:
             pass
+        # Move OS cursor if enabled.
+        if pyautogui is not None:
+            alpha = args.cursor_smoothing
+            cursor_x = (1 - alpha) * cursor_x + alpha * gaze_x
+            cursor_y = (1 - alpha) * cursor_y + alpha * gaze_y
+            pyautogui.moveTo(int(cursor_x), int(cursor_y), duration=0)
     
     # Clear screen with black background
     win.fill((0, 0, 0))
@@ -139,7 +217,6 @@ gf.stop_sampling()
 
 # Save the gaze data (optional)
 try:
-    import os
     data_dir = "./data"
     os.makedirs(data_dir, exist_ok=True)
     file_name = "gaze_cursor_session.csv"
@@ -152,4 +229,3 @@ except Exception as e:
 gf.release()
 pygame.quit()
 print("Exiting...")
-
