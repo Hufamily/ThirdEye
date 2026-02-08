@@ -29,10 +29,10 @@ const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 const ENABLE_GAZE_MODE = true;
 
 /** Gaze tracking poll interval in milliseconds */
-const GAZE_POLL_INTERVAL = 300;
+const GAZE_POLL_INTERVAL = 200;
 
 /** Request timeout in milliseconds */
-const REQUEST_TIMEOUT = 3000;
+const REQUEST_TIMEOUT = 5000;
 
 /** Minimum confidence threshold for gaze coordinates (0-1) */
 const MIN_CONFIDENCE = 0.5;
@@ -3751,7 +3751,7 @@ function loadUserInfo() {
  */
 function openPersonalDashboard() {
   chrome.storage.local.get(['api_base_url'], (result) => {
-    const apiBase = result.api_base_url || 'http://localhost:8000';
+    const apiBase = result.analyze_api_url ? new URL(result.analyze_api_url).origin : 'http://127.0.0.1:8000';
     const dashboardUrl = `${apiBase.replace('/api', '')}/personal`;
     chrome.tabs.create({ url: dashboardUrl });
   });

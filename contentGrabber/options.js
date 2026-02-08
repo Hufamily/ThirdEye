@@ -3,8 +3,8 @@
  * Handles saving and loading user settings for ThirdEye extension
  */
 
-const DEFAULT_API_URL = 'http://localhost:8000/analyze';
-const DEFAULT_GAZE_URL = 'http://localhost:8000/gaze';
+const DEFAULT_API_URL = 'http://127.0.0.1:8000/analyze';
+const DEFAULT_GAZE_URL = 'http://127.0.0.1:5000/gaze';
 
 /**
  * Show status message to user
@@ -62,13 +62,13 @@ document.getElementById('save').addEventListener('click', async () => {
   
   // Validate API URL
   if (!validateApiUrl(apiUrl)) {
-    showStatus('Invalid Analysis API URL format. Example: http://localhost:8000/analyze', false);
+    showStatus('Invalid Analysis API URL format. Example: http://127.0.0.1:8000/analyze', false);
     return;
   }
   
   // Validate Gaze URL if provided
   if (gazeUrl && !validateApiUrl(gazeUrl)) {
-    showStatus('Invalid Gaze API URL format. Example: http://localhost:8000/gaze', false);
+    showStatus('Invalid Gaze API URL format. Example: http://127.0.0.1:5000/gaze', false);
     return;
   }
   

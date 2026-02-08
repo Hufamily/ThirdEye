@@ -18,10 +18,10 @@
 // ============================================================================
 
 /**
- * API Base URL - configurable, defaults to localhost
- * Can be overridden via chrome.storage.local['api_base_url']
+ * API Base URL - configurable, defaults to 127.0.0.1:8000
+ * Can be overridden via chrome.storage.local['analyze_api_url']
  */
-const DEFAULT_API_BASE_URL = 'http://localhost:8000';
+const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000';
 
 /** Gaze WebSocket URL - gaze2 streams at ~60 FPS when gaze_cursor.py --api is running */
 const GAZE_WS_URL = 'ws://127.0.0.1:8765';
@@ -42,10 +42,10 @@ const GAZE_HTTP_POLL_INTERVAL = 200;
 const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 
 /**
- * Gaze tracking API endpoint
- * GET request that returns { x, y, confidence }
+ * Gaze tracking API endpoint (gaze2 runs on port 5000)
+ * GET request that returns { x, y, confidence, screenWidth, screenHeight }
  */
-const GAZE_API_URL = 'http://127.0.0.1:8000/gaze';
+const GAZE_API_URL = 'http://127.0.0.1:5000/gaze';
 
 /** Request timeout in milliseconds */
 const REQUEST_TIMEOUT = 5000;
@@ -78,8 +78,12 @@ async function getAuthToken() {
  */
 async function getApiBaseUrl() {
   try {
-    const result = await chrome.storage.local.get(['api_base_url']);
-    return result.api_base_url || DEFAULT_API_BASE_URL;
+    const result = await chrome.storage.local.get(['analyze_api_url']);
+    if (result.analyze_api_url) {
+      // Derive base URL from stored analyze endpoint (strip path)
+      try { return new URL(result.analyze_api_url).origin; } catch (_) {}
+    }
+    return DEFAULT_API_BASE_URL;
   } catch (error) {
     console.error('[ContextGrabber] Error getting API base URL:', error);
     return DEFAULT_API_BASE_URL;
