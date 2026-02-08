@@ -1,1 +1,16 @@
+# Core dependencies
 flask>=3.0.0
+flask-cors>=4.0.0
+gunicorn>=21.2.0
+
+# Gaze tracking dependencies (from GazeFollower)
+mediapipe==0.10.13
+MNN>=3.2.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+pandas>=2.0.0
+pygame>=2.5.0
+screeninfo>=0.8.0
+
+# Production dependencies
+python-dotenv>=1.0.0

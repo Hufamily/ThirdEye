@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  gaze-tracker:
+    build: .
+    container_name: gaze-tracker
+    ports:
+      - "5000:5000"
+    environment:
+      - GAZE_API_HOST=0.0.0.0
+      - GAZE_API_PORT=5000
+      - GAZE_API_DEBUG=false
+      - GAZE_LOG_LEVEL=INFO
+      - GAZE_CORS_ORIGINS=*
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    devices:
+      - /dev/video0:/dev/video0  # Camera access (adjust device path as needed)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import requests; requests.get('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
