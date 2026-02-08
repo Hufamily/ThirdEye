@@ -4934,6 +4934,23 @@ async function dwellDetectionLoop() {
         continue;
       }
 
+      // Skip if gaze point falls inside the overlay (mouse-hover only catches cursor,
+      // not eye gaze — so we do an explicit bounding-rect hit test here).
+      if (currentOverlay) {
+        const overlayRect = currentOverlay.getBoundingClientRect();
+        // Peek at gaze position before the full point resolution below
+        let gazeVp = null;
+        if (lastGazePoint && lastGazePoint.available !== false) {
+          gazeVp = screenToViewport(lastGazePoint.x, lastGazePoint.y);
+        }
+        const testPt = gazeVp || smoothedMousePos;
+        if (testPt.x >= overlayRect.left && testPt.x <= overlayRect.right &&
+            testPt.y >= overlayRect.top  && testPt.y <= overlayRect.bottom) {
+          dwellAnchor = null;
+          continue;
+        }
+      }
+
       // Skip briefly after a scroll (content shifted under cursor)
       if (Date.now() - lastScrollTime < 500) {
         dwellAnchor = null;
