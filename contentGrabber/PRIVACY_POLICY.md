@@ -27,4 +27,4 @@ Users can:
 ## Changes
 This policy may be updated. Users will be notified of significant changes.
 
-For questions, contact: [your-email@example.com]
+For questions, contact: [huextensions0@gmail.com]
