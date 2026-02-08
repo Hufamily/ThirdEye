@@ -5,6 +5,13 @@ python -m pip install -r requirements.txt
 ```
 *make sure you're using python 3.11.9
 
+
+# Running
+```
+cd ThirdEye
+python .\gaze2\gaze_cursor.py --api
+```
+
 ### CLI
 
 ```bash

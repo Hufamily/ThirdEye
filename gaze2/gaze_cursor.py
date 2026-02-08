@@ -16,6 +16,9 @@ import os
 import sys
 from pathlib import Path
 
+# Suppress noisy MediaPipe C++ warnings (NORM_RECT without IMAGE_DIMENSIONS)
+os.environ.setdefault("GLOG_minloglevel", "2")
+
 # Allow running without installing gazefollower globally.
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOCAL_GAZEFOLLOWER_ROOT = SCRIPT_DIR / "GazeFollower"
@@ -60,6 +63,16 @@ Y_OFFSET_CORRECTION = 50
 # Try 0.85-0.95 if Y is less accurate at screen edges.
 Y_SCALE = 1.0
 
+# Deadband: gaze must move at least this many pixels from the last reported
+# position before a new position is published.  Eliminates micro-jitter that
+# would otherwise reset dwell timers in the Chrome extension.
+# Typical range: 15-40 pixels.  Increase if triggers are too sensitive.
+GAZE_DEADBAND_PX = 25
+
+# Gaze EMA smoothing factor (0-1).  Lower = smoother but laggier.
+# Applied before the deadband check so the deadband operates on stable data.
+GAZE_SMOOTH_FACTOR = 0.4
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--api", action="store_true", help="Start Flask API in background (GET /gaze)")
 parser.add_argument("--api-port", type=int, default=5000, help="Port for API (default: 5000)")
@@ -74,7 +87,14 @@ parser.add_argument(
     default=0.25,
     help="Smoothing factor for cursor control in [0.0, 1.0] (default: 0.25)",
 )
+parser.add_argument(
+    "--deadband",
+    type=int,
+    default=GAZE_DEADBAND_PX,
+    help=f"Deadband in pixels — gaze must move this far to update (default: {GAZE_DEADBAND_PX})",
+)
 args = parser.parse_args()
+GAZE_DEADBAND_PX = args.deadband
 
 # Validate smoothing range.
 args.cursor_smoothing = max(0.0, min(1.0, args.cursor_smoothing))
@@ -155,6 +175,10 @@ y_offset = Y_OFFSET_CORRECTION  # Mutable for live adjustment
 y_scale = Y_SCALE
 cursor_x, cursor_y = float(gaze_x), float(gaze_y)
 
+# Deadband / smoothing state
+smoothed_gaze_x, smoothed_gaze_y = float(gaze_x), float(gaze_y)
+last_published_x, last_published_y = float(gaze_x), float(gaze_y)
+
 while running:
     # Handle events
     for event in pygame.event.get():
@@ -182,10 +206,23 @@ while running:
         # Clamp to screen bounds
         gaze_x = max(0, min(screen_width, gaze_x))
         gaze_y = max(0, min(screen_height, gaze_y))
+
+        # EMA smoothing pass — reduces jitter before deadband check
+        smoothed_gaze_x = GAZE_SMOOTH_FACTOR * gaze_x + (1 - GAZE_SMOOTH_FACTOR) * smoothed_gaze_x
+        smoothed_gaze_y = GAZE_SMOOTH_FACTOR * gaze_y + (1 - GAZE_SMOOTH_FACTOR) * smoothed_gaze_y
+
+        # Deadband: only publish a new position when gaze moves beyond threshold.
+        # This prevents micro-jitter from resetting dwell timers in the extension.
+        dx = smoothed_gaze_x - last_published_x
+        dy = smoothed_gaze_y - last_published_y
+        if (dx * dx + dy * dy) >= GAZE_DEADBAND_PX * GAZE_DEADBAND_PX:
+            last_published_x = smoothed_gaze_x
+            last_published_y = smoothed_gaze_y
+
         # Push to API for /gaze endpoint (if api module is used)
         try:
             from api.app import set_gaze
-            set_gaze(float(gaze_x), float(gaze_y), confidence=1.0,
+            set_gaze(float(last_published_x), float(last_published_y), confidence=1.0,
                      screen_width=screen_width, screen_height=screen_height)
         except ImportError:
             pass

@@ -61,6 +61,14 @@ const GAZE_SNAPSHOT_SIZE = 200;
 /** Red gaze overlay diameter in pixels */
 const GAZE_OVERLAY_DIAMETER = 20;
 
+/** Gaze deadband in pixels — gaze must move at least this far to be considered
+ *  a genuine shift in attention. Small jitters within this radius are suppressed.
+ *  Works with the server-side deadband for two-layer noise rejection. */
+const GAZE_DEADBAND_PX = 100;
+
+/** Gaze EMA smoothing factor (0-1). Lower = smoother but laggier. */
+const GAZE_SMOOTH_FACTOR = 0.35;
+
 /** 
  * Screenshot API priority mode:
  * - 'api-only': Only use screenshot + backend API, never fall back to Google
@@ -162,6 +170,8 @@ let pdfTrackingOverlay = null;        // Transparent overlay for PDF mouse track
 let lastScrollTime = 0;               // Timestamp of last scroll event
 let lastGazePoint = null;             // Latest gaze from WebSocket {x, y, screenWidth, screenHeight}
 let gazeOverlayEl = null;             // Red circle DOM element for gaze cursor
+let smoothedGaze = null;              // EMA-smoothed gaze position {x, y}
+let settledGaze = null;               // Last gaze position that passed deadband {x, y}
 
 // Chatbot panel state
 let chatbotExpanded = false;          // Whether chatbot panel is expanded
@@ -4279,9 +4289,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Real-time gaze updates from WebSocket or HTTP poll (gaze2 stream)
   if (message.type === 'GAZE_UPDATE') {
-    lastGazePoint = message.data;
+    const raw = message.data;
     gazeAvailable = true;
-    updateGazeOverlay(message.data);
+
+    // EMA-smooth the incoming gaze coordinates
+    if (!smoothedGaze) {
+      smoothedGaze = { x: raw.x, y: raw.y };
+    } else {
+      smoothedGaze.x = GAZE_SMOOTH_FACTOR * raw.x + (1 - GAZE_SMOOTH_FACTOR) * smoothedGaze.x;
+      smoothedGaze.y = GAZE_SMOOTH_FACTOR * raw.y + (1 - GAZE_SMOOTH_FACTOR) * smoothedGaze.y;
+    }
+
+    // Deadband: only accept a new gaze position when it moves beyond threshold
+    if (!settledGaze) {
+      settledGaze = { x: smoothedGaze.x, y: smoothedGaze.y };
+    }
+    const gdx = smoothedGaze.x - settledGaze.x;
+    const gdy = smoothedGaze.y - settledGaze.y;
+    if (gdx * gdx + gdy * gdy >= GAZE_DEADBAND_PX * GAZE_DEADBAND_PX) {
+      settledGaze = { x: smoothedGaze.x, y: smoothedGaze.y };
+    }
+
+    // Publish the settled (deadbanded) position
+    lastGazePoint = {
+      x: settledGaze.x,
+      y: settledGaze.y,
+      screenWidth: raw.screenWidth,
+      screenHeight: raw.screenHeight,
+      available: raw.available,
+      confidence: raw.confidence
+    };
+
+    updateGazeOverlay(lastGazePoint);
     if (!window.__cgGazeReceived) {
       window.__cgGazeReceived = true;
       console.log('[ContextGrabber] Gaze tracking active — red dot following your eyes');
