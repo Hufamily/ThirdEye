@@ -26,7 +26,7 @@ const GAZE_API_URL = 'http://127.0.0.1:8000/gaze';
 const ANALYZE_API_URL = 'http://127.0.0.1:8000/analyze';
 
 /** Enable/disable gaze tracking (set to false to use cursor-only mode) */
-const ENABLE_GAZE_MODE = false;
+const ENABLE_GAZE_MODE = true;
 
 /** Gaze tracking poll interval in milliseconds */
 const GAZE_POLL_INTERVAL = 300;
@@ -1548,7 +1548,6 @@ function createPersistentOverlay() {
         <span class="cg-title">Context Grabber</span>
         <span class="cg-status" id="cg-status">Watching...</span>
         <button class="cg-toggle-btn" id="cg-toggle-btn" aria-label="Toggle extension" title="Toggle on/off (Ctrl+Shift+G)">&#9654;</button>
-        <button class="cg-minimize-btn" aria-label="Minimize">&#8212;</button>
         <button class="cg-dock-btn" id="cg-dock-btn" aria-label="Dock to corner" title="Dock to corner">&#8690;</button>
       </div>
       <div class="cg-body" id="cg-body">
@@ -1572,16 +1571,6 @@ function createPersistentOverlay() {
     updateToggleButton();
   });
   updateToggleButton(); // Set initial state
-
-  // Minimize/restore toggle
-  const minimizeBtn = overlay.querySelector('.cg-minimize-btn');
-  const body = overlay.querySelector('#cg-body');
-  minimizeBtn.addEventListener('click', () => {
-    const isMinimized = body.style.display === 'none';
-    body.style.display = isMinimized ? 'block' : 'none';
-    minimizeBtn.innerHTML = isMinimized ? '&#8212;' : '&#9744;';
-    overlayVisible = isMinimized;
-  });
 
   // Dock/undock toggle
   const dockBtn = overlay.querySelector('#cg-dock-btn');
@@ -1800,27 +1789,6 @@ function getOverlayStyles() {
       flex: 1;
       text-align: right;
       margin-right: 8px;
-    }
-
-    .cg-minimize-btn {
-      background: none;
-      border: none;
-      font-size: 18px;
-      cursor: pointer;
-      color: #999;
-      padding: 0;
-      width: 24px;
-      height: 24px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      border-radius: 4px;
-      transition: all 0.2s;
-    }
-
-    .cg-minimize-btn:hover {
-      background: #f0f0f0;
-      color: #333;
     }
 
     .cg-toggle-btn {
@@ -2060,7 +2028,7 @@ function escapeHtml(text) {
 
 /**
  * Toggles the extension on or off.
- * Updates the overlay status and resets dwell state.
+ * When disabled, completely hides the overlay from the screen.
  */
 function toggleExtension() {
   extensionEnabled = !extensionEnabled;
@@ -2073,11 +2041,18 @@ function toggleExtension() {
   
   if (extensionEnabled) {
     console.log('[ContextGrabber] Extension ENABLED');
+    // Show the overlay
+    if (currentOverlay) {
+      currentOverlay.style.display = 'block';
+    }
     setOverlayStatus('Watching...');
     showOverlayIfHidden();
   } else {
     console.log('[ContextGrabber] Extension DISABLED');
-    setOverlayStatus('Paused (click ▶ to resume)');
+    // Completely hide the overlay
+    if (currentOverlay) {
+      currentOverlay.style.display = 'none';
+    }
   }
   
   // Update the toggle button appearance
@@ -2101,10 +2076,8 @@ function showOverlayIfHidden() {
   if (!currentOverlay) return; // Still failed to create
   
   const body = currentOverlay.querySelector('#cg-body');
-  const minimizeBtn = currentOverlay.querySelector('.cg-minimize-btn');
   if (body && body.style.display === 'none') {
     body.style.display = 'block';
-    if (minimizeBtn) minimizeBtn.innerHTML = '&#8212;';
     overlayVisible = true;
   }
 }
